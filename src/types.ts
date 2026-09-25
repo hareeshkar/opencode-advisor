@@ -45,6 +45,8 @@ export interface AdvisorOptions {
   source?: AdvisorSource
   /** Max advisor calls per user task. Default 3 (matches Anthropic evals). */
   maxUsesPerTask: number
+  /** Dispatch-attempt ceiling per task (default derived: maxUsesPerTask*3+2). */
+  maxAttempts: number
   /** Target advisor response length in words (prompt-enforced + hard cap). */
   adviceWordBudget: number
   /** Sub-call timeout in ms. Default 90_000. */

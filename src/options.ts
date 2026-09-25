@@ -11,6 +11,30 @@ import type { AdvisorModelRef, AdvisorOptions, AdvisorSource, LogLevel } from ".
 
 const ENV = process.env as Record<string, string | undefined>
 
+/** Dedicated config file names, lowest → highest precedence. */
+export const CONFIG_FILE_RELATIVE = "opencode-advisor.json"
+
+/** Shallow-merge config layers (later layers win per top-level key). Set
+ *  whole nested objects (advisor/source) in one place to stay predictable. */
+export function mergeAdvisorConfigLayers(layers: Array<unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const layer of layers) {
+    if (layer === null || typeof layer !== "object" || Array.isArray(layer)) continue
+    for (const [k, v] of Object.entries(layer as Record<string, unknown>)) {
+      if (v !== undefined) out[k] = v
+    }
+  }
+  return out
+}
+
+/** Non-technical presets: a single word tunes the whole cost/quality curve. */
+export const PRESETS: Record<string, Partial<Record<string, unknown>>> = {
+  economy: { maxUsesPerTask: 1, transcriptBudgetChars: "16k", adviceWordBudget: 80 },
+  balanced: { maxUsesPerTask: 3, transcriptBudgetChars: "32k", adviceWordBudget: 120 },
+  thorough: { maxUsesPerTask: 5, transcriptBudgetChars: "128k", adviceWordBudget: 200 },
+  exhaustive: { maxUsesPerTask: 8, transcriptBudgetChars: "500k", adviceWordBudget: 300 },
+}
+
 export const DEFAULTS = {
   advisor: { providerID: "", id: "" } as AdvisorModelRef,
   maxUsesPerTask: 3,
@@ -44,6 +68,23 @@ function readInt(rec: Record<string, unknown>, key: string, min: number, max: nu
     throw new Error(`[advisor] option "${key}" must be between ${min} and ${max}, got ${v}`)
   }
   return i
+}
+
+/** Human-friendly sizes: 32000 | "32k" | "1.5k" | "2m" (1000-based; chars). */
+function readSize(rec: Record<string, unknown>, key: string, min: number, max: number): number | undefined {
+  const v = rec[key]
+  if (v === undefined) return undefined
+  let n: number | undefined
+  if (typeof v === "number" && Number.isFinite(v)) n = Math.floor(v)
+  else if (typeof v === "string") {
+    const m = /^(\d+(?:\.\d+)?)\s*([kKmM])?$/.exec(v.trim())
+    if (m) n = Math.floor(Number.parseFloat(m[1]!) * (m[2] ? (m[2].toLowerCase() === "k" ? 1_000 : 1_000_000) : 1))
+  }
+  if (n === undefined) {
+    throw new Error(`[advisor] option "${key}" must be a number or size like "64k"/"1.5m", got ${JSON.stringify(v)}`)
+  }
+  if (n < min || n > max) throw new Error(`[advisor] option "${key}" must be between ${min} and ${max}, got ${v}`)
+  return n
 }
 
 function readModelRef(v: unknown, label: string): AdvisorModelRef {
@@ -137,11 +178,26 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   const optSource = readSource(opts.source)
   if (optSource !== undefined) source = optSource
 
+  // Preset first (non-technical), then explicit options override it.
+  const presetName = readString(opts, "preset")
+  if (presetName !== undefined) {
+    const preset = PRESETS[presetName]
+    if (!preset) {
+      throw new Error(`[advisor] option "preset" must be one of: ${Object.keys(PRESETS).join(", ")} — got "${presetName}"`)
+    }
+    if (preset.maxUsesPerTask !== undefined) maxUsesPerTask = preset.maxUsesPerTask as number
+    if (preset.transcriptBudgetChars !== undefined) {
+      transcriptBudgetChars = readSize({ v: preset.transcriptBudgetChars as string }, "v", 2_000, 2_000_000) ?? transcriptBudgetChars
+    }
+    if (preset.adviceWordBudget !== undefined) adviceWordBudget = preset.adviceWordBudget as number
+  }
+
   maxUsesPerTask = readInt(opts, "maxUsesPerTask", 1, 50) ?? maxUsesPerTask
+  let maxAttempts = readInt(opts, "maxAttempts", 1, 100) ?? 0 // 0 = derive from cap
   adviceWordBudget = readInt(opts, "adviceWordBudget", 20, 1000) ?? adviceWordBudget
   timeoutMs = readInt(opts, "timeoutMs", 1_000, 600_000) ?? timeoutMs
-  maxToolOutputChars = readInt(opts, "maxToolOutputChars", 100, 200_000) ?? maxToolOutputChars
-  transcriptBudgetChars = readInt(opts, "transcriptBudgetChars", 2_000, 2_000_000) ?? transcriptBudgetChars
+  maxToolOutputChars = readSize(opts, "maxToolOutputChars", 100, 200_000) ?? maxToolOutputChars
+  transcriptBudgetChars = readSize(opts, "transcriptBudgetChars", 2_000, 2_000_000) ?? transcriptBudgetChars
   const optNudge = readString(opts, "nudge")
   if (optNudge !== undefined) {
     if (optNudge !== "auto" && optNudge !== "on" && optNudge !== "off") {
@@ -195,6 +251,7 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     advisor,
     source,
     maxUsesPerTask,
+    maxAttempts: maxAttempts > 0 ? maxAttempts : maxUsesPerTask * 3 + 2,
     adviceWordBudget,
     timeoutMs,
     prune: { maxToolOutputChars, transcriptBudgetChars },

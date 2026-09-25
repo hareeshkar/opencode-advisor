@@ -300,8 +300,8 @@ export class AdvisorEngine {
     }
 
     // Attempt ceiling: bounds retry storms against a throttled provider
-    // without punishing the user for transient failures.
-    const attemptCeiling = this.opts.maxUsesPerTask * 3 + 2
+    // without punishing the user for transient failures (configurable).
+    const attemptCeiling = this.opts.maxAttempts || this.opts.maxUsesPerTask * 3 + 2
     if (st.attempts >= attemptCeiling) {
       return {
         ok: false,

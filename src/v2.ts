@@ -15,9 +15,12 @@
  *     the host's model call
  */
 
+import { readFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { AdvisorEngine } from "./engine.js"
 import { extractToolNames, replaceSystemInBody } from "./inject.js"
-import { resolveOptions, shouldNudgeExecutor } from "./options.js"
+import { CONFIG_FILE_RELATIVE, mergeAdvisorConfigLayers, resolveOptions, shouldNudgeExecutor } from "./options.js"
 import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
@@ -174,6 +177,31 @@ export function extractLastAssistantText(messages: unknown): string {
 
 const EMPTY_INPUT = { type: "object", properties: {}, additionalProperties: false }
 
+/** Dedicated plugin config file (global → project, project wins), merged
+ *  under the plugin's opencode.json options (explicit inline wins). Set
+ *  whole nested objects (advisor/source) rather than partial merges. */
+async function loadAdvisorConfig(ctx: unknown): Promise<Record<string, unknown>> {
+  const c = ctx as { location?: { directory?: unknown }; options?: unknown } | undefined
+  const globalDir = process.env.XDG_CONFIG_HOME ? join(process.env.XDG_CONFIG_HOME, "opencode") : join(homedir(), ".config", "opencode")
+  const dir = typeof c?.location?.directory === "string" && c.location.directory !== "" ? c.location.directory : process.cwd()
+  const paths = [
+    join(globalDir, CONFIG_FILE_RELATIVE),
+    join(dir, ".opencode", CONFIG_FILE_RELATIVE),
+    join(dir, CONFIG_FILE_RELATIVE),
+  ]
+  const layers: unknown[] = []
+  for (const path of paths) {
+    try {
+      layers.push(JSON.parse(await readFile(path, "utf8")))
+    } catch (err) {
+      const code = (err as { code?: unknown }).code
+      if (code === "ENOENT") continue
+      throw new Error(`[advisor] config file ${path} is unreadable or invalid JSON: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return mergeAdvisorConfigLayers([...layers, c?.options])
+}
+
 export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise<() => void> } {
   return {
     id: PLUGIN_ID,
@@ -181,7 +209,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       const ctx = ctxUnknown as any
       let opts: AdvisorOptions
       try {
-        opts = resolveOptions(ctx?.options)
+        opts = resolveOptions(await loadAdvisorConfig(ctx))
       } catch (err) {
         // loud + rethrow: a misconfigured plugin must not load silently
         console.error(`[${PLUGIN_ID}] CONFIG ERROR: ${err instanceof Error ? err.message : String(err)}`)

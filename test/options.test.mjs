@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { resolveOptions, shouldNudgeExecutor } from "../dist/opencode-advisor.js"
+import { mergeAdvisorConfigLayers, resolveOptions, shouldNudgeExecutor } from "../dist/opencode-advisor.js"
 
 /* ---------------- tiers ---------------- */
 
@@ -83,4 +83,51 @@ test("out-of-range values throw with bounds", () => {
 test("nudge defaults to off (credit-conscious: no autonomous spend)", () => {
   const o = resolveOptions({ advisor: { providerID: "p", id: "m" } })
   assert.equal(o.nudge, "off")
+})
+
+test("human budgets: 64k / 128k / 500k / 1.5m parse to chars", () => {
+  const base = { advisor: { providerID: "p", id: "m" } }
+  assert.equal(resolveOptions({ ...base, transcriptBudgetChars: "64k" }).prune.transcriptBudgetChars, 64_000)
+  assert.equal(resolveOptions({ ...base, transcriptBudgetChars: "128k" }).prune.transcriptBudgetChars, 128_000)
+  assert.equal(resolveOptions({ ...base, transcriptBudgetChars: "500k" }).prune.transcriptBudgetChars, 500_000)
+  assert.equal(resolveOptions({ ...base, transcriptBudgetChars: "1.5m" }).prune.transcriptBudgetChars, 1_500_000)
+  assert.equal(resolveOptions({ ...base, maxToolOutputChars: "3k" }).prune.maxToolOutputChars, 3_000)
+  assert.throws(() => resolveOptions({ ...base, transcriptBudgetChars: "huge" }), /size like "64k"/)
+})
+
+test("presets tune the curve; explicit options override them", () => {
+  const economy = resolveOptions({ advisor: { providerID: "p", id: "m" }, preset: "economy" })
+  assert.equal(economy.maxUsesPerTask, 1)
+  assert.equal(economy.prune.transcriptBudgetChars, 16_000)
+  assert.equal(economy.adviceWordBudget, 80)
+
+  const exhaustive = resolveOptions({ advisor: { providerID: "p", id: "m" }, preset: "exhaustive" })
+  assert.equal(exhaustive.maxUsesPerTask, 8)
+  assert.equal(exhaustive.prune.transcriptBudgetChars, 500_000)
+
+  const overridden = resolveOptions({ advisor: { providerID: "p", id: "m" }, preset: "economy", maxUsesPerTask: 4 })
+  assert.equal(overridden.maxUsesPerTask, 4)
+
+  assert.throws(() => resolveOptions({ advisor: { providerID: "p", id: "m" }, preset: "turbo" }), /must be one of/)
+})
+
+test("maxAttempts: derived by default, explicit when set", () => {
+  const derived = resolveOptions({ advisor: { providerID: "p", id: "m" }, maxUsesPerTask: 2 })
+  assert.equal(derived.maxAttempts, 8) // 2*3+2
+  const explicit = resolveOptions({ advisor: { providerID: "p", id: "m" }, maxAttempts: 12 })
+  assert.equal(explicit.maxAttempts, 12)
+})
+
+test("config layers merge: later wins, nested objects replaced whole", () => {
+  const merged = mergeAdvisorConfigLayers([
+    { maxUsesPerTask: 1, advisor: { providerID: "a", id: "x" }, preset: "economy" },
+    { maxUsesPerTask: 3, transcriptBudgetChars: "64k" },
+    { logLevel: "debug" },
+  ])
+  assert.equal(merged.maxUsesPerTask, 3)
+  assert.equal(merged.transcriptBudgetChars, "64k")
+  assert.equal(merged.logLevel, "debug")
+  const opts = resolveOptions(merged)
+  assert.equal(opts.prune.transcriptBudgetChars, 64_000)
+  assert.equal(opts.advisor.providerID, "a")
 })

@@ -29,6 +29,6 @@ export { INJECTION_SENTINEL, extractToolNames, replaceSystemInBody } from "./inj
 export { pruneTranscript, clean } from "./pruner.js"
 export { buildAdvisorPrompt, ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, DEFAULT_TRIGGERS, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, notConfiguredMessage, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
 export { redactError, sanitizeEvidence, sanitizeAdviceText, frameAdvice } from "./sanitize.js"
-export { resolveOptions, shouldNudgeExecutor } from "./options.js"
+export { CONFIG_FILE_RELATIVE, PRESETS, mergeAdvisorConfigLayers, resolveOptions, shouldNudgeExecutor } from "./options.js"
 export { callAdvisorProvider } from "./providers.js"
 export { PLUGIN_VERSION, PLUGIN_ID } from "./types.js"

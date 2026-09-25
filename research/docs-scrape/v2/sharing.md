@@ -1,0 +1,3 @@
+# Sharing
+
+OpenCode V2 does not support session sharing yet.

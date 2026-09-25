@@ -1,0 +1,22 @@
+# build artifacts
+dist/
+node_modules/
+*.tsbuildinfo
+
+# re-fetchable npm artifacts (kept locally; recover via `npm pack <pkg>@<ver>`)
+research/api-types/opencode-*/
+research/api-types/*.tgz
+
+# runtime / machine-local state
+logs/sessions/*
+logs/investigations/*
+!logs/sessions/SESSION_TEMPLATE.md
+!logs/investigations/2026-09-25-initial-research.md
+.env
+.env.*
+
+# os / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

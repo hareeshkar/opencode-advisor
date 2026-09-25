@@ -200,3 +200,7 @@ export function triggerDirective(matched: string): string {
     `Weigh any reply as peer review, then answer, refining where it holds. Credit the advisor model named in its header when you use the advice. If it returns a not_configured error, relay its setup steps to me (do not invent advice). If it fails for another reason, say so in one line and proceed.`,
   ].join(" ")
 }
+
+/** TUI claim marker: when the CLI plugin handles /advisor-settings natively,
+ *  the server-side settings command is suppressed (single slash entry). */
+export const TUI_CLAIM_KEY = "tui:claimed"

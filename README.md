@@ -116,11 +116,13 @@ on V1 copy `commands/advisor.md` into `~/.config/opencode/commands/` (or your
 project's `.opencode/commands/`). The submitted message stays lean (your
 focus, or one short line); the directive travels invisibly.
 
-**`/advisor-settings` command** — the configuration path (see above). V2
-curates a shortlist from your live model catalog and asks via the native
-`question` tool (model, then variant/thinking effort); the choice applies
-immediately to the next consultation. On V1 copy `commands/advisor-settings.md`
-the same way (the executor reads your configured providers itself).
+**`/advisor-settings` command** — the configuration path (see above). With
+the bundled CLI plugin it opens a **native picker** (`dialog.select`, like
+`/models`): model from your live catalog, then variant/thinking effort —
+zero conversation tokens, applied immediately. Hosts without CLI plugin
+support automatically fall back to the executor-driven flow (token-lean
+shortlist + native `question` tool). On V1 copy `commands/advisor-settings.md`
+into your commands directory.
 
 **Credit attribution** — advice arrives framed as `ADVISOR REVIEW by
 <provider/model>`, and executors credit the source when they use it

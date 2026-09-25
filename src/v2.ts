@@ -17,7 +17,7 @@
 
 import { AdvisorEngine } from "./engine.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
+import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, LogLevel, Slice, UsageEntry } from "./types.js"
@@ -316,6 +316,15 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       // Hook/tool/RPC registrations must be disposed on unload — otherwise a
       // plugin reload leaks callbacks and injections fire repeatedly.
       const regs: Array<{ dispose(): Promise<void> }> = []
+      // Handle for the settings command so a TUI claim can dispose it.
+      let settingsRegistration: { dispose(): Promise<void> } | undefined
+      // Does the TUI plugin own /advisor-settings? (persisted claim)
+      let tuiClaimed = false
+      try {
+        tuiClaimed = (await ctx.storage.get(TUI_CLAIM_KEY)) === true
+      } catch {
+        /* storage unavailable — assume no claim */
+      }
       // Transient consult directives (trigger words / /advisor) — delivered
       // as invisible system text on the next primary model call, never
       // written into the user's message (no conversation bloat, no
@@ -410,6 +419,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                   additionalProperties: false,
                 },
               },
+              "claim": {
+                input: { type: "object", properties: {}, additionalProperties: false },
+                output: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false },
+              },
             },
             events: {},
           },
@@ -436,6 +449,23 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               await persistAdvisorOverride(null)
               const ref = engine.advisor()
               return { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) }
+            },
+            "claim": async () => {
+              try {
+                await ctx.storage.set(TUI_CLAIM_KEY, true)
+              } catch {
+                /* storage unavailable — claim is best-effort */
+              }
+              if (settingsRegistration) {
+                try {
+                  await settingsRegistration.dispose()
+                } catch {
+                  /* already disposed */
+                }
+                settingsRegistration = undefined
+              }
+              log("info", "TUI claimed /advisor-settings — native picker active, server flow suppressed")
+              return { ok: true }
             },
           },
         )
@@ -583,14 +613,18 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         log("warn", "/advisor command registration failed (trigger words still work)", err)
       }
 
-      // --- 2c) /advisor-settings slash command ----------------------------
-      // Guided advisor-model selection mirroring the /models UX pattern:
-      // the plugin renders the authoritative catalog (available models
-      // only), then the executor asks via the native question tool and
-      // writes the choice into opencode.json (transparent diff, hot-reload
-      // applies it — no shadow state). Variant (thinking effort) asked second.
-      try {
-        const regSettings = await ctx.command.transform((editor: any) => {
+      // --- 2c) /advisor-settings slash command (executor fallback) --------
+      // Guided advisor-model selection for hosts WITHOUT the CLI plugin:
+      // the plugin renders a token-lean shortlist, the executor asks via the
+      // native question tool, and writes the choice into opencode.json
+      // (transparent diff, hot-reload applies it). When the TUI plugin has
+      // claimed the UI (storage flag), this flow is skipped so there is
+      // exactly one /advisor-settings entry (the native picker).
+      if (tuiClaimed) {
+        log("info", "TUI owns /advisor-settings — executor settings flow skipped")
+      } else {
+        try {
+          const regSettings = await ctx.command.transform((editor: any) => {
           editor.add({
             name: "advisor-settings",
             description: "Choose the advisor model and variant via a guided question flow.",
@@ -636,8 +670,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           })
         })
         regs.push(regSettings)
-      } catch (err) {
-        log("warn", "/advisor-settings command registration failed", err)
+        settingsRegistration = regSettings
+        } catch (err) {
+          log("warn", "/advisor-settings command registration failed", err)
+        }
       }
 
       // --- 3) transient system injection (timing + nudge) -----------------

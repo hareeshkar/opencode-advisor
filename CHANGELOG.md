@@ -6,6 +6,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 ## [0.5.0] — 2026-09-26
 
 ### Added
+- **Native TUI settings picker** (bundled CLI plugin `tui.js`, discovered by
+  filename convention): `/advisor-settings` opens a real `dialog.select`
+  picker like `/models` — model from the live catalog, then variant/thinking
+  effort, saved over RPC. Zero conversation tokens. The TUI claims the UI
+  (`claim` RPC) so the server-side executor flow is suppressed — exactly one
+  slash entry; hosts without CLI plugin support keep the executor fallback.
 - **Safe-by-default unconfigured state**: fresh installs load with NO advisor
   model (zero spend), register the tool anyway, and answer consults with a
   setup-carrying `not_configured` error (steps for `/advisor-settings` and

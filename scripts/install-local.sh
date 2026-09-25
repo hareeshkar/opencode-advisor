@@ -12,6 +12,7 @@ SRC="dist/opencode-advisor.js"
 DIR="${HOME}/.config/opencode/opencode-advisor"
 mkdir -p "$DIR"
 cp "$SRC" "$DIR/index.js"
+cp dist/tui.js "$DIR/tui.js"
 cat <<EOF
 installed -> $DIR/index.js
 The plugin directory is hot-watched — no restart needed.

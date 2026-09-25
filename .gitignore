@@ -12,6 +12,12 @@ logs/sessions/*
 logs/investigations/*
 !logs/sessions/SESSION_TEMPLATE.md
 !logs/investigations/2026-09-25-initial-research.md
+!logs/investigations/2026-09-25-transport-saga.md
+!logs/investigations/2026-09-25-implementation-live-verify.md
+!logs/sessions/bench/
+logs/sessions/bench/*
+!logs/sessions/bench/TASK.md
+!logs/sessions/bench/REPORT.md
 .env
 .env.*
 

@@ -149,6 +149,7 @@ export class AdvisorEngine {
         calls: 0,
         attempts: 0,
         inFlight: 0,
+        generation: 0,
         steps: 0,
         timingInjected: false,
         advisorUsed: false,
@@ -179,6 +180,7 @@ export class AdvisorEngine {
   resetTask(sessionID: string): void {
     this.evictIfNeeded()
     const st = this.state(sessionID)
+    st.generation++
     st.calls = 0
     st.attempts = 0
     st.inFlight = 0
@@ -307,12 +309,19 @@ export class AdvisorEngine {
         message: `Advisor attempt ceiling (${attemptCeiling}) reached this task. Continue without further advice.`,
       }
     }
+    // Generation-guarded accounting (grounded-review finding): resetTask may
+    // fire mid-consult (steering / new prompt / fingerprint self-heal) and
+    // zeroes the counters in place. Every mutation below applies ONLY if the
+    // task generation is unchanged when it happens — a straggler from a
+    // previous task must never consume the new task's quota or flip its
+    // latches.
+    const gen = st.generation
     st.attempts++
     st.inFlight++
     try {
-      return await this.dispatch(st, transcript, sessionID, signal, fail, started)
+      return await this.dispatch(st, transcript, sessionID, signal, fail, started, gen)
     } finally {
-      st.inFlight--
+      if (st.generation === gen) st.inFlight--
     }
   }
 
@@ -323,6 +332,7 @@ export class AdvisorEngine {
     signal: AbortSignal,
     fail: (errorCode: AdvisorErrorCode, message: string, tokensIn?: number) => ConsultResult,
     started: number,
+    gen: number,
   ): Promise<ConsultResult> {
     const pruned = pruneTranscript(windowTranscript(transcript, this.opts.prune.transcriptBudgetChars), this.opts.prune)
     if (pruned.text.trim() === "") {
@@ -369,8 +379,12 @@ export class AdvisorEngine {
       estTokensOut: Math.ceil(advice.length / 4),
       elapsedMs: Date.now() - started,
     }
-    st.calls++
-    this.markAdvisorUsed(sessionID)
+    // Generation-guarded: a straggler completing after a task reset must not
+    // consume the NEW task's quota or flip its latch (grounded-review finding).
+    if (st.generation === gen) {
+      st.calls++
+      this.markAdvisorUsed(sessionID)
+    }
     this.recordUsage(true, stats.estTokensIn, stats.estTokensOut, stats.elapsedMs, advice.length).catch(() => {})
     this.host.log(
       "info",

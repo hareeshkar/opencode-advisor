@@ -8,7 +8,7 @@
  */
 
 import { createV1Hooks, normalizeV1Messages } from "./v1.js"
-import { createV2Plugin, normalizeV2Transcript } from "./v2.js"
+import { createV2Plugin, extractLastAssistantText, normalizeV2Transcript } from "./v2.js"
 import { PLUGIN_VERSION } from "./types.js"
 
 const v2 = createV2Plugin()
@@ -23,10 +23,11 @@ export default {
 }
 
 export { createV1Hooks, createV2Plugin }
-export { normalizeV1Messages, normalizeV2Transcript }
+export { extractLastAssistantText, normalizeV1Messages, normalizeV2Transcript }
 export { AdvisorEngine, windowTranscript } from "./engine.js"
+export { INJECTION_SENTINEL, extractToolNames, replaceSystemInBody } from "./inject.js"
 export { pruneTranscript, clean } from "./pruner.js"
-export { buildAdvisorPrompt, ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, DEFAULT_TRIGGERS, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, notConfiguredMessage, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
+export { buildAdvisorPrompt, ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, DEFAULT_TRIGGERS, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, notConfiguredMessage, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
 export { redactError, sanitizeEvidence, sanitizeAdviceText, frameAdvice } from "./sanitize.js"
 export { resolveOptions, shouldNudgeExecutor } from "./options.js"
 export { callAdvisorProvider } from "./providers.js"

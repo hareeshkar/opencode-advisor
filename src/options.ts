@@ -22,6 +22,7 @@ export const DEFAULTS = {
   // (efficiency review F-ledger; tune per workload).
   transcriptBudgetChars: 32_000,
   nudge: "off" as const,
+  advisorMode: "review" as const,
   injectTimingPrompt: true,
   logLevel: "info" as const,
 }
@@ -96,6 +97,7 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   let maxToolOutputChars = DEFAULTS.maxToolOutputChars
   let transcriptBudgetChars = DEFAULTS.transcriptBudgetChars
   let nudge: AdvisorOptions["nudge"] = DEFAULTS.nudge
+  let advisorMode: AdvisorOptions["advisorMode"] = DEFAULTS.advisorMode
   let injectTimingPrompt = DEFAULTS.injectTimingPrompt
   let logLevel: LogLevel = DEFAULTS.logLevel
   let source: AdvisorSource | undefined
@@ -113,6 +115,12 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     const lv = readLogLevel(ENV.ADVISOR_LOG)
     if (!lv) throw new Error(`[advisor] ADVISOR_LOG must be debug|info|warn|error, got "${ENV.ADVISOR_LOG}"`)
     logLevel = lv
+  }
+  if (ENV.ADVISOR_MODE) {
+    if (ENV.ADVISOR_MODE !== "review" && ENV.ADVISOR_MODE !== "agent") {
+      throw new Error(`[advisor] ADVISOR_MODE must be review|agent, got "${ENV.ADVISOR_MODE}"`)
+    }
+    advisorMode = ENV.ADVISOR_MODE
   }
   if (ENV.ADVISOR_SOURCE_KIND) {
     source = readSource({
@@ -157,6 +165,13 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   }
   const optLevel = readLogLevel(opts.logLevel)
   if (optLevel !== undefined) logLevel = optLevel
+  const optMode = readString(opts, "advisorMode")
+  if (optMode !== undefined) {
+    if (optMode !== "review" && optMode !== "agent") {
+      throw new Error(`[advisor] option "advisorMode" must be review|agent, got "${optMode}"`)
+    }
+    advisorMode = optMode
+  }
 
   if (!advisor.providerID || !advisor.id) {
     // NOT an error: the plugin loads in an unconfigured state. The advisor
@@ -184,6 +199,7 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     timeoutMs,
     prune: { maxToolOutputChars, transcriptBudgetChars },
     nudge,
+    advisorMode,
     injectTimingPrompt,
     triggers,
     logLevel,

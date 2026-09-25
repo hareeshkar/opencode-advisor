@@ -32,14 +32,21 @@ test("hasDirective detects the marker", () => {
   assert.equal(hasDirective("blah [advisor requested by user — trigger: \"x\"] blah"), true)
 })
 
-test("triggerDirective distinguishes request-now from permit-later", () => {
-  const d = triggerDirective("get consultation")
+test("triggerDirective: mention mode distinguishes request-now from permit-later", () => {
+  const d = triggerDirective("get consultation", "mention")
   assert.ok(d.includes('"get consultation"'))
-  assert.ok(d.includes("call the `advisor` tool before responding"))
-  assert.ok(d.includes("merely permit future use"))
+  assert.ok(d.includes("asks for consultation now"))
+  assert.ok(d.includes("merely permits future use"), "grant clause present")
   assert.ok(d.includes("do NOT call now"))
   assert.ok(d.includes("not_configured"), "relay setup steps on unconfigured")
-  assert.ok(d.split(/\s+/).length <= 120, "directive stays lean (fires rarely, but still)")
+})
+
+test("triggerDirective: command mode is unconditional", () => {
+  const d = triggerDirective("/advisor", "command")
+  assert.ok(d.includes("/advisor command"))
+  assert.ok(d.includes("FIRST action MUST be a call to the `advisor` tool"))
+  assert.ok(d.includes("Do not decide that advisor consultation is unnecessary"))
+  assert.ok(!d.includes("merely permit"))
 })
 
 test("frugal UX invariants are locked in prompt assets", async () => {

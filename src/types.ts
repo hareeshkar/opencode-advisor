@@ -57,6 +57,15 @@ export interface AdvisorOptions {
    * neutral on Sonnet, NEGATIVE on Opus-tier), "on", "off".
    */
   nudge: "auto" | "on" | "off"
+  /**
+   * Advisor operating mode:
+   *  - "review" (default): tool-less single-shot advice over the pruned
+   *    transcript — native parity with Anthropic's advisor, cheapest.
+   *  - "agent": the advisor runs as a read-only child session (plan agent,
+   *    advisor model) that can read/grep/glob and make multiple tool calls
+   *    to VERIFY claims before advising — grounded guidance, higher cost.
+   */
+  advisorMode: "review" | "agent"
   /** Inject the executor timing prompt (once per task, transient). */
   injectTimingPrompt: boolean
   /**
@@ -149,6 +158,8 @@ export interface StepDecision {
 }
 
 export interface TaskState {
+  /** Task generation: bumped by resetTask; guards straggler accounting. */
+  generation: number
   /** Successful advisor uses this task (the user-facing cap). */
   calls: number
   /** Total dispatch attempts this task (anti-retry-storm ceiling). */

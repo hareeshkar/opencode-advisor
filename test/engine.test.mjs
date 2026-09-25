@@ -239,3 +239,40 @@ test("setAdvisor hot-swaps the model and exposes it via advisor()", () => {
   engine.setAdvisor({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
   assert.deepEqual(engine.advisor(), { providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
 })
+
+test("straggler consult after resetTask does not consume the new task's quota (generation guard)", async () => {
+  let release
+  const gate = new Promise((r) => (release = r))
+  const host = makeHost({
+    runAdvisor: async () => {
+      await gate
+      return "late advice from the old task"
+    },
+  })
+  const engine = new AdvisorEngine({ ...OPTS, maxUsesPerTask: 1 }, host)
+  const sig = new AbortController().signal
+
+  const straggler = engine.consult("gen", sig) // holds the reservation
+  await new Promise((r) => setTimeout(r, 5))
+  engine.resetTask("gen") // new user prompt arrives mid-flight
+  release()
+  const result = await straggler
+  assert.equal(result.ok, true, "straggler still returns its advice")
+
+  // The new task's quota must be untouched: a fresh consult succeeds.
+  const fresh = await engine.consult("gen", sig)
+  assert.equal(fresh.ok, true, "new task quota intact (straggler did not consume it)")
+
+  // And the new task's own cap still applies afterwards.
+  const capped = await engine.consult("gen", sig)
+  assert.equal(capped.errorCode, "max_uses_exceeded")
+})
+
+test("health() reflects the generation counter bump", () => {
+  const engine = new AdvisorEngine(OPTS, makeHost())
+  engine.noteStep("g1", false)
+  engine.health("g1")
+  engine.resetTask("g1")
+  const h = engine.health("g1")
+  assert.equal(h.steps, 0)
+})

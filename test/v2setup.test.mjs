@@ -8,6 +8,7 @@ function makeCtx(overrides = {}) {
     tools: [],
     promptHooks: [],
     contextHooks: [],
+    httpHooks: [],
     commands: [],
     prompts: [],
     storage: new Map(),
@@ -32,6 +33,7 @@ function makeCtx(overrides = {}) {
       hook: async (name, cb) => {
         if (name === "prompt") captured.promptHooks.push(cb)
         if (name === "context") captured.contextHooks.push(cb)
+        if (name === "http.request") captured.httpHooks.push(cb)
         return { dispose: async () => {} }
       },
       prompt: async (args) => {
@@ -95,24 +97,41 @@ test("setup registers the advisor tool and both commands", async () => {
   await cleanup()
 })
 
-test("prompt hook queues a transient directive; context hook delivers it invisibly", async () => {
+test("prompt hook queues a directive; http hook injects it into the request body", async () => {
   const { ctx, captured } = makeCtx()
   await createV2Plugin().setup(ctx)
   assert.equal(captured.promptHooks.length, 1)
   const promptHook = captured.promptHooks[0]
   const contextHook = captured.contextHooks[0]
+  const httpHook = captured.httpHooks[0]
+  assert.ok(httpHook, "http.request hook registered")
 
   const event = { sessionID: "s1", prompt: { text: "give me some advice on caching" } }
   await promptHook(event)
   assert.equal(event.prompt.text, "give me some advice on caching", "user text never mutates")
 
-  const first = { sessionID: "s1", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
-  await contextHook(first)
-  assert.ok(first.system.some((t) => t.text.includes("[advisor requested")), "directive delivered via system")
+  // Context hook only QUEUES (v2.0.16 drops event.system mutations).
+  const ctxEvent = { sessionID: "s1", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
+  await contextHook(ctxEvent)
+  assert.equal(ctxEvent.system.length, 0, "no dead-end system push")
 
-  const second = { sessionID: "s1", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
-  await contextHook(second)
-  assert.ok(!second.system.some((t) => t.text.includes("[advisor requested")), "delivered once, then consumed")
+  // The native request hook delivers by rewriting the outgoing body.
+  const raw = JSON.stringify({ model: "m", system: "base", messages: [{ role: "user", content: "hi" }] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: raw })
+  const httpEvent = { sessionID: "s1", kind: "primary", request }
+  await httpHook(httpEvent)
+  const rewritten = await httpEvent.request.clone().text()
+  assert.ok(rewritten.includes("[advisor requested"), "directive injected into the body system")
+  assert.ok(/<<advisor-plugin:[a-z0-9]+>>/.test(rewritten), "fresh batch marker present")
+  assert.ok(rewritten.includes('"model":"m"'), "body shape preserved")
+
+  // Second delivery attempt must not stack (sentinel idempotency).
+  const raw2 = JSON.stringify({ model: "m", system: "base", messages: [] })
+  const req2 = new Request("http://example.test/v1/messages", { method: "POST", body: raw2 })
+  const ev2 = { sessionID: "s1", kind: "primary", request: req2 }
+  await httpHook(ev2)
+  const out2 = await ev2.request.clone().text()
+  assert.equal((out2.match(/<<advisor-plugin:/g) ?? []).length, 0, "nothing pending anymore — request untouched")
 
   const plain = { sessionID: "s2", prompt: { text: "deploy the cache" } }
   await promptHook(plain)
@@ -122,7 +141,7 @@ test("prompt hook queues a transient directive; context hook delivers it invisib
   await promptHook(settings)
   const sys = { sessionID: "s3", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
   await contextHook(sys)
-  assert.ok(!sys.system.some((t) => t.text.includes("[advisor requested")), "settings invocation never queues")
+  assert.equal(sys.system.length, 0)
 })
 
 test("advisor tool executes end to end through the fake session", async () => {
@@ -148,9 +167,13 @@ test("/advisor command submits lean visible text and queues the directive", asyn
   assert.equal(submitted.text, "review the cache", "focus only — no boilerplate in the visible prompt")
   assert.equal(submitted.delivery, "steer")
 
-  const sys = { sessionID: "s2", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
-  await captured.contextHooks[0](sys)
-  assert.ok(sys.system.some((t) => t.text.includes("[advisor requested")), "directive delivered invisibly")
+  // Queue drains through the native request rewrite, not the dead system channel.
+  await captured.contextHooks[0]({ sessionID: "s2", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: JSON.stringify({ system: "s", messages: [] }) })
+  const ev = { sessionID: "s2", kind: "primary", request }
+  await captured.httpHooks[0](ev)
+  const body = await ev.request.clone().text()
+  assert.ok(body.includes("[advisor requested"), "directive delivered via native request body")
 })
 
 test("/advisor with no focus uses one short line", async () => {
@@ -223,4 +246,77 @@ test("unconfigured install injects no timing guidance (token discipline)", async
   const sys = { sessionID: "s-nc2", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
   await captured.contextHooks[0](sys)
   assert.equal(sys.system.length, 0, "nothing injected while unconfigured")
+})
+
+test("agent mode spawns a read-only child session, polls to idle, returns its advice", async () => {
+  const adviceText = "AGENT-GROUNDED-ADVICE: verified in engine.ts line 42."
+  let childID = ""
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "zai-coding-plan", id: "glm-5.3" }, logLevel: "error", advisorMode: "agent", timeoutMs: 20_000 }
+  ctx.session.create = async (input) => {
+    captured.createInput = input
+    childID = "ses_child_agent"
+    return { id: childID }
+  }
+  ctx.session.prompt = async (args) => {
+    captured.prompts.push(args)
+    return {}
+  }
+  ctx.session.context = async ({ sessionID }) => {
+    if (sessionID === childID) {
+      return [{ type: "assistant", content: [{ type: "text", text: adviceText }] }, { type: "idle" }]
+    }
+    return [{ type: "user", text: "do the thing" }]
+  }
+  ctx.session.remove = async () => {}
+  await createV2Plugin().setup(ctx)
+
+  const result = await captured.tools[0].execute({}, { sessionID: "s-agent", signal: new AbortController().signal })
+  assert.ok(result.content.includes("AGENT-GROUNDED-ADVICE"), "child advice returned")
+  assert.ok(result.content.startsWith("ADVISOR REVIEW by zai-coding-plan/glm-5.3"), "framed with attribution")
+
+  const create = captured.createInput
+  assert.equal(create.agent, "plan", "read-only plan agent")
+  assert.equal(create.model.providerID, "zai-coding-plan")
+  assert.equal(create.model.id, "glm-5.3")
+  const denied = (create.permissions ?? []).filter((p) => p.effect === "deny").map((p) => p.action)
+  assert.deepEqual(denied.sort(), ["edit", "shell", "subagent"], "write/shell/subagent denied")
+
+  const childPrompt = captured.prompts.find((p) => p.sessionID === "ses_child_agent")
+  assert.ok(childPrompt, "child prompted")
+  assert.ok(childPrompt.text.startsWith("You are the ADVISOR operating in AGENT MODE"), "agent prefix present")
+  assert.ok(childPrompt.text.includes("<transcript-"), "transcript forwarded for grounding")
+})
+
+test("nested advisor sessions are refused (recursion guard)", async () => {
+  let childID = "ses_child_nested"
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorMode: "agent", timeoutMs: 20_000 }
+  ctx.session.create = async () => ({ id: childID })
+  ctx.session.remove = async () => {}
+  ctx.session.prompt = async (args) => {
+    captured.prompts.push(args)
+    // Simulate the child calling the advisor TOOL during its run.
+    captured.nestedResult = await captured.tools[0].execute({}, { sessionID: childID, signal: new AbortController().signal })
+    return {}
+  }
+  ctx.session.context = async ({ sessionID }) => {
+    if (sessionID === childID) return [{ type: "assistant", content: [{ type: "text", text: "advice" }] }, { type: "idle" }]
+    return [{ type: "user", text: "task" }]
+  }
+  await createV2Plugin().setup(ctx)
+  await captured.tools[0].execute({}, { sessionID: "s-root", signal: new AbortController().signal })
+  assert.ok(String(captured.nestedResult.content).includes("nested advisor sessions are not supported"), "nested call refused")
+})
+
+test("GUARANTEE: the executor receives ONLY the framed advice — never transcript text", async () => {
+  const { ctx, captured } = makeCtx()
+  const SECRET = "SECRET_TRANSCRIPT_TOKEN_XYZ"
+  ctx.session.context = async () => [{ type: "user", text: `${SECRET} long transcript content...` }]
+  ctx.session.generate = async () => ({ text: "1. Do A. 2. Then B." })
+  await createV2Plugin().setup(ctx)
+  const result = await captured.tools[0].execute({}, { sessionID: "s-leak", signal: new AbortController().signal })
+  assert.ok(!result.content.includes(SECRET), "no transcript content in the tool result")
+  assert.ok(result.content.startsWith("ADVISOR REVIEW by "), "only the framed advice")
+  assert.ok(result.content.length < 600, `advice is small (${result.content.length} chars), not a transcript dump`)
 })

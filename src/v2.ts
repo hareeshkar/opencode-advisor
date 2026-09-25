@@ -16,8 +16,9 @@
  */
 
 import { AdvisorEngine } from "./engine.js"
+import { extractToolNames, replaceSystemInBody } from "./inject.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
+import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, LogLevel, Slice, UsageEntry } from "./types.js"
@@ -148,6 +149,25 @@ export function normalizeV2Transcript(messages: unknown): Slice[] {
   return out
 }
 
+/** Last assistant text in a session message list (agent-mode advice extraction). */
+export function extractLastAssistantText(messages: unknown): string {
+  if (!Array.isArray(messages)) return ""
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as { type?: unknown; content?: unknown } | undefined
+    if (!m || String(m.type ?? "") !== "assistant") continue
+    if (!Array.isArray(m.content)) continue
+    const texts: string[] = []
+    for (const c of m.content) {
+      const part = c as { type?: unknown; text?: unknown }
+      if (part && part.type === "text" && typeof part.text === "string" && part.text.trim() !== "") {
+        texts.push(part.text)
+      }
+    }
+    if (texts.length > 0) return texts.join("\n").trim()
+  }
+  return ""
+}
+
 /* ------------------------------------------------------------------ */
 /* plugin                                                              */
 /* ------------------------------------------------------------------ */
@@ -215,6 +235,13 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           return normalizeV2Transcript(messages)
         },
         runAdvisor: async (prompt, signal, sessionID, nonce, model) => {
+          // AGENT MODE: the advisor runs as a READ-ONLY child session (plan
+          // agent, advisor model, deny edit/shell) that may make multiple
+          // tool calls to verify claims before advising — Anthropic's
+          // principle (full-transcript strategy) plus grounded exploration.
+          if (opts.advisorMode === "agent") {
+            return runAdvisorAgent(prompt, model)
+          }
           // Session-scoped transient generation (NOT ctx.generate.text):
           // only session-bound requests emit hooks and inherit the host's
           // native session headers. The transient endpoint takes no model
@@ -313,6 +340,58 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         log,
       }
       const engine = new AdvisorEngine(opts, host)
+      // Child sessions spawned by AGENT-MODE advisor consults. Used as a
+      // recursion guard: a consult originating inside one of these returns
+      // an error instead of spawning another child (bounded depth).
+      const advisorChildSessions = new Set<string>()
+      /** AGENT MODE: read-only child session that investigates, then advises. */
+      const runAdvisorAgent = async (
+        prompt: string,
+        model: { providerID: string; id: string; variant?: string },
+      ): Promise<string> => {
+        const created = (await ctx.session.create({
+          title: "advisor consult",
+          agent: "plan",
+          model: { providerID: model.providerID, id: model.id, ...(model.variant ? { variant: model.variant } : {}) },
+          permissions: [
+            { action: "edit", resource: "*", effect: "deny" },
+            { action: "shell", resource: "*", effect: "deny" },
+            { action: "subagent", resource: "*", effect: "deny" },
+          ],
+        })) as { id?: unknown } | undefined
+        const childID = String((created as { id?: unknown })?.id ?? "")
+        if (childID === "") throw new Error("agent-mode advisor: child session creation returned no id")
+        advisorChildSessions.add(childID)
+        try {
+          await ctx.session.prompt({ sessionID: childID, text: `${AGENT_MODE_PREFIX}${prompt}` })
+          // Poll to completion (idle message marks the end of the run).
+          const deadline = Date.now() + opts.timeoutMs
+          let lastText = ""
+          for (;;) {
+            if (Date.now() > deadline) throw new Error(`agent-mode advisor timed out after ${opts.timeoutMs}ms`)
+            await new Promise((r) => setTimeout(r, 1_500))
+            let messages: unknown[] = []
+            try {
+              messages = (await ctx.session.context({ sessionID: childID })) as unknown[]
+            } catch {
+              /* transient read failure — retry until deadline */
+              continue
+            }
+            const text = extractLastAssistantText(messages)
+            if (text !== "") lastText = text
+            const last = messages[messages.length - 1] as { type?: unknown } | undefined
+            if (last && String(last.type ?? "") === "idle") return lastText
+          }
+        } finally {
+          advisorChildSessions.delete(childID)
+          try {
+            await (ctx.session as { remove?: (input: { sessionID: string }) => Promise<void> }).remove?.({ sessionID: childID })
+          } catch {
+            /* cleanup is best-effort; a stray read-only session is harmless */
+          }
+        }
+      }
+
       // Hook/tool/RPC registrations must be disposed on unload — otherwise a
       // plugin reload leaks callbacks and injections fire repeatedly.
       const regs: Array<{ dispose(): Promise<void> }> = []
@@ -329,8 +408,43 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       // as invisible system text on the next primary model call, never
       // written into the user's message (no conversation bloat, no
       // persisted boilerplate). TTL guards against stale deliveries.
+      // INSTANCE identifies this plugin instance in diagnostics (multiple
+      // instances can exist per location set; per-instance closures must
+      // never be assumed to be shared).
+      const INSTANCE = Math.random().toString(36).slice(2, 8)
       const pendingDirectives = new Map<string, { text: string; at: number }>()
       const DIRECTIVE_TTL_MS = 15 * 60_000
+      const diagDirective = (action: string, sessionID: string, extra?: Record<string, unknown>): void => {
+        try {
+          const key = `diag:directive:${sessionID}`
+          void (async () => {
+            const prev = ((await ctx.storage.get(key)) as unknown[] | undefined) ?? []
+            const next = [...prev, { action, instance: INSTANCE, at: Date.now(), steps: engine.health(sessionID).steps, ...extra }].slice(-20)
+            await ctx.storage.set(key, next).catch(() => {})
+          })().catch(() => {})
+        } catch {
+          /* diagnostics only */
+        }
+      }
+      // Transient system guidance awaiting native delivery: queued by the
+      // context hook, injected into the outgoing request body by the
+      // http.request hook (the only channel that reaches the model on
+      // v2.0.16). TTL-guarded; idempotent via the injection sentinel.
+      // Each pending batch carries a FRESH random marker: a stable sentinel
+      // can already exist in transcripts (this very project discusses it),
+      // which silently disabled injection (observed via diag "http-already").
+      const pendingSystem = new Map<string, { texts: string[]; marker: string; at: number }>()
+      const queueSystemInjection = (sessionID: string, texts: string[]): void => {
+        const prev = pendingSystem.get(sessionID)
+        const merged = prev ? [...prev.texts, ...texts] : texts
+        pendingSystem.set(sessionID, { texts: merged.slice(-6), marker: `<<advisor-plugin:${Math.random().toString(36).slice(2, 12)}>>`, at: Date.now() })
+      }
+      const takeSystemInjection = (sessionID: string): { texts: string[]; marker: string } | undefined => {
+        const p = pendingSystem.get(sessionID)
+        if (!p) return undefined
+        pendingSystem.delete(sessionID)
+        return Date.now() - p.at > DIRECTIVE_TTL_MS ? undefined : { texts: p.texts, marker: p.marker }
+      }
       const takeDirective = (sessionID: string): string | undefined => {
         const d = pendingDirectives.get(sessionID)
         if (!d) return undefined
@@ -516,6 +630,12 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               if (!sessionID) {
                 return { content: "advisor_tool_result_error: unavailable — tool context carries no sessionID" }
               }
+              if (advisorChildSessions.has(sessionID)) {
+                return {
+                  content:
+                    "advisor_tool_result_error: unavailable — nested advisor sessions are not supported. You ARE the advisor: answer with your guidance.",
+                }
+              }
               const signal: AbortSignal = tctx?.signal ?? new AbortController().signal
               const r = await engine.consult(sessionID, signal)
               // Observable hook-delivery signal: last-write-wins health per
@@ -575,6 +695,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               const matched = findTrigger(text, opts.triggers)
               if (matched) {
                 pendingDirectives.set(sid, { text: triggerDirective(matched), at: Date.now() })
+                diagDirective("queued", sid, { trigger: matched, via: "prompt-hook" })
                 log("info", `advisor trigger "${matched}" — directive queued (transient system delivery)`)
               }
             }
@@ -598,7 +719,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             execute: async ({ sessionID, prompt, delivery }: any) => {
               const focus = String(prompt?.text ?? "").trim()
               if (sessionID && !pendingDirectives.has(sessionID)) {
-                pendingDirectives.set(sessionID, { text: triggerDirective("/advisor"), at: Date.now() })
+                pendingDirectives.set(sessionID, { text: triggerDirective("/advisor", "command"), at: Date.now() })
+                diagDirective("queued", sessionID, { trigger: "/advisor", via: "command" })
               }
               await ctx.session.prompt({
                 sessionID,
@@ -710,20 +832,46 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             // first model call (last-write-wins single key — bounded). Lets
             // post-hoc analysis prove hooks fire in any session type
             // (one-shot `run`, subagents, TUI) without per-call amplification.
+            // The richer `diag:ctx` write additionally records the SHAPE of
+            // the context event (canInject depends on system being an array).
             if (engine.health(sid).steps === 1) {
               try {
                 void ctx.storage.set("diag:hookcheck", { sessionID: sid, time: Date.now() }).catch(() => {})
+                void ctx.storage
+                  .set("diag:ctx", {
+                    sessionID: sid,
+                    kind: String(event?.kind ?? "?"),
+                    systemIsArray: Array.isArray(event?.system),
+                    systemLength: Array.isArray(event?.system) ? event.system.length : -1,
+                    keys: Object.keys(event ?? {}).slice(0, 15),
+                    at: Date.now(),
+                  })
+                  .catch(() => {})
               } catch {
                 /* diagnostics only */
               }
             }
-            if (canInject) {
-              // Consult directives first (user-triggered), then once-per-task
-              // guidance. All transient — nothing persisted or visible.
+            // Transient guidance is QUEUED here, not pushed into
+            // event.system: v2.0.16 does not deliver context-hook system
+            // mutations to the provider (verified with an in-band canary).
+            // Delivery happens in the http.request hook by rewriting the
+            // outgoing body (native, request-level).
+            {
               const directive = takeDirective(sid)
-              if (directive) event.system.push({ type: "text", text: directive })
-              if (d.injectTiming) event.system.push({ type: "text", text: EXECUTOR_TIMING_PROMPT })
-              if (d.injectNudge) event.system.push({ type: "text", text: NUDGE_TEXT })
+              const injections: string[] = []
+              if (directive) injections.push(directive)
+              if (d.injectTiming) injections.push(EXECUTOR_TIMING_PROMPT)
+              if (d.injectNudge) injections.push(NUDGE_TEXT)
+              if (injections.length > 0) {
+                queueSystemInjection(sid, injections)
+              }
+              diagDirective("context", sid, {
+                queued: injections.length,
+                directive: directive !== undefined,
+                timing: d.injectTiming,
+                nudge: d.injectNudge,
+                kind: String(event?.kind ?? "(none)"),
+              })
             }
           } catch (err) {
             log("warn", "context hook body failed (ignored — model call proceeds)", err)
@@ -734,13 +882,15 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         log("warn", "context hook registration failed (timing prompt will not be injected)", err)
       }
 
-      // --- 4) native request observation + session-header injection ----
-      // Fires for every native provider request a session issues. Correlates
-      // advisor sub-calls by their evidence nonce (embedded in the prompt
-      // body) and attaches x-opencode-session so session-routed providers
-      // (opencode-go) accept the call and can apply prompt caching.
-      // The registration itself is race-guarded: an unproven hook must never
-      // hang setup and take the advisor tool down with it.
+      // --- 4) native request rewrite: session header + transient system ----
+      // Fires for every native provider request a session issues. Two jobs:
+      //  a) correlate advisor sub-calls by their evidence nonce and attach
+      //     x-opencode-session (routing; enables provider prompt caching)
+      //  b) inject queued transient system guidance into PRIMARY request
+      //     bodies — the only channel that reaches the model on v2.0.16
+      //     (context-hook system mutations are silently dropped).
+      // Idempotent via the injection sentinel; queued texts are consumed
+      // only after a successful rewrite.
       try {
         const regHttp = await Promise.race([
           ctx.session.hook("http.request", async (event: any) => {
@@ -749,17 +899,75 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 httpHookLive = true
                 observedKinds.add(String(event?.kind ?? "?"))
               }
-              if (pendingAdvisorCalls.size === 0) return
-              const req = event?.request as { clone(): { text(): Promise<string> }; headers: { set(k: string, v: string): void } } | undefined
+              const sid = String(event?.sessionID ?? "")
+              const kind = String(event?.kind ?? "")
+              const hasPendingSystem = sid !== "" && kind === "primary" && pendingSystem.has(sid)
+              if (pendingAdvisorCalls.size === 0 && !hasPendingSystem) return
+              const req = event?.request as
+                | { clone(): { text(): Promise<string> }; headers: { set(k: string, v: string): void }; url?: string; method?: string }
+                | undefined
               if (!req || typeof req.clone !== "function") return
-              const body = await req.clone().text().catch(() => "")
-              if (!body) return
-              for (const [nonce, sid] of pendingAdvisorCalls) {
-                if (body.includes(nonce)) {
-                  req.headers.set("x-opencode-session", sid)
-                  nonceMatches++
-                  log("debug", `attached x-opencode-session for advisor sub-call (kind=${String(event?.kind ?? "?")})`)
-                  break
+
+              // (b) transient system injection for primary requests
+              if (hasPendingSystem) {
+                const batch = takeSystemInjection(sid)
+                if (batch && batch.texts.length > 0) {
+                  const texts = batch.texts
+                  const bodyText = await req.clone().text().catch(() => "")
+                  if (bodyText) {
+                    const result = replaceSystemInBody(bodyText, texts, batch.marker)
+                    if (result && typeof event.request !== "undefined") {
+                      const original = event.request as Request
+                      event.request = new Request(original.url, {
+                        method: original.method,
+                        headers: new Headers(original.headers),
+                        body: result.body,
+                      })
+                      diagDirective("http-injected", sid, { format: result.format, blocks: texts.length })
+                      // Proof-of-delivery diagnostics: which tools were
+                      // actually offered, and was the advisor among them?
+                      // (Settles infrastructure-vs-compliance questions.)
+                      try {
+                        const toolNames = extractToolNames(bodyText)
+                        const advisorTool = toolNames.find((n) => n === "advisor" || n.endsWith("_advisor") || n.includes("advisor")) ?? null
+                        void ctx.storage
+                          .set(`diag:injected:${sid}`, {
+                            advisorPresent: advisorTool !== null,
+                            advisorToolName: advisorTool,
+                            toolsCount: toolNames.length,
+                            toolsSample: toolNames.slice(0, 12),
+                            sentinel: result.body.includes(batch.marker),
+                            format: result.format,
+                            at: Date.now(),
+                          })
+                          .catch(() => {})
+                      } catch {
+                        /* diagnostics only */
+                      }
+                    } else {
+                      // Never silently drop: re-queue with a FRESH marker for
+                      // the next attempt (unknown shape / already-present).
+                      queueSystemInjection(sid, texts)
+                      diagDirective("http-skip", sid, { bodyLength: bodyText.length, alreadyPresent: bodyText.includes(batch.marker) })
+                    }
+                  } else {
+                    queueSystemInjection(sid, texts)
+                  }
+                }
+              }
+
+              // (a) advisor sub-call routing header via nonce correlation
+              if (pendingAdvisorCalls.size > 0) {
+                const body = await req.clone().text().catch(() => "")
+                if (body) {
+                  for (const [nonce, advisorSid] of pendingAdvisorCalls) {
+                    if (body.includes(nonce)) {
+                      req.headers.set("x-opencode-session", advisorSid)
+                      nonceMatches++
+                      log("debug", `attached x-opencode-session for advisor sub-call (kind=${kind})`)
+                      break
+                    }
+                  }
                 }
               }
             } catch (err) {

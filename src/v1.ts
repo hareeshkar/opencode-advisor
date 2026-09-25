@@ -268,7 +268,7 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
             log("advisor-settings command intercepted (v1 command.execute.before) — assist appended")
           }
         } else {
-          queueDirective(sid, triggerDirective("/advisor"))
+          queueDirective(sid, triggerDirective("/advisor", "command"))
           log("advisor command intercepted (v1 command.execute.before) — directive queued (transient)")
         }
       } catch (err) {

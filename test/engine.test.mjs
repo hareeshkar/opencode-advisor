@@ -106,24 +106,100 @@ test("hard output cap trims runaway advice at a word boundary", async () => {
   assert.ok(r.advice.includes("…[truncated]"))
 })
 
-test("noteStep: timing on first step only, nudge respects mode", async () => {
+test("noteStep: timing on first injectable call only, nudge respects mode", async () => {
   const engine = new AdvisorEngine({ ...OPTS, nudge: "on" }, makeHost())
-  const first = engine.noteStep("s9", "some/haiku-flash", true)
+  const first = engine.noteStep("s9", true)
   assert.equal(first.injectTiming, true)
   assert.equal(first.injectNudge, false)
-  const second = engine.noteStep("s9", "some/haiku-flash", true)
+  const second = engine.noteStep("s9", true)
   assert.equal(second.injectTiming, false)
   assert.equal(second.injectNudge, true)
-  const third = engine.noteStep("s9", "some/haiku-flash", true)
+  const third = engine.noteStep("s9", true)
   assert.equal(third.injectNudge, false, "nudge fires once per task")
 })
 
+test("noteStep: canInject=false defers timing without consuming it (F2 hole 3)", async () => {
+  const engine = new AdvisorEngine({ ...OPTS, nudge: "on" }, makeHost())
+  const blocked = engine.noteStep("s11", true, false)
+  assert.equal(blocked.injectTiming, false, "no injection when system not writable")
+  assert.equal(blocked.injectNudge, false)
+  const next = engine.noteStep("s11", true, true)
+  assert.equal(next.injectTiming, true, "timing not latched by the blocked call")
+})
+
+test("noteStep: nudge suppressed after advisor use", async () => {
+  const engine = new AdvisorEngine({ ...OPTS, nudge: "on" }, makeHost())
+  engine.markAdvisorUsed("s12")
+  engine.noteStep("s12", true)
+  const second = engine.noteStep("s12", true)
+  assert.equal(second.injectNudge, false)
+})
+
+test("transient failures do not consume the success cap", async () => {
+  let fails = 2
+  const host = makeHost({ runAdvisor: async () => { if (fails-- > 0) throw new Error("HTTP 503 overloaded"); return "good advice here" } })
+  const engine = new AdvisorEngine({ ...OPTS, maxUsesPerTask: 1 }, host)
+  const sig = new AbortController().signal
+  assert.equal((await engine.consult("fc", sig)).errorCode, "overloaded")
+  assert.equal((await engine.consult("fc", sig)).errorCode, "overloaded")
+  assert.equal((await engine.consult("fc", sig)).ok, true, "cap intact after failures")
+})
+
+test("attempt ceiling bounds retry storms without punishing single failures", async () => {
+  const host = makeHost({ runAdvisor: async () => { throw new Error("boom") } })
+  const engine = new AdvisorEngine({ ...OPTS, maxUsesPerTask: 1 }, host)
+  const sig = new AbortController().signal
+  for (let i = 0; i < 5; i++) assert.equal((await engine.consult("ac", sig)).errorCode, "unavailable")
+  assert.equal((await engine.consult("ac", sig)).errorCode, "max_uses_exceeded", "ceiling = 1*3+2")
+})
+
+test("task change detected via fingerprint resets caps without a prompt hook", async () => {
+  const host = makeHost()
+  const engine = new AdvisorEngine({ ...OPTS, maxUsesPerTask: 1 }, host)
+  const sig = new AbortController().signal
+  assert.equal((await engine.consult("fp", sig)).ok, true)
+  assert.equal((await engine.consult("fp", sig)).errorCode, "max_uses_exceeded")
+  host.transcript = [{ role: "user", text: "a completely different task about databases" }]
+  assert.equal((await engine.consult("fp", sig)).ok, true, "auto-reset on task change")
+})
+
+test("parallel consults respect the cap via in-flight reservation", async () => {
+  const host = makeHost()
+  const engine = new AdvisorEngine({ ...OPTS, maxUsesPerTask: 2 }, host)
+  const sig = new AbortController().signal
+  const results = await Promise.all([1, 2, 3, 4, 5].map(() => engine.consult("par", sig)))
+  assert.equal(results.filter((r) => r.ok).length, 2, "exactly 2 successes")
+  assert.ok(results.filter((r) => !r.ok).every((r) => r.errorCode === "max_uses_exceeded"))
+})
+
+test("hook-delivery warning fires once when injections never land", async () => {
+  const warnings = []
+  const host = makeHost({ log: (level, msg) => { if (level === "warn") warnings.push(msg) } })
+  const engine = new AdvisorEngine(OPTS, host)
+  for (let i = 0; i < 4; i++) engine.noteStep("hw", false, false)
+  await engine.consult("hw", new AbortController().signal)
+  assert.equal(warnings.length, 1)
+  assert.ok(warnings[0].includes("context hooks"))
+})
+
+test("upstream secrets never reach the tool result", async () => {
+  const host = makeHost({
+    runAdvisor: async () => { throw new Error("HTTP 401 from https://x.com?api_key=SUPERSECRET: Bearer abc.def.ghi") },
+  })
+  const engine = new AdvisorEngine(OPTS, host)
+  const r = await engine.consult("sec", new AbortController().signal)
+  assert.equal(r.ok, false)
+  assert.ok(!r.message.includes("SUPERSECRET"), "query-string secret redacted")
+  assert.ok(!r.message.includes("abc.def.ghi"), "bearer redacted")
+  assert.ok(r.message.includes("<redacted>"))
+})
 test("prompt-enforced budget appears in the advisor prompt", async () => {
   let seenPrompt = ""
   const host = makeHost({ runAdvisor: async (p) => { seenPrompt = p; return "ok advice" } })
   const engine = new AdvisorEngine({ ...OPTS, adviceWordBudget: 80 }, host)
   await engine.consult("s10", new AbortController().signal)
   assert.ok(seenPrompt.includes("under 80 words"), "budget instruction present")
-  assert.ok(seenPrompt.includes("<transcript>"), "transcript framed")
+  assert.ok(/<transcript-[a-z0-9]+>/.test(seenPrompt), "transcript framed with nonce delimiter")
   assert.ok(seenPrompt.includes("EVIDENCE"), "injection defense present")
+  assert.ok(seenPrompt.includes("transcript pruned"), "pruning manifest present (F7)")
 })

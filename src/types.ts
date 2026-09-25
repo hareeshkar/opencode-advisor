@@ -132,9 +132,19 @@ export interface StepDecision {
 }
 
 export interface TaskState {
+  /** Successful advisor uses this task (the user-facing cap). */
   calls: number
+  /** Total dispatch attempts this task (anti-retry-storm ceiling). */
+  attempts: number
+  /** Dispatched but not yet settled (bounds parallel-round overshoot). */
+  inFlight: number
   steps: number
+  timingInjected: boolean
   advisorUsed: boolean
   nudged: boolean
+  /** First-user-slice prefix; detects task changes the prompt hook missed. */
+  taskFingerprint: string | undefined
+  /** One-shot host-hook-delivery warning flag. */
+  hookWarned: boolean
   lastSeen: number
 }

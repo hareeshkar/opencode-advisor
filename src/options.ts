@@ -16,7 +16,10 @@ export const DEFAULTS = {
   adviceWordBudget: 120,
   timeoutMs: 90_000,
   maxToolOutputChars: 1_500,
-  transcriptBudgetChars: 48_000,
+  // 32k chars ≈ 8k tokens: balanced default — the recency-weighted excerpt
+  // plus original-task pinning preserves signal at roughly ⅔ the cost of 48k
+  // (efficiency review F-ledger; tune per workload).
+  transcriptBudgetChars: 32_000,
   nudge: "auto" as const,
   injectTimingPrompt: true,
   logLevel: "info" as const,
@@ -79,6 +82,9 @@ function readLogLevel(v: unknown): LogLevel | undefined {
 
 /** Resolve the full option set. Throws with a precise message on invalid input. */
 export function resolveOptions(raw: unknown): AdvisorOptions {
+  if (Array.isArray(raw)) {
+    throw new Error("[advisor] options must be an object, got an array — check your plugins entry shape")
+  }
   const opts = asRecord(raw)
 
   // 1. defaults
@@ -139,14 +145,24 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   if (optLevel !== undefined) logLevel = optLevel
 
   if (!advisor.providerID || !advisor.id) {
-    throw new Error(
-      "[advisor] no advisor model configured. Set plugin option \"advisor\" = { providerID, id } " +
-        "(or env ADVISOR_PROVIDER + ADVISOR_MODEL). Run `opencode models` to list configured models.",
-    )
+    if (source) {
+      // Source-only config: valid for the V1 adapter (direct provider calls).
+      // The V2 adapter validates the advisor ref itself at setup.
+      advisor = { providerID: "", id: "" }
+    } else {
+      throw new Error(
+        "[advisor] no advisor model configured. Set plugin option \"advisor\" = { providerID, id } " +
+          "(or env ADVISOR_PROVIDER + ADVISOR_MODEL). Run `opencode models` to list configured models.",
+      )
+    }
   }
 
   // sanity: transcript budget must accommodate several slices
   if (transcriptBudgetChars < maxToolOutputChars * 4) {
+    console.warn(
+      `[advisor] transcriptBudgetChars (${transcriptBudgetChars}) raised to maxToolOutputChars*4 ` +
+        `(${maxToolOutputChars * 4}) — a smaller budget cannot hold a meaningful excerpt`,
+    )
     transcriptBudgetChars = maxToolOutputChars * 4
   }
 
@@ -166,16 +182,20 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
 /**
  * Heuristic: executors in the "small/fast" tier benefit from a nudge
  * (Anthropic: +7pp on Haiku-class, neutral on mid-tier, NEGATIVE on
- * frontier-tier). We err on excluding frontier models.
+ * frontier-tier). Explicit small-tier markers win over frontier markers
+ * (e.g. glm-5.3-flash is small despite the glm-5 prefix); unknown models
+ * default to no nudge (conservative — the timing prompt still guides).
  */
-const FRONTIER = /(opus|fable|mythos|gpt-5|o[1-9]\b|ultra|max|pro\b)/i
-const SMALL = /(haiku|flash|mini|nano|lite|turbo|small|instant|swift|air\b|3\.3|8b|9b|14b)/i
+const FRONTIER =
+  /(opus|fable|mythos|ultra|(^|[^a-z0-9])pro([^a-z0-9]|$)|-max([^a-z0-9]|$)|(^|[^a-z0-9])o\d+([^a-z0-9]|$)|gpt-[56]|grok|glm-5(\.\d+)?([^a-z0-9]|$)|deepseek-v4-pro|qwen\d\S*-max|claude-(sonnet|opus|haiku)-[45])/i
+const SMALL = /(haiku|flash|nano|lite|turbo|small|instant|swift|(^|[^a-z0-9])mini([^a-z0-9]|$)|air\b|3\.3|8b|9b|14b)/i
 
 export function shouldNudgeExecutor(modelId: string | undefined, mode: AdvisorOptions["nudge"]): boolean {
   if (mode === "off") return false
   if (mode === "on") return true
   if (!modelId) return false
   const id = modelId.toLowerCase()
+  if (SMALL.test(id)) return true
   if (FRONTIER.test(id)) return false
-  return SMALL.test(id)
+  return false
 }

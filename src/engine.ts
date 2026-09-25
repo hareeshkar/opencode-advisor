@@ -4,29 +4,45 @@
  * Owns everything except transport: per-task call caps, step/nudge decisions,
  * pruning, prompt assembly, timeout enforcement, error-code mapping, output
  * caps, and usage accounting. V1/V2 adapters provide the Host implementation.
+ *
+ * Trust model: transcript content and advisor output are BOTH untrusted I/O.
+ * Errors surfaced to the model are redacted (never raw upstream text);
+ * advice is sanitized and framed as a peer opinion before re-entering the
+ * executor turn.
  */
 
 import { buildAdvisorPrompt } from "./prompts.js"
 import { pruneTranscript } from "./pruner.js"
-import type { AdvisorErrorCode, ConsultResult, Host, StepDecision, TaskState, UsageEntry } from "./types.js"
+import { redactError, sanitizeAdviceText } from "./sanitize.js"
+import type {
+  AdvisorErrorCode,
+  AdvisorOptions,
+  ConsultResult,
+  Host,
+  Slice,
+  StepDecision,
+  TaskState,
+  UsageEntry,
+} from "./types.js"
 
 /**
  * Physical output cap: enforce the word budget exactly (token length varies
  * wildly across languages and models), with a char-based safety ceiling for
- * pathological single-token runs.
+ * pathological single-token runs. One word is reserved for the truncation
+ * marker so output is never `words + 1`.
  */
 function hardCapWords(text: string, words: number): string {
-  const maxChars = words * 12
+  const MARKER = "…[truncated]"
   let t = text
+  const maxChars = words * 12
   if (t.length > maxChars) {
     const cut = t.slice(0, maxChars)
     const lastSpace = cut.lastIndexOf(" ")
     t = (lastSpace > maxChars * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()
-    t += " …[truncated]"
   }
   const parts = t.split(/\s+/).filter((w) => w !== "")
   if (parts.length > words) {
-    t = parts.slice(0, words).join(" ") + " …[truncated]"
+    t = parts.slice(0, Math.max(1, words - 1)).join(" ") + " " + MARKER
   }
   return t
 }
@@ -69,36 +85,96 @@ function classifyError(err: unknown): { errorCode: AdvisorErrorCode; message: st
   return { errorCode: "unavailable", message }
 }
 
+/** First user slice prefix — binds state to the actual task, not just the session. */
+function taskFingerprint(transcript: readonly Slice[]): string {
+  const first = transcript.find((s) => s.role === "user")
+  return first ? first.text.slice(0, 120) : ""
+}
+
+/**
+ * Bound the raw transcript BEFORE normalization cost grows with session size:
+ * keep the original task plus the most recent slices under 4× the char
+ * budget (and at most MAX_WINDOW_SLICES). Recency is what the pruner wants
+ * anyway; this only caps peak memory.
+ */
+const MAX_WINDOW_SLICES = 400
+
+export function windowTranscript(slices: readonly Slice[], budgetChars: number): Slice[] {
+  const cap = budgetChars * 4
+  const firstUserIdx = slices.findIndex((s) => s.role === "user")
+  let used = 0
+  let start = slices.length
+  let count = 0
+  for (let i = slices.length - 1; i >= 0 && count < MAX_WINDOW_SLICES; i--) {
+    const len = slices[i]!.text.length
+    if (used + len > cap && count > 0) break
+    used += len
+    start = i
+    count++
+  }
+  const out = slices.slice(start)
+  if (firstUserIdx >= 0 && firstUserIdx < start) return [slices[firstUserIdx]!, ...out]
+  return [...out]
+}
+
 const MAX_TRACKED_SESSIONS = 512
 
 export class AdvisorEngine {
   private tasks = new Map<string, TaskState>()
 
   constructor(
-    private readonly opts: import("./types.js").AdvisorOptions,
+    private readonly opts: AdvisorOptions,
     private readonly host: Host,
   ) {}
 
   private state(sessionID: string): TaskState {
     let st = this.tasks.get(sessionID)
     if (!st) {
-      if (this.tasks.size >= MAX_TRACKED_SESSIONS) {
-        // evict the least-recently-seen entry
-        let oldestKey: string | undefined
-        let oldest = Infinity
-        for (const [k, v] of this.tasks) if (v.lastSeen < oldest) (oldest = v.lastSeen), (oldestKey = k)
-        if (oldestKey) this.tasks.delete(oldestKey)
+      this.evictIfNeeded()
+      st = {
+        calls: 0,
+        attempts: 0,
+        inFlight: 0,
+        steps: 0,
+        timingInjected: false,
+        advisorUsed: false,
+        nudged: false,
+        taskFingerprint: undefined,
+        hookWarned: false,
+        lastSeen: Date.now(),
       }
-      st = { calls: 0, steps: 0, advisorUsed: false, nudged: false, lastSeen: Date.now() }
       this.tasks.set(sessionID, st)
     }
     st.lastSeen = Date.now()
     return st
   }
 
-  /** New user prompt admitted → fresh task state. */
+  /** Bound the task map; call before every insertion. */
+  private evictIfNeeded(): void {
+    if (this.tasks.size < MAX_TRACKED_SESSIONS) return
+    let oldestKey: string | undefined
+    let oldest = Infinity
+    for (const [k, v] of this.tasks) if (v.lastSeen < oldest) (oldest = v.lastSeen), (oldestKey = k)
+    if (oldestKey) this.tasks.delete(oldestKey)
+  }
+
+  /**
+   * New user prompt admitted → fresh task state. Mutates in place so an
+   * in-flight consult keeps writing to the live object instead of an orphan.
+   */
   resetTask(sessionID: string): void {
-    this.tasks.set(sessionID, { calls: 0, steps: 0, advisorUsed: false, nudged: false, lastSeen: Date.now() })
+    this.evictIfNeeded()
+    const st = this.state(sessionID)
+    st.calls = 0
+    st.attempts = 0
+    st.inFlight = 0
+    st.steps = 0
+    st.timingInjected = false
+    st.advisorUsed = false
+    st.nudged = false
+    st.taskFingerprint = undefined
+    st.hookWarned = false
+    st.lastSeen = Date.now()
   }
 
   markAdvisorUsed(sessionID: string): void {
@@ -107,80 +183,149 @@ export class AdvisorEngine {
 
   /**
    * Called once per model request (context hook / system transform).
-   * Returns the injection decision for this step. Timing fires on the first
-   * step of a task only; the nudge fires once at NUDGE_STEP for eligible
-   * executors that haven't used the advisor (Anthropic: +7pp Haiku-class,
-   * negative on frontier-tier).
+   *
+   * Injection is STATE-DRIVEN, not index-driven: the timing prompt fires on
+   * the first *injectable* call of a task (whatever its index), and flags
+   * latch only when the caller confirms the system array was actually
+   * writable — so a non-array `event.system` or a failed prompt-hook
+   * registration degrades gracefully instead of silently suppressing
+   * guidance. The nudge window opens at the 2nd call and stays open, so
+   * hidden/auxiliary model calls can't steal the slot.
+   *
+   * `nudgeEligible` may be a lazy callback so executor-tier matching runs
+   * only when a nudge is actually on the table.
    */
-  noteStep(sessionID: string, executorModelId: string | undefined, nudgeEligible: boolean): StepDecision {
+  noteStep(
+    sessionID: string,
+    nudgeEligible: boolean | (() => boolean),
+    canInject = true,
+  ): StepDecision {
     const st = this.state(sessionID)
-    const step = st.steps++
-    const injectTiming = this.opts.injectTimingPrompt && step === 0
-    const NUDGE_STEP = 1 // fires on the 2nd model call of a task
-    const injectNudge =
-      !st.nudged &&
-      !st.advisorUsed &&
-      step === NUDGE_STEP &&
-      nudgeEligible &&
-      (this.opts.nudge === "on" || (this.opts.nudge === "auto" && nudgeEligible))
+    st.steps++
+    const injectTiming = this.opts.injectTimingPrompt && !st.timingInjected && canInject
+    if (injectTiming) st.timingInjected = true
+    const nudgePossible = !st.nudged && !st.advisorUsed && st.steps >= 2
+    const eligible = nudgePossible ? (typeof nudgeEligible === "function" ? nudgeEligible() : nudgeEligible) : false
+    const injectNudge = nudgePossible && eligible && canInject && this.opts.nudge !== "off"
     if (injectNudge) st.nudged = true
-    void executorModelId
     return { injectTiming, injectNudge }
   }
 
   /** The core escalation path, invoked by the `advisor` tool executor. */
   async consult(sessionID: string, signal: AbortSignal): Promise<ConsultResult> {
     const st = this.state(sessionID)
-    st.calls++
-    if (st.calls > this.opts.maxUsesPerTask) {
-      return {
-        ok: false,
-        errorCode: "max_uses_exceeded",
-        message: `Advisor cap of ${this.opts.maxUsesPerTask} calls reached for this task. Continue without further advice.`,
-      }
+    const started = Date.now()
+    const fail = (
+      errorCode: AdvisorErrorCode,
+      message: string,
+      tokensIn = 0,
+    ): ConsultResult => {
+      this.recordUsage(false, tokensIn, 0, Date.now() - started).catch(() => {})
+      return { ok: false, errorCode, message: redactError(message) }
     }
 
-    const started = Date.now()
-    let transcript: readonly import("./types.js").Slice[]
+    // Fetch FIRST: the transcript identifies the task, so a stale cap from a
+    // missed prompt hook must never block the very consult that would heal
+    // it. A session.context read is local and token-free.
+    let transcript: readonly Slice[]
     try {
       transcript = await this.host.getTranscript(sessionID)
     } catch (err) {
       const { errorCode, message } = classifyError(err)
-      return { ok: false, errorCode, message: `transcript read failed: ${message}` }
+      return fail(errorCode, `transcript read failed: ${message}`)
     }
 
-    const pruned = pruneTranscript(transcript, this.opts.prune)
+    // Self-healing: task changed without a prompt-hook reset → start fresh.
+    const fp = taskFingerprint(transcript)
+    if (st.taskFingerprint === undefined) {
+      st.taskFingerprint = fp
+    } else if (fp !== st.taskFingerprint) {
+      this.resetTask(sessionID)
+      this.state(sessionID).taskFingerprint = fp
+    }
+
+    // Successful-use cap (failures never consume it) plus an in-flight
+    // reservation so parallel tool rounds can't overshoot the cap before
+    // the first completion lands.
+    if (st.calls + st.inFlight >= this.opts.maxUsesPerTask) {
+      return {
+        ok: false,
+        errorCode: "max_uses_exceeded",
+        message: `Advisor already consulted ${st.calls}/${this.opts.maxUsesPerTask} successful times this task. Continue without further advice.`,
+      }
+    }
+
+    // Attempt ceiling: bounds retry storms against a throttled provider
+    // without punishing the user for transient failures.
+    const attemptCeiling = this.opts.maxUsesPerTask * 3 + 2
+    if (st.attempts >= attemptCeiling) {
+      return {
+        ok: false,
+        errorCode: "max_uses_exceeded",
+        message: `Advisor attempt ceiling (${attemptCeiling}) reached this task. Continue without further advice.`,
+      }
+    }
+    st.attempts++
+    st.inFlight++
+    try {
+      return await this.dispatch(st, transcript, sessionID, signal, fail, started)
+    } finally {
+      st.inFlight--
+    }
+  }
+
+  private async dispatch(
+    st: TaskState,
+    transcript: readonly Slice[],
+    sessionID: string,
+    signal: AbortSignal,
+    fail: (errorCode: AdvisorErrorCode, message: string, tokensIn?: number) => ConsultResult,
+    started: number,
+  ): Promise<ConsultResult> {
+    const pruned = pruneTranscript(windowTranscript(transcript, this.opts.prune.transcriptBudgetChars), this.opts.prune)
     if (pruned.text.trim() === "") {
-      return { ok: false, errorCode: "unavailable", message: "Transcript is empty after pruning — nothing to advise on." }
+      return fail("unavailable", "Transcript is empty after pruning — nothing to advise on.")
     }
 
-    const prompt = buildAdvisorPrompt(pruned.text, this.opts)
+    const prompt = buildAdvisorPrompt(pruned.text, pruned.stats, this.opts)
     const promptChars = prompt.length
+    const estTokensIn = Math.ceil(promptChars / 4)
+
+    // Turn-1 assertion: if model calls keep arriving but no injection was
+    // ever delivered, the host is swallowing context hooks — say so once,
+    // loudly, instead of running a silently unguided task.
+    if (!st.timingInjected && st.steps > 3 && !st.hookWarned) {
+      st.hookWarned = true
+      this.host.log(
+        "warn",
+        "advisor: no system injection delivered after 3+ model calls — host may not be delivering " +
+          "context hooks (timing/nudge guidance inactive). See opencode-advisor troubleshooting.",
+      )
+    }
 
     let raw: string
     try {
       raw = await withTimeout(this.host.runAdvisor(prompt, signal), this.opts.timeoutMs, signal)
     } catch (err) {
-      this.recordUsage(false, 0, 0, Date.now() - started).catch(() => {})
       const { errorCode, message } = classifyError(err)
-      return { ok: false, errorCode, message }
+      return fail(errorCode, message, estTokensIn)
     }
 
-    const advice = hardCapWords(raw.trim(), this.opts.adviceWordBudget)
+    const advice = sanitizeAdviceText(hardCapWords(raw.trim(), this.opts.adviceWordBudget))
     if (advice === "") {
-      this.recordUsage(false, promptChars, 0, Date.now() - started).catch(() => {})
-      return { ok: false, errorCode: "unavailable", message: "Advisor returned an empty response." }
+      return fail("unavailable", "Advisor returned an empty response.", estTokensIn)
     }
 
     const stats = {
       prune: pruned.stats,
       promptChars,
       adviceChars: advice.length,
-      estTokensIn: Math.ceil(promptChars / 4),
+      estTokensIn,
       estTokensOut: Math.ceil(advice.length / 4),
       elapsedMs: Date.now() - started,
     }
-    st.advisorUsed = true
+    st.calls++
+    this.markAdvisorUsed(sessionID)
     this.recordUsage(true, stats.estTokensIn, stats.estTokensOut, stats.elapsedMs, advice.length).catch(() => {})
     this.host.log(
       "info",

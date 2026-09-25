@@ -13,8 +13,9 @@
  */
 
 import type { AdvisorSource } from "./types.js"
+import { PLUGIN_VERSION } from "./types.js"
 
-const USER_AGENT = "opencode-advisor/0.1.0"
+const USER_AGENT = `opencode-advisor/${PLUGIN_VERSION}`
 
 function joinUrl(base: string, path: string): string {
   const b = base.replace(/\/+$/, "")
@@ -56,7 +57,7 @@ async function postJson(
 function requireKey(src: AdvisorSource): string {
   const key = process.env[src.apiKeyEnv]
   if (!key || key.trim() === "") {
-    throw new Error(`advisor source not configured: env ${src.apiKeyEnv} is unset (set it to use ${src.kind} at ${src.baseURL})`)
+    throw new Error(`advisor source not configured: env ${src.apiKeyEnv} is unset`)
   }
   return key.trim()
 }
@@ -65,9 +66,45 @@ function parseJson(body: string): Record<string, unknown> {
   try {
     return JSON.parse(body) as Record<string, unknown>
   } catch {
-    throw new Error(`advisor provider returned non-JSON (HTTP body: ${body.slice(0, 200)})`)
+    throw new Error("advisor provider returned a non-JSON response")
   }
 }
+
+/** Origin only — paths and query strings may carry credentials. */
+function safeOrigin(url: string): string {
+  try {
+    return new URL(url).origin
+  } catch {
+    return "[unparseable-url]"
+  }
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error("aborted")
+}
+
+async function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) throw abortError(signal)
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(abortError(signal))
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+/**
+ * Two attempts max, inside ONE wall-clock budget owned by the engine's
+ * timeout: the retry only runs when there is provably time left for the
+ * backoff plus a second attempt. Error strings carry origin-only URLs and
+ * truncated bodies (the engine redacts secrets before surfacing anyway).
+ */
+const BACKOFF_MS = 1_500
 
 async function callWithRetry(
   url: string,
@@ -76,25 +113,27 @@ async function callWithRetry(
   timeoutMs: number,
   signal: AbortSignal,
 ): Promise<Record<string, unknown>> {
-  let lastErr: unknown
+  const start = Date.now()
   for (let attempt = 1; attempt <= 2; attempt++) {
+    const remaining = timeoutMs - (Date.now() - start)
+    if (remaining <= 0) throw new Error(`advisor provider timed out after ${timeoutMs}ms`)
     let res: HttpResult
     try {
-      res = await postJson(url, headers, body, timeoutMs, signal)
+      res = await postJson(url, headers, body, remaining, signal)
     } catch (err) {
-      lastErr = err
       throw err
     }
     if (res.status >= 200 && res.status < 300) return parseJson(res.body)
     const retryable = res.status === 429 || res.status >= 500
-    const detail = `HTTP ${res.status} from ${url}: ${res.body.slice(0, 300)}`
-    if (retryable && attempt === 1) {
-      await new Promise((r) => setTimeout(r, 1_500))
+    const detail = `HTTP ${res.status} from ${safeOrigin(url)}: ${res.body.slice(0, 120)}`
+    const timeForRetry = Date.now() - start + BACKOFF_MS < timeoutMs
+    if (retryable && attempt === 1 && timeForRetry && !signal.aborted) {
+      await sleepAbortable(BACKOFF_MS, signal)
       continue
     }
     throw new Error(detail)
   }
-  throw new Error(`advisor provider failed: ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`)
+  throw new Error("advisor provider failed without a response")
 }
 
 function textFromAnthropicContent(content: unknown): string {
@@ -124,7 +163,7 @@ async function callAnthropic(src: AdvisorSource, prompt: string, timeoutMs: numb
     signal,
   )
   const text = textFromAnthropicContent(json.content)
-  if (!text) throw new Error(`anthropic advisor returned no text blocks: ${JSON.stringify(json).slice(0, 200)}`)
+  if (!text) throw new Error("anthropic advisor returned no text blocks")
   return text
 }
 
@@ -147,7 +186,7 @@ async function callOpenAICompatible(src: AdvisorSource, prompt: string, timeoutM
   const choices = json.choices
   const message = Array.isArray(choices) && choices[0] && typeof choices[0] === "object" ? (choices[0] as { message?: { content?: unknown } }).message : undefined
   const text = typeof message?.content === "string" ? message.content.trim() : ""
-  if (!text) throw new Error(`openai-compatible advisor returned no message content: ${JSON.stringify(json).slice(0, 200)}`)
+  if (!text) throw new Error("openai-compatible advisor returned no message content")
   return text
 }
 

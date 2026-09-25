@@ -14,45 +14,57 @@
  *     a plain empty-object schema if it is unavailable
  */
 
-import { readFile, mkdir, writeFile } from "node:fs/promises"
+import { readFile, mkdir, writeFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { AdvisorEngine } from "./engine.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
 import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT } from "./prompts.js"
+import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, Slice, UsageEntry } from "./types.js"
 import { callAdvisorProvider } from "./providers.js"
 
 const USAGE_DIR = join(homedir(), ".cache", "opencode-advisor")
 const USAGE_FILE = join(USAGE_DIR, "usage.json")
+const USAGE_TMP = join(USAGE_DIR, "usage.json.tmp")
 
 type UsageFile = Record<string, UsageEntry>
 
-async function persistUsageFile(entry: UsageEntry): Promise<void> {
-  let all: UsageFile = {}
-  try {
-    all = JSON.parse(await readFile(USAGE_FILE, "utf8")) as UsageFile
-  } catch {
-    /* fresh file */
-  }
-  const prev = all[entry.date]
-  all[entry.date] = prev
-    ? {
-        date: entry.date,
-        calls: prev.calls + entry.calls,
-        errors: prev.errors + entry.errors,
-        estTokensIn: prev.estTokensIn + entry.estTokensIn,
-        estTokensOut: prev.estTokensOut + entry.estTokensOut,
-        adviceChars: prev.adviceChars + entry.adviceChars,
+// Serialized read-modify-write (plus atomic tmp+rename) so concurrent
+// consults can't clobber each other's ledger entries.
+let usageChainV1: Promise<void> = Promise.resolve()
+
+function persistUsageFile(entry: UsageEntry): Promise<void> {
+  usageChainV1 = usageChainV1
+    .then(async () => {
+      let all: UsageFile = {}
+      try {
+        all = JSON.parse(await readFile(USAGE_FILE, "utf8")) as UsageFile
+      } catch {
+        /* fresh file */
       }
-    : entry
-  await mkdir(USAGE_DIR, { recursive: true })
-  await writeFile(USAGE_FILE, JSON.stringify(all, null, 2), "utf8")
+      const prev = all[entry.date]
+      all[entry.date] = prev
+        ? {
+            date: entry.date,
+            calls: prev.calls + entry.calls,
+            errors: prev.errors + entry.errors,
+            estTokensIn: prev.estTokensIn + entry.estTokensIn,
+            estTokensOut: prev.estTokensOut + entry.estTokensOut,
+            adviceChars: prev.adviceChars + entry.adviceChars,
+          }
+        : entry
+      await mkdir(USAGE_DIR, { recursive: true })
+      await writeFile(USAGE_TMP, JSON.stringify(all, null, 2), "utf8")
+      await rename(USAGE_TMP, USAGE_FILE)
+    })
+    .catch(() => {})
+  return usageChainV1
 }
 
 /** V1 transcript: client.session.messages → {info, parts}[] (shape varies by version). */
-function normalizeV1Messages(messages: unknown): Slice[] {
+export function normalizeV1Messages(messages: unknown): Slice[] {
   const out: Slice[] = []
   if (!Array.isArray(messages)) return out
   for (const m of messages) {
@@ -69,12 +81,21 @@ function normalizeV1Messages(messages: unknown): Slice[] {
       if (t === "text" && typeof part.text === "string" && part.text.trim() !== "") {
         out.push({ role: role === "assistant" ? "assistant" : "user", text: part.text })
       } else if (t === "tool") {
-        const state = part.state as Record<string, unknown> | undefined
-        const payload =
-          (typeof state?.output === "string" && state.output) ||
-          (typeof state?.input === "string" && state.input) ||
-          (typeof part.output === "string" && part.output) ||
-          ""
+        const state = (part.state ?? {}) as Record<string, unknown>
+        const status = state.status
+        // Partial states are not evidence; error states surface the message.
+        if (status === "streaming" || status === "running") continue
+        let payload = ""
+        if (status === "error") {
+          const err = state.error as { message?: unknown } | undefined
+          payload = err && typeof err.message === "string" ? `[error] ${err.message}` : ""
+        } else {
+          payload =
+            (typeof state.output === "string" && state.output) ||
+            (typeof state.input === "string" && state.input) ||
+            (typeof part.output === "string" && part.output) ||
+            ""
+        }
         if (payload) out.push({ role: "tool", name: typeof part.tool === "string" ? part.tool : "unknown", text: payload })
       }
     }
@@ -97,14 +118,13 @@ async function makeV1Tool(engine: AdvisorEngine, log: (msg: string) => void): Pr
       const sessionID = String(tctx?.sessionID ?? "")
       const signal = tctx?.abort ?? new AbortController().signal
       const r = await engine.consult(sessionID, signal)
-      return r.ok ? r.advice : `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
+      return r.ok ? frameAdvice(r.advice) : `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
     },
   }
 }
 
 export async function createV1Hooks(input: unknown, options?: unknown): Promise<Record<string, unknown>> {
   const ctx = input as { client?: any } | undefined
-  const log = (msg: string): void => console.log(`[${PLUGIN_ID}] ${msg}`)
 
   let opts: AdvisorOptions
   try {
@@ -113,15 +133,24 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
     console.error(`[${PLUGIN_ID}] CONFIG ERROR (v1 adapter): ${err instanceof Error ? err.message : String(err)}`)
     throw err
   }
+  const INFO_ENABLED = opts.logLevel === "debug" || opts.logLevel === "info"
+  const log = (msg: string): void => {
+    if (INFO_ENABLED) console.log(`[${PLUGIN_ID}] ${msg}`)
+  }
+  if (opts.advisor.variant) {
+    console.warn(`[${PLUGIN_ID}] v1 adapter ignores advisor.variant "${opts.advisor.variant}" (direct provider calls use source.model)`)
+  }
 
   const host: Host = {
     getTranscript: async (sessionID) => {
-      const client = ctx?.client
-      if (!client?.session) throw new Error("v1 host has no session client")
-      // V1 SDK shapes vary; try the documented call forms in order.
-      const messages = await (client.session.messages?.({ path: { id: sessionID } }).catch(() =>
-        client.session.messages?.({ query: { sessionID } }),
-      ) ?? [])
+      const fn = ctx?.client?.session?.messages
+      if (typeof fn !== "function") throw new Error("v1 host has no session.messages client")
+      let messages: unknown = []
+      try {
+        messages = await fn({ path: { id: sessionID } })
+      } catch {
+        messages = await fn({ query: { sessionID } })
+      }
       return normalizeV1Messages(messages)
     },
     runAdvisor: async (prompt, signal) => {
@@ -143,17 +172,32 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
 
   log(`v1 adapter v${PLUGIN_VERSION} — advisor=${opts.advisor.providerID}/${opts.advisor.id}${opts.source ? ` source=${opts.source.kind}` : " (NO SOURCE — configure before use)"}`)
 
+  // The system transform carries no reliable sessionID, so track the most
+  // recent session from the hooks that do have it. Residual limitation:
+  // truly concurrent V1 sessions share one step bucket (V2 is the fix).
+  let currentSession = "*"
+
   return {
     "chat.message": async (inp: { sessionID?: string }) => {
       const sid = String(inp?.sessionID ?? "")
-      if (sid) engine.resetTask(sid)
-      else engine.resetTask("*")
+      currentSession = sid || "*"
+      engine.resetTask(currentSession)
     },
-    "experimental.chat.system.transform": async (_inp: unknown, output: { system: string[] }) => {
+    "experimental.chat.system.transform": async (
+      inp: { sessionID?: string; model?: { providerID?: unknown; provider?: unknown; id?: unknown; modelID?: unknown } },
+      output: { system: string[] },
+    ) => {
       try {
-        const d = engine.noteStep("*", undefined, shouldNudgeExecutor(undefined, opts.nudge))
-        if (d.injectTiming && Array.isArray(output?.system)) output.system.push(EXECUTOR_TIMING_PROMPT)
-        if (d.injectNudge && Array.isArray(output?.system)) output.system.push(NUDGE_TEXT)
+        const sid = (typeof inp?.sessionID === "string" && inp.sessionID) || currentSession
+        currentSession = sid
+        const m = inp?.model
+        const modelId = m ? `${String(m.providerID ?? m.provider ?? "")}/${String(m.id ?? m.modelID ?? "")}` : undefined
+        const canInject = Array.isArray(output?.system)
+        const d = engine.noteStep(sid, () => shouldNudgeExecutor(modelId, opts.nudge), canInject)
+        if (canInject) {
+          if (d.injectTiming) output.system.push(EXECUTOR_TIMING_PROMPT)
+          if (d.injectNudge) output.system.push(NUDGE_TEXT)
+        }
       } catch (err) {
         log(`system transform failed (ignored): ${err instanceof Error ? err.message : String(err)}`)
       }

@@ -33,7 +33,7 @@
   "scripts": {
     "build": "bash scripts/build.sh",
     "typecheck": "tsc --noEmit",
-    "test": "bash scripts/build.sh >/dev/null && node --test test/pruner.test.mjs test/engine.test.mjs",
+    "test": "bash scripts/build.sh >/dev/null && node --test test/pruner.test.mjs test/engine.test.mjs test/security.test.mjs test/normalize.test.mjs test/options.test.mjs test/providers.test.mjs",
     "install:local": "bash scripts/install-local.sh"
   },
   "devDependencies": {

@@ -27,9 +27,41 @@ const NOISE_PATTERNS: RegExp[] = [
   /^\s*(> |$)\s*$/m, // bare repl echoes
 ]
 
-/** Strip ANSI escapes and collapse whitespace runs. */
+/** Strip ANSI escapes, Unicode format controls (bidi, isolates, zero-width, BOM)
+ * and C0/C1 codes except tab/newline/CR; collapse whitespace runs.
+ * Property escapes keep this source 100% ASCII — no invisible characters. */
 export function clean(text: string): string {
-  return text.replace(ANSI, "").replace(WHITESPACE_RUNS, "\n\n").trim()
+  return text
+    .replace(ANSI, "")
+    .replace(/[\p{Cf}]/gu, "")
+    .replace(/\p{Cc}/gu, (ch) => (ch === "\t" || ch === "\n" || ch === "\r" ? ch : ""))
+    .replace(WHITESPACE_RUNS, "\n\n")
+    .trim()
+}
+
+/**
+ * Forged slice labels: evidence content containing a line like "[user] ..."
+ * would impersonate executor turns once we add our own labels. Neutralize by
+ * quoting such lines; our own labels are added afterwards and stay canonical.
+ */
+const FORGED_LABEL = /^\[(transcript|original task|user|assistant|tool:[^\]\n]{0,80})\]/gim
+
+function neutralizeLabels(body: string): string {
+  return body.replace(FORGED_LABEL, "> [$1]")
+}
+
+/**
+ * Opaque-blob heuristic (base64 dumps, minified single-token runs): long,
+ * whitespace-poor, >92% base64-alphabet. Such slices consume budget with
+ * zero advisor signal. Normal code (whitespace, punctuation, keywords)
+ * never trips it.
+ */
+function isBlob(text: string): boolean {
+  if (text.length < 300) return false
+  const compact = text.replace(/\s+/g, "")
+  if (compact.length < 300) return false
+  const b64 = compact.match(/[A-Za-z0-9+/=]/g)
+  return b64 !== null && b64.length / compact.length > 0.92
 }
 
 /** Fraction of lines matching noise patterns above which a slice is dropped. */
@@ -87,9 +119,13 @@ export function pruneTranscript(slices: readonly Slice[], opts: PruneOptions): P
   type Prepared = { slice: Slice; body: string; keepFull: boolean }
   const prepared: Prepared[] = []
   for (const s of slices) {
-    const body = clean(s.text)
+    const body = neutralizeLabels(clean(s.text))
     if (body === "") continue
     if (s.role === "tool" && isNoise(body)) {
+      dropped++
+      continue
+    }
+    if (s.role === "tool" && isBlob(body)) {
       dropped++
       continue
     }
@@ -99,35 +135,48 @@ export function pruneTranscript(slices: readonly Slice[], opts: PruneOptions): P
   }
 
   // Pass 2: assemble from the most recent context backwards under budget.
+  // O(n): push newest→oldest, then reverse once. `used` tracks the exact
+  // final byte length including "\n\n" separators, so the budget is a hard
+  // invariant, not an approximation.
+  const SEP = 2 // "\n\n".length
   const budget = opts.transcriptBudgetChars
-  const lines: string[] = []
+  const out: string[] = []
   let used = 0
+  let firstUserKept = false
   for (let i = prepared.length - 1; i >= 0; i--) {
     const p = prepared[i]!
     const line = `${label(p.slice)} ${p.body}`
-    if (used + line.length <= budget || lines.length === 0) {
-      lines.unshift(line)
-      used += line.length
+    const cost = line.length + (out.length > 0 ? SEP : 0)
+    if (used + cost <= budget || out.length === 0) {
+      out.push(line)
+      used += cost
+      if (p.slice.role === "user" && p.keepFull) firstUserKept = true
     } else {
       dropped++
     }
   }
 
   // Pass 3: pin the original task (first user slice) if it fell out of budget.
+  // Evict oldest lines until the pin fits; truncate the pin itself as a last
+  // resort. Every evicted line is newly excluded → counted as dropped.
   const firstUser = prepared.find((p) => p.slice.role === "user" && p.keepFull)
-  if (firstUser && !lines.some((l) => l.startsWith("[user]") && l.includes(firstUser.body.slice(0, 40)))) {
-    const pinned = `[original task] ${truncateMiddle(firstUser.body, Math.min(firstUser.body.length, 2_000))}`
-    if (used + pinned.length > budget && lines.length > 0) {
-      // evict the oldest assembled line to make room
-      const evicted = lines.shift()
-      used -= evicted?.length ?? 0
+  if (firstUser && !firstUserKept) {
+    let pinned = `[original task] ${truncateMiddle(firstUser.body, Math.min(firstUser.body.length, 2_000))}`
+    while (out.length > 0 && used + SEP + pinned.length > budget) {
+      const evicted = out.pop() as string
+      used -= evicted.length + SEP
       dropped++
     }
-    lines.unshift(pinned)
-    used += pinned.length
+    const sep = out.length > 0 ? SEP : 0
+    if (used + sep + pinned.length > budget) {
+      pinned = truncateMiddle(pinned, Math.max(80, budget - used - sep))
+    }
+    used += sep + pinned.length
+    out.push(pinned)
   }
 
-  const text = lines.join("\n\n")
+  out.reverse()
+  const text = out.join("\n\n")
   return {
     text,
     stats: {

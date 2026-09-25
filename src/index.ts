@@ -7,14 +7,15 @@
  *   - OpenCode V1 ≥ 1.18.29 calls `server(input, options)`  (experimental)
  */
 
-import { createV1Hooks } from "./v1.js"
-import { createV2Plugin } from "./v2.js"
+import { createV1Hooks, normalizeV1Messages } from "./v1.js"
+import { createV2Plugin, normalizeV2Transcript } from "./v2.js"
+import { PLUGIN_VERSION } from "./types.js"
 
 const v2 = createV2Plugin()
 
 export default {
   id: v2.id,
-  version: "0.1.0",
+  version: PLUGIN_VERSION,
   setup: v2.setup,
   async server(input: unknown, options?: unknown): Promise<Record<string, unknown>> {
     return createV1Hooks(input, options)
@@ -22,7 +23,11 @@ export default {
 }
 
 export { createV1Hooks, createV2Plugin }
-export { AdvisorEngine } from "./engine.js"
-export { pruneTranscript } from "./pruner.js"
+export { normalizeV1Messages, normalizeV2Transcript }
+export { AdvisorEngine, windowTranscript } from "./engine.js"
+export { pruneTranscript, clean } from "./pruner.js"
+export { buildAdvisorPrompt } from "./prompts.js"
+export { redactError, sanitizeEvidence, sanitizeAdviceText, frameAdvice } from "./sanitize.js"
 export { resolveOptions, shouldNudgeExecutor } from "./options.js"
 export { callAdvisorProvider } from "./providers.js"
+export { PLUGIN_VERSION, PLUGIN_ID } from "./types.js"

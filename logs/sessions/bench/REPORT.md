@@ -121,3 +121,14 @@ Across 6 arms (pilot A/B, R2 A/B, R4 A/B): **all green, 0 advisor dispatches**.
 - **Transient flake observed**: 1 empty-text provider response in 19 consults
   (~5%); executor fell back to a direct answer per the directive (correct —
   no silent retry burning credits). No code change; noted.
+
+## /advisor-settings verified live (v0.4.0)
+
+- Both commands registered in the live catalog (`GET /api/command`).
+- Settings execute path proven via API-driven session: composed prompt
+  contains the live 100+ model catalog with names + question-tool flow +
+  config-edit path. Test sessions removed afterward (`session.remove`).
+- Human-answer tail (question → config write) by design needs the user;
+  validated pattern, not headless flow.
+- Credit attribution live: executor cited "advisor model
+  zai-coding-plan/glm-5.3" by name in its answer.

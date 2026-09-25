@@ -69,6 +69,18 @@ arm 4B's own session ID timestamped 1s after its start: **context hooks fire
 in one-shot `run` sessions**. Arm B executors had the tool + timing + nudge
 and chose solo — mechanism exonerated, model choice confirmed.
 
+## GLM advisor validation (zai-coding-plan, cap lifted)
+
+- `glm-5.3` on a REAL task (DB choice): superb advice — specific thresholds,
+  correct trade-offs, actionable next step, budget held, faithfully consumed
+  by the executor. Live advisor set to `zai-coding-plan/glm-5.3`.
+- `glm-5.3-flash`: genuine role adherence (even discerned a content-free probe).
+- Echo incidents EXPLAINED: degenerate self-referential tasks ("quote the
+  advisor's response verbatim") create a liar-paradox loop — the model tries
+  to comply by regurgitating input. Same model + same path advises superbly
+  on real tasks. No plugin change (echo is visible garbage, not silent
+  corruption; documented, not coded).
+
 ## FINAL VERDICT
 
 Across 6 arms (pilot A/B, R2 A/B, R4 A/B): **all green, 0 advisor dispatches**.

@@ -70,10 +70,6 @@ in one-shot `run` sessions**. Arm B executors had the tool + timing + nudge
 and chose solo — mechanism exonerated, model choice confirmed.
 
 ## GLM advisor validation (zai-coding-plan, cap lifted)
-
-- `glm-5.3` on a REAL task (DB choice): superb advice — specific thresholds,
-  correct trade-offs, actionable next step, budget held, faithfully consumed
-  by the executor. Live advisor set to `zai-coding-plan/glm-5.3`.
 - `glm-5.3-flash`: genuine role adherence (even discerned a content-free probe).
 - Echo incidents EXPLAINED: degenerate self-referential tasks ("quote the
   advisor's response verbatim") create a liar-paradox loop — the model tries
@@ -111,3 +107,17 @@ Across 6 arms (pilot A/B, R2 A/B, R4 A/B): **all green, 0 advisor dispatches**.
 4. `model.unavailable` error pattern — from live bogus-id evidence.
 5. No escalation-threshold changes: executors behaved per guidance;
    overfitting to benchmarks would corrupt the product.
+
+## UX verification — frugal triggering live (v0.3.0)
+
+- **Trigger-word flow, end to end**: directive persisted in the admitted user
+  message (DB-verified), consult fired (ledger 16→17), advice consumed and
+  refined into the answer (point-for-point tracking observed).
+- **Explicit request → consults**: "Get consultation on X" → 18th successful
+  consult (GLM-5.3, +897 advice chars), executor cited the key point.
+- **Grant + trivial → restrains**: "you can use advisor if stuck" + "capital
+  of France" → zero tool calls, direct answer, ledger unchanged. The
+  request/grant disjunction works as designed.
+- **Transient flake observed**: 1 empty-text provider response in 19 consults
+  (~5%); executor fell back to a direct answer per the directive (correct —
+  no silent retry burning credits). No code change; noted.

@@ -118,8 +118,13 @@ export interface UsageEntry {
 export interface Host {
   /** Normalized transcript for a session (most recent last). */
   getTranscript(sessionID: string): Promise<readonly Slice[]>
-  /** Run the advisor sub-call. Must be tool-less and history-less. */
-  runAdvisor(prompt: string, signal: AbortSignal): Promise<string>
+  /**
+   * Run the advisor sub-call. Must be tool-less and history-less.
+   * Receives the sessionID so adapters can attach provider-required
+   * routing headers (e.g. opencode-go's x-opencode-session), plus the
+   * per-call evidence nonce for native-request correlation.
+   */
+  runAdvisor(prompt: string, signal: AbortSignal, sessionID: string, nonce: string): Promise<string>
   /** Durable usage aggregation (fire-and-forget semantics). */
   persistUsage(entry: UsageEntry): Promise<void>
   log(level: LogLevel, message: string, data?: unknown): void

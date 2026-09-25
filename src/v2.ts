@@ -213,15 +213,100 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           const messages = await ctx.session.context({ sessionID })
           return normalizeV2Transcript(messages)
         },
-        runAdvisor: async (prompt, signal) => {
-          const model: Record<string, string> = { providerID: opts.advisor.providerID, id: opts.advisor.id }
-          if (opts.advisor.variant) model.variant = opts.advisor.variant
-          // requestOptions.signal (typed on RequestOptions) lets timeout /
-          // cancel actually stop the sub-call instead of orphaning it.
-          const res = await ctx.generate.text({ model, prompt }, { signal })
-          const text = (res as { text?: unknown } | undefined)?.text
-          if (typeof text !== "string" || text === "") throw new Error(`advisor model ${opts.advisor.providerID}/${opts.advisor.id} returned no text`)
-          return text
+        runAdvisor: async (prompt, signal, sessionID, nonce) => {
+          // Session-scoped transient generation (NOT ctx.generate.text):
+          // only session-bound requests emit hooks and inherit the host's
+          // native session headers. The transient endpoint takes no model
+          // parameter, so the advisor model is installed with a switchModel
+          // SANDWICH around the call. Safety argument: the sandwich is
+          // race-free because the session is blocked awaiting this very tool
+          // result — no competing primary request can interleave. Parallel
+          // advisor calls in one session all target the same advisor model.
+          // The original model is restored in `finally`; if the restore
+          // fails the session is left (visibly, repairably) on the advisor.
+          const advisorRef: { providerID: string; id: string; variant?: string } = {
+            providerID: opts.advisor.providerID,
+            id: opts.advisor.id,
+          }
+          if (opts.advisor.variant) advisorRef.variant = opts.advisor.variant
+          if (nonce && sessionID) {
+            pendingAdvisorCalls.set(nonce, sessionID)
+            const timer = setTimeout(() => pendingAdvisorCalls.delete(nonce), opts.timeoutMs + 30_000)
+            if (typeof timer === "object" && timer !== null && "unref" in timer) {
+              (timer as { unref(): void }).unref()
+            }
+          }
+          let prev = sessionModel.get(sessionID)
+          if (!prev) {
+            try {
+              const info = (await ctx.session.get({ sessionID })) as {
+                model?: { providerID?: string; id?: string; variant?: string }
+              }
+              if (info?.model?.providerID && info?.model?.id) {
+                prev = {
+                  providerID: info.model.providerID,
+                  id: info.model.id,
+                  ...(info.model.variant ? { variant: info.model.variant } : {}),
+                }
+                sessionModel.set(sessionID, prev)
+              }
+            } catch {
+              /* fall through to the guard below */
+            }
+          }
+          if (!prev) {
+            throw new Error(
+              "refusing unsafe model sandwich: no tracked executor model for this session and session.get failed",
+            )
+          }
+          const sameModel =
+            prev.providerID === advisorRef.providerID &&
+            prev.id === advisorRef.id &&
+            (prev.variant ?? undefined) === (advisorRef.variant ?? undefined)
+          if (!sameModel) {
+            await ctx.session.switchModel({ sessionID, model: advisorRef })
+          }
+          let before = -1
+          if (opts.logLevel === "debug") {
+            try {
+              before = ((await ctx.session.context({ sessionID })) as unknown[]).length
+            } catch {
+              before = -1
+            }
+          }
+          try {
+            const res = (await ctx.session.generate({ sessionID, prompt })) as { text?: unknown } | undefined
+            const text = res?.text
+            if (typeof text !== "string" || text.trim() === "") {
+              const shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
+              throw new Error(`advisor sub-call returned no text (response shape: ${shape})`)
+            }
+            if (opts.logLevel === "debug" && before >= 0) {
+              try {
+                const after = ((await ctx.session.context({ sessionID })) as unknown[]).length
+                lastHistoryDelta = `${before}→${after}`
+                if (after !== before) {
+                  log("warn", `HISTORY CANARY: session.generate changed persisted history (${before} → ${after} messages)`)
+                }
+              } catch {
+                lastHistoryDelta = "census-failed"
+              }
+            }
+            return text
+          } finally {
+            if (nonce) pendingAdvisorCalls.delete(nonce)
+            if (!sameModel) {
+              try {
+                await ctx.session.switchModel({ sessionID, model: prev })
+              } catch (err) {
+                log(
+                  "error",
+                  `FAILED to restore executor model ${prev.providerID}/${prev.id} — session left on advisor model; the next consult will repair it`,
+                  err,
+                )
+              }
+            }
+          }
         },
         persistUsage,
         log,
@@ -230,6 +315,31 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       // Hook/tool registrations must be disposed on unload — otherwise a
       // plugin reload leaks callbacks and injections fire repeatedly.
       const regs: Array<{ dispose(): Promise<void> }> = []
+      const sessionModel = new Map<string, { providerID: string; id: string; variant?: string }>()
+      // In-flight advisor sub-calls awaiting native dispatch: evidence
+      // nonce → originating sessionID. Lets the http.request hook attach
+      // provider-required routing headers (x-opencode-session) that
+      // transient generate.text calls otherwise lack. Empty 99.9% of the
+      // time, so the hook's hot path is a single Map-size check.
+      const pendingAdvisorCalls = new Map<string, string>()
+      // Debug-only hook observability (surfaced in error results; the hot
+      // path stays a size check + Set add in debug mode, nothing in release).
+      let httpHookLive = false
+      const observedKinds = new Set<string>()
+      const modelRequestKinds = new Set<string>()
+      const generateKinds = new Set<string>()
+      let nonceMatches = 0
+      let toolsStripped = 0
+      let toolsSeen = 0
+      let lastHistoryDelta = "n/a"
+      // Executor model per session, tracked from primary context-hook
+      // events. Lets runAdvisor restore the exact model after the advisor
+      // sandwich below. Falls back to session.get when untracked.
+      // Unproven hooks must never hang setup: bound every registration.
+      const hookTimeout = (name: string): Promise<never> =>
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`${name} hook registration timed out after 5000ms`)), 5000),
+        )
       // Did our own transform see the tool land in the editor? Stronger than
       // a global name search for the startup self-probe.
       let editorSawAdvisor = false
@@ -250,7 +360,11 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               const r = await engine.consult(sessionID, signal)
               if (!r.ok) {
                 log("warn", `consult failed: ${r.errorCode} — ${r.message}`)
-                return { content: `advisor_tool_result_error: ${r.errorCode} — ${r.message}` }
+                let content = `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
+                if (opts.logLevel === "debug") {
+                  content += ` [diag: httpHookLive=${httpHookLive} kinds=[${[...observedKinds].join(",")}] mrKinds=[${[...modelRequestKinds].join(",")}] genKinds=[${[...generateKinds].join(",")}] nonceMatches=${nonceMatches} stripped=${toolsStripped} seen=${toolsSeen} hist=${lastHistoryDelta} pending=${pendingAdvisorCalls.size}]`
+                }
+                return { content }
               }
               return { content: frameAdvice(r.advice) }
             },
@@ -290,6 +404,14 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             if (event?.kind !== undefined && event.kind !== "primary") return
             const modelRef = event?.model
             const modelId = modelRef ? `${String(modelRef.providerID ?? "")}/${String(modelRef.id ?? "")}` : undefined
+            // Track the executor model for the sandwich restore.
+            if (modelRef && typeof modelRef.id === "string" && typeof modelRef.providerID === "string") {
+              sessionModel.set(sid, {
+                providerID: String(modelRef.providerID),
+                id: String(modelRef.id),
+                ...(typeof modelRef.variant === "string" ? { variant: modelRef.variant } : {}),
+              })
+            }
             // canInject: flags latch only when the system array is actually writable,
             // so a non-array event.system retries next call instead of losing the
             // injection for the whole task. Eligibility is lazy so tier regexes
@@ -309,7 +431,119 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         log("warn", "context hook registration failed (timing prompt will not be injected)", err)
       }
 
-      // --- 4) self-probe: prove the tool is actually registered ----------
+      // --- 4) native request observation + session-header injection ----
+      // Fires for every native provider request a session issues. Correlates
+      // advisor sub-calls by their evidence nonce (embedded in the prompt
+      // body) and attaches x-opencode-session so session-routed providers
+      // (opencode-go) accept the call and can apply prompt caching.
+      // The registration itself is race-guarded: an unproven hook must never
+      // hang setup and take the advisor tool down with it.
+      try {
+        const regHttp = await Promise.race([
+          ctx.session.hook("http.request", async (event: any) => {
+            try {
+              if (opts.logLevel === "debug") {
+                httpHookLive = true
+                observedKinds.add(String(event?.kind ?? "?"))
+              }
+              if (pendingAdvisorCalls.size === 0) return
+              const req = event?.request as { clone(): { text(): Promise<string> }; headers: { set(k: string, v: string): void } } | undefined
+              if (!req || typeof req.clone !== "function") return
+              const body = await req.clone().text().catch(() => "")
+              if (!body) return
+              for (const [nonce, sid] of pendingAdvisorCalls) {
+                if (body.includes(nonce)) {
+                  req.headers.set("x-opencode-session", sid)
+                  nonceMatches++
+                  log("debug", `attached x-opencode-session for advisor sub-call (kind=${String(event?.kind ?? "?")})`)
+                  break
+                }
+              }
+            } catch (err) {
+              log("warn", "http.request advisor hook failed (ignored — request proceeds)", err)
+            }
+          }),
+          hookTimeout("http.request"),
+        ])
+        regs.push(regHttp)
+      } catch (err) {
+        log("warn", "http.request hook unavailable (session-routed providers may refuse advisor calls)", err)
+      }
+
+      // --- 4c) generate-kind tool stripping (recursion defense) ---------
+      // session.generate assembles the session's tool catalog unless told
+      // otherwise — including our own `advisor` tool. Correlate EXACTLY via
+      // the evidence nonce in the transient messages (the generate hook
+      // carries full messages, unlike http.request which needs body reads),
+      // and strip tools only for our own sub-calls. All other generate-kind
+      // requests pass through untouched.
+      try {
+        const regGen = await Promise.race([
+          ctx.session.hook("generate", (event: any) => {
+            try {
+              if (opts.logLevel === "debug") {
+                generateKinds.add("generate")
+              }
+              if (pendingAdvisorCalls.size === 0) return
+              const messages = Array.isArray(event?.messages) ? event.messages : []
+              let haystack = ""
+              for (const m of messages) {
+                const c = (m as { content?: unknown })?.content
+                if (typeof c === "string") haystack += c + "\n"
+                else if (Array.isArray(c)) {
+                  for (const p of c) {
+                    const part = p as { text?: unknown }
+                    if (part && typeof part.text === "string") haystack += part.text + "\n"
+                  }
+                }
+              }
+              for (const nonce of pendingAdvisorCalls.keys()) {
+                if (haystack.includes(nonce)) {
+                  try {
+                    toolsSeen += Object.keys((event as { tools?: object }).tools ?? {}).length
+                  } catch {
+                    /* introspection failed — proceed to strip */
+                  }
+                  event.tools = {}
+                  toolsStripped++
+                  log("debug", "stripped tools from advisor sub-call (recursion defense)")
+                  break
+                }
+              }
+            } catch (err) {
+              log("warn", "generate hook failed (ignored — request proceeds)", err)
+            }
+          }),
+          hookTimeout("generate"),
+        ])
+        regs.push(regGen)
+      } catch (err) {
+        log("warn", "generate hook unavailable (advisor sub-calls may see session tools)", err)
+      }
+      // Records which request kinds reach the model layer, including for
+      // transient calls. Race-guarded like all unproven hooks.
+      // --- 4b) model-request observation (diagnostic depth) ---------------
+      // Records which request kinds reach the model layer, including for
+      // transient calls. Race-guarded like all unproven hooks.
+      try {
+        const regModel = await Promise.race([
+          ctx.session.hook("model.request", (event: any) => {
+            try {
+              if (opts.logLevel === "debug") {
+                modelRequestKinds.add(String(event?.kind ?? "?"))
+              }
+            } catch {
+              /* never break the request */
+            }
+          }),
+          hookTimeout("model.request"),
+        ])
+        regs.push(regModel)
+      } catch (err) {
+        log("warn", "model.request hook unavailable (diagnostic depth reduced)", err)
+      }
+
+      // --- 5) self-probe: prove the tool is actually registered ----------
       try {
         const tools = await ctx.tool.list()
         const listed = Array.isArray(tools) && tools.some((t: any) => String(t?.id ?? t?.name ?? "") === "advisor")

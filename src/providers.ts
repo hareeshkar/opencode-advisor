@@ -33,6 +33,7 @@ async function postJson(
   body: unknown,
   timeoutMs: number,
   signal: AbortSignal,
+  extraHeaders: Record<string, string> = {},
 ): Promise<HttpResult> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(new Error(`HTTP timeout after ${timeoutMs}ms`)), timeoutMs)
@@ -42,7 +43,7 @@ async function postJson(
   try {
     const res = await fetch(url, {
       method: "POST",
-      headers: { "content-type": "application/json", "user-agent": USER_AGENT, ...headers },
+      headers: { "content-type": "application/json", "user-agent": USER_AGENT, ...extraHeaders, ...headers },
       body: JSON.stringify(body),
       signal: controller.signal,
     })
@@ -112,6 +113,7 @@ async function callWithRetry(
   body: unknown,
   timeoutMs: number,
   signal: AbortSignal,
+  extraHeaders: Record<string, string> = {},
 ): Promise<Record<string, unknown>> {
   const start = Date.now()
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -119,7 +121,7 @@ async function callWithRetry(
     if (remaining <= 0) throw new Error(`advisor provider timed out after ${timeoutMs}ms`)
     let res: HttpResult
     try {
-      res = await postJson(url, headers, body, remaining, signal)
+      res = await postJson(url, headers, body, remaining, signal, extraHeaders)
     } catch (err) {
       throw err
     }
@@ -147,7 +149,13 @@ function textFromAnthropicContent(content: unknown): string {
 }
 
 /** Anthropic Messages API. max_tokens ≥1024 is the documented advisor-tool minimum. */
-async function callAnthropic(src: AdvisorSource, prompt: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
+async function callAnthropic(
+  src: AdvisorSource,
+  prompt: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+  extraHeaders: Record<string, string> = {},
+): Promise<string> {
   const key = requireKey(src)
   const url = /\/v\d+$/.test(src.baseURL.replace(/\/+$/, "")) ? joinUrl(src.baseURL, "/messages") : joinUrl(src.baseURL, "/v1/messages")
   const headers: Record<string, string> = {
@@ -161,6 +169,7 @@ async function callAnthropic(src: AdvisorSource, prompt: string, timeoutMs: numb
     { model: src.model, max_tokens: 1024, messages: [{ role: "user", content: prompt }] },
     timeoutMs,
     signal,
+    extraHeaders,
   )
   const text = textFromAnthropicContent(json.content)
   if (!text) throw new Error("anthropic advisor returned no text blocks")
@@ -168,7 +177,13 @@ async function callAnthropic(src: AdvisorSource, prompt: string, timeoutMs: numb
 }
 
 /** OpenAI-compatible chat completions (OpenAI, DeepSeek, GLM, Ollama, vLLM, gateways…). */
-async function callOpenAICompatible(src: AdvisorSource, prompt: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
+async function callOpenAICompatible(
+  src: AdvisorSource,
+  prompt: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+  extraHeaders: Record<string, string> = {},
+): Promise<string> {
   const key = requireKey(src)
   const base = src.baseURL.replace(/\/+$/, "")
   const url = /\/v\d+$/.test(base) ? `${base}/chat/completions` : `${base}/v1/chat/completions`
@@ -182,6 +197,7 @@ async function callOpenAICompatible(src: AdvisorSource, prompt: string, timeoutM
     { model: src.model, messages: [{ role: "user", content: prompt }], max_tokens: 768 },
     timeoutMs,
     signal,
+    extraHeaders,
   )
   const choices = json.choices
   const message = Array.isArray(choices) && choices[0] && typeof choices[0] === "object" ? (choices[0] as { message?: { content?: unknown } }).message : undefined
@@ -190,6 +206,14 @@ async function callOpenAICompatible(src: AdvisorSource, prompt: string, timeoutM
   return text
 }
 
-export function callAdvisorProvider(src: AdvisorSource, prompt: string, timeoutMs: number, signal: AbortSignal): Promise<string> {
-  return src.kind === "anthropic" ? callAnthropic(src, prompt, timeoutMs, signal) : callOpenAICompatible(src, prompt, timeoutMs, signal)
+export function callAdvisorProvider(
+  src: AdvisorSource,
+  prompt: string,
+  timeoutMs: number,
+  signal: AbortSignal,
+  extraHeaders: Record<string, string> = {},
+): Promise<string> {
+  return src.kind === "anthropic"
+    ? callAnthropic(src, prompt, timeoutMs, signal, extraHeaders)
+    : callOpenAICompatible(src, prompt, timeoutMs, signal, extraHeaders)
 }

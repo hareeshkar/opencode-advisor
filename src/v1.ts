@@ -153,14 +153,16 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
       }
       return normalizeV1Messages(messages)
     },
-    runAdvisor: async (prompt, signal) => {
+    runAdvisor: async (prompt, signal, sessionID, _nonce) => {
       if (!opts.source) {
         throw new Error(
           "v1 adapter requires a direct advisor source — set plugin option \"source\" { kind, baseURL, apiKeyEnv, model } " +
             "(or ADVISOR_SOURCE_KIND/URL/KEY_ENV/MODEL env vars)",
         )
       }
-      return callAdvisorProvider(opts.source, prompt, opts.timeoutMs, signal)
+      return callAdvisorProvider(opts.source, prompt, opts.timeoutMs, signal, {
+        "x-opencode-session": sessionID,
+      })
     },
     persistUsage: (entry) => persistUsageFile(entry).catch(() => {}),
     log: (level, message, data) => {

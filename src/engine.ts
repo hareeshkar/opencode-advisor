@@ -75,7 +75,7 @@ const ERROR_MAP: Array<[RegExp, AdvisorErrorCode]> = [
   [/timed? ?out|timeout|etimedout|aborted/i, "execution_time_exceeded"],
   [/429|rate.?limit|too many requests|quota/i, "too_many_requests"],
   [/overloaded|capacity|503|502|504|internal server/i, "overloaded"],
-  [/not found|404|unknown model|invalid model|does not exist/i, "model_not_found"],
+  [/not found|404|unknown model|invalid model|does not exist|model unavailable/i, "model_not_found"],
   [/context (length|window)|too long|413|prompt_too_long/i, "prompt_too_long"],
 ]
 
@@ -287,7 +287,10 @@ export class AdvisorEngine {
       return fail("unavailable", "Transcript is empty after pruning — nothing to advise on.")
     }
 
-    const prompt = buildAdvisorPrompt(pruned.text, pruned.stats, this.opts)
+    // Per-call evidence nonce: closes the prompt's evidence region AND lets
+    // the native-request hook correlate this sub-call with its session.
+    const nonce = Math.random().toString(36).slice(2, 12)
+    const prompt = buildAdvisorPrompt(pruned.text, pruned.stats, this.opts, nonce)
     const promptChars = prompt.length
     const estTokensIn = Math.ceil(promptChars / 4)
 
@@ -305,7 +308,7 @@ export class AdvisorEngine {
 
     let raw: string
     try {
-      raw = await withTimeout(this.host.runAdvisor(prompt, signal), this.opts.timeoutMs, signal)
+      raw = await withTimeout(this.host.runAdvisor(prompt, signal, sessionID, nonce), this.opts.timeoutMs, signal)
     } catch (err) {
       const { errorCode, message } = classifyError(err)
       return fail(errorCode, message, estTokensIn)

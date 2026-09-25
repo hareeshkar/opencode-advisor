@@ -22,13 +22,16 @@ executor hits a decision point ──▶ zero-arg `advisor` tool fires
 
 ### OpenCode V2 (verified path)
 
+The config `plugins[].package` entry must point at a **directory** (verified against v2.0.16 — a flat file entry logs `configured plugin path must be a directory`):
+
 ```sh
 git clone https://github.com/hareeshkar/opencode-advisor
 cd opencode-advisor && npm run build
-cp dist/opencode-advisor.js ~/.config/opencode/plugins/opencode-advisor.js
+mkdir -p ~/.config/opencode/opencode-advisor
+cp dist/opencode-advisor.js ~/.config/opencode/opencode-advisor/index.js
 ```
 
-The plugins directory is hot-watched — **no restart required**. Then set the advisor model:
+Plugin directories are hot-watched — **no restart required**. Then configure:
 
 ```jsonc
 // ~/.config/opencode/opencode.json
@@ -36,18 +39,23 @@ The plugins directory is hot-watched — **no restart required**. Then set the a
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "./plugins/opencode-advisor.js",
+      "package": "./opencode-advisor",
       "options": {
-        "advisor": { "providerID": "bailian-token-plan", "id": "deepseek-v4-pro" }
+        "advisor": { "providerID": "zai-coding-plan", "id": "glm-5.3" }
       }
     }
   ]
 }
 ```
 
-Or without config: `export ADVISOR_PROVIDER=bailian-token-plan ADVISOR_MODEL=deepseek-v4-pro`
+Alternative — flat auto-discovery (drops the file into `~/.config/opencode/plugins/`): it loads with **no options**, so configuration must come from env vars instead:
 
-Verify: `grep -i advisor ~/.local/share/opencode/log/opencode.log | tail` → expect `ready v0.1.0 — tool=✓ advisor=…`
+```sh
+cp dist/opencode-advisor.js ~/.config/opencode/plugins/opencode-advisor.js
+export ADVISOR_PROVIDER=zai-coding-plan ADVISOR_MODEL=glm-5.3   # must be set before the service starts
+```
+
+Verify: `grep -i advisor ~/.local/share/opencode/log/opencode.log | tail` → expect `ready v0.1.0 — tool=✓ advisor=…`. A misconfigured plugin fails **loudly** (`failed to load plugin … cause: …`) and never harms the running host.
 
 ### OpenCode V1 ≥ 1.18.29 (experimental)
 

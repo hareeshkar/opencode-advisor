@@ -26,7 +26,7 @@ export { createV1Hooks, createV2Plugin }
 export { normalizeV1Messages, normalizeV2Transcript }
 export { AdvisorEngine, windowTranscript } from "./engine.js"
 export { pruneTranscript, clean } from "./pruner.js"
-export { buildAdvisorPrompt, ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, DEFAULT_TRIGGERS, findTrigger, hasDirective, triggerDirective } from "./prompts.js"
+export { buildAdvisorPrompt, ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, DEFAULT_TRIGGERS, advisorLabel, findTrigger, hasDirective, triggerDirective } from "./prompts.js"
 export { redactError, sanitizeEvidence, sanitizeAdviceText, frameAdvice } from "./sanitize.js"
 export { resolveOptions, shouldNudgeExecutor } from "./options.js"
 export { callAdvisorProvider } from "./providers.js"

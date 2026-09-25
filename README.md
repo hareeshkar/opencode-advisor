@@ -97,6 +97,19 @@ exec: works solo, consults only if stuck
 on V1 copy `commands/advisor.md` into `~/.config/opencode/commands/` (or your
 project's `.opencode/commands/`). Same flow, explicit invocation.
 
+**`/advisor-settings` command** — guided model selection mirroring the
+`/models` UX pattern. V2 renders your authoritative model catalog; the
+executor asks via the native `question` tool (model, then variant/thinking
+effort) and writes your choice into the plugin's `opencode.json` options —
+a transparent diff you can inspect, applied via hot-reload. On V1 copy
+`commands/advisor-settings.md` the same way (the executor reads your
+configured providers itself).
+
+**Credit attribution** — advice arrives framed as `ADVISOR REVIEW by
+<provider/model>`, and executors credit the source when they use it
+("per <model>: ..."), so you always know whose judgment contributed — and
+which model to switch when it doesn't.
+
 | Option | Default | Description |
 |---|---|---|
 | `triggers` | `["advice","advisor","get consultation"]` | Case-insensitive substrings routing user messages to the flow; `[]` disables |

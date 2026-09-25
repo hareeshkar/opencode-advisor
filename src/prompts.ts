@@ -100,17 +100,28 @@ export function hasDirective(text: string): boolean {
   return text.includes(TRIGGER_MARKER)
 }
 
+/** Settings invocations must never trigger consult directives. */
+export function isSettingsInvocation(text: string): boolean {
+  return text.includes("advisor-settings")
+}
+
+/** Human label for the configured advisor (framing + credit attribution). */
+export function advisorLabel(opts: AdvisorOptions): string {
+  return `${opts.advisor.providerID}/${opts.advisor.id}${opts.advisor.variant ? `#${opts.advisor.variant}` : ""}`
+}
+
 /**
- * Directive appended to a trigger-word user prompt (~90 tokens). Distinguishes
+ * Directive appended to a trigger-word user prompt (~100 tokens). Distinguishes
  * a consultation REQUEST (call now) from a future-use GRANT ("if stuck" —
  * remember, call only if genuinely stuck or before declaring done), so a
- * casual permission never triggers immediate spend.
+ * casual permission never triggers immediate spend. Fires only on explicit
+ * user intent, so verbosity here is cheap and clarity is everything.
  */
 export function triggerDirective(matched: string): string {
   return [
     `[advisor requested by user — trigger: "${matched}"]`,
-    `The user mentioned the advisor. If they ask for consultation now (advice, review, consultation, the /advisor command), call the \`advisor\` tool before responding (no parameters; full conversation forwarded automatically).`,
-    `If they merely permit future use ("if stuck", "if needed", "you may/can use"), do NOT call now — remember the permission and call only if genuinely stuck or before declaring done.`,
-    `Weigh any reply as peer review, then answer, refining where it holds. If the tool is unavailable, say so in one line and proceed.`,
+    `If the user asks for consultation now (advice, review, consultation, the /advisor command), call the \`advisor\` tool before responding (no parameters; full conversation forwarded).`,
+    `If they merely permit future use ("if stuck", "if needed", "you may/can use"), do NOT call now — remember it; call only if genuinely stuck or before declaring done.`,
+    `Weigh any reply as peer review, then answer, refining where it holds. Credit the advisor model named in its header when you use the advice. If the tool is unavailable, say so in one line and proceed.`,
   ].join(" ")
 }

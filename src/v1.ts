@@ -19,7 +19,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { AdvisorEngine } from "./engine.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, findTrigger, hasDirective, triggerDirective } from "./prompts.js"
+import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, advisorLabel, findTrigger, hasDirective, isSettingsInvocation, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, Slice, UsageEntry } from "./types.js"
@@ -103,7 +103,7 @@ export function normalizeV1Messages(messages: unknown): Slice[] {
   return out
 }
 
-async function makeV1Tool(engine: AdvisorEngine, log: (msg: string) => void): Promise<Record<string, unknown>> {
+async function makeV1Tool(engine: AdvisorEngine, log: (msg: string) => void, opts: AdvisorOptions): Promise<Record<string, unknown>> {
   let args: unknown = {}
   try {
     const { z } = (await import("zod")) as { z: { object: (s: Record<string, never>) => unknown } }
@@ -118,7 +118,7 @@ async function makeV1Tool(engine: AdvisorEngine, log: (msg: string) => void): Pr
       const sessionID = String(tctx?.sessionID ?? "")
       const signal = tctx?.abort ?? new AbortController().signal
       const r = await engine.consult(sessionID, signal)
-      return r.ok ? frameAdvice(r.advice) : `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
+      return r.ok ? frameAdvice(r.advice, advisorLabel(opts)) : `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
     },
   }
 }
@@ -193,7 +193,7 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
         for (let i = parts.length - 1; i >= 0; i--) {
           const p = parts[i] as { type?: unknown; text?: unknown }
           if (p !== null && typeof p === "object" && p.type === "text" && typeof p.text === "string") {
-            if (!hasDirective(p.text)) {
+            if (!hasDirective(p.text) && !isSettingsInvocation(p.text)) {
               const matched = findTrigger(p.text, opts.triggers)
               if (matched) {
                 p.text = `${p.text}\n\n${triggerDirective(matched)}`
@@ -226,23 +226,33 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
         log(`system transform failed (ignored): ${err instanceof Error ? err.message : String(err)}`)
       }
     },
-    tool: { advisor: await makeV1Tool(engine, log) },
+    tool: { advisor: await makeV1Tool(engine, log, opts) },
     // V1 has no command-registration API, so /advisor arrives as a user
     // command FILE (see commands/advisor.md) or any command named exactly
     // "advisor". Intercept here and append the directive to its submitted
     // parts (proven live refs from server source). Marker-guarded against
-    // doubles when the command path also crosses chat.message.
+    // doubles when the command path also crosses chat.message. The
+    // /advisor-settings command gets a catalog assist instead of a consult
+    // directive (settings must never trigger spend).
     "command.execute.before": async (
       inp: { command?: string; sessionID?: string; arguments?: string },
       output?: { parts?: unknown },
     ) => {
       try {
-        if (String(inp?.command ?? "") !== "advisor") return
+        const cmd = String(inp?.command ?? "")
+        if (cmd !== "advisor" && cmd !== "advisor-settings") return
         const parts = Array.isArray(output?.parts) ? (output as { parts: unknown[] }).parts : []
         for (let i = parts.length - 1; i >= 0; i--) {
           const p = parts[i] as { type?: unknown; text?: unknown }
           if (p !== null && typeof p === "object" && p.type === "text" && typeof p.text === "string") {
-            if (!hasDirective(p.text)) {
+            if (cmd === "advisor-settings") {
+              if (!p.text.includes("[advisor-settings assist]")) {
+                p.text =
+                  `${p.text}\n\n[advisor-settings assist] Before asking, read the configured providers from the ` +
+                  `opencode.json file containing the opencode-advisor plugin entry so the options you offer reflect reality.`
+                log("advisor-settings command intercepted (v1 command.execute.before) — assist appended")
+              }
+            } else if (!hasDirective(p.text)) {
               p.text = `${p.text}\n\n${triggerDirective("/advisor")}`
               log("advisor command intercepted (v1 command.execute.before) — directive appended")
             }

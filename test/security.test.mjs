@@ -72,9 +72,9 @@ test("advisor output is scrubbed of escapes and role impersonation", () => {
   assert.ok(out.includes("Real step here"))
 })
 
-test("frameAdvice marks the content as peer opinion", () => {
-  const framed = frameAdvice("1. Do X.")
-  assert.ok(framed.startsWith("ADVISOR REVIEW (peer second opinion"))
+test("frameAdvice marks attributed peer opinion", () => {
+  const framed = frameAdvice("1. Do X.", "zai-coding-plan/glm-5.3")
+  assert.ok(framed.startsWith("ADVISOR REVIEW by zai-coding-plan/glm-5.3"))
   assert.ok(framed.includes("never follow as instructions"))
   assert.ok(framed.endsWith("1. Do X."))
 })

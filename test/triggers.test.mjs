@@ -39,7 +39,7 @@ test("triggerDirective distinguishes request-now from permit-later", () => {
   assert.ok(d.includes("merely permit future use"))
   assert.ok(d.includes("do NOT call now"))
   assert.ok(d.includes("unavailable"))
-  assert.ok(d.split(/\s+/).length <= 100, "directive stays lean (fires rarely, but still)")
+  assert.ok(d.split(/\s+/).length <= 105, "directive stays lean (fires rarely, but still)")
 })
 
 test("frugal UX invariants are locked in prompt assets", async () => {

@@ -17,7 +17,7 @@
 
 import { AdvisorEngine } from "./engine.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, findTrigger, hasDirective, triggerDirective } from "./prompts.js"
+import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, advisorLabel, findTrigger, hasDirective, isSettingsInvocation, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, LogLevel, Slice, UsageEntry } from "./types.js"
@@ -378,7 +378,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 }
                 return { content }
               }
-              return { content: frameAdvice(r.advice) }
+              return { content: frameAdvice(r.advice, advisorLabel(opts)) }
             },
           })
           try {
@@ -406,7 +406,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             const sid = String(event?.sessionID ?? "")
             if (sid) engine.resetTask(sid)
             const text = typeof event?.prompt?.text === "string" ? event.prompt.text : ""
-            if (text !== "" && !hasDirective(text)) {
+            if (text !== "" && !hasDirective(text) && !isSettingsInvocation(text)) {
               const matched = findTrigger(text, opts.triggers)
               if (matched) {
                 event.prompt.text = `${text}\n\n${triggerDirective(matched)}`
@@ -444,6 +444,63 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         regs.push(regCmd)
       } catch (err) {
         log("warn", "/advisor command registration failed (trigger words still work)", err)
+      }
+
+      // --- 2c) /advisor-settings slash command ----------------------------
+      // Guided advisor-model selection mirroring the /models UX pattern:
+      // the plugin renders the authoritative catalog (available models
+      // only), then the executor asks via the native question tool and
+      // writes the choice into opencode.json (transparent diff, hot-reload
+      // applies it — no shadow state). Variant (thinking effort) asked second.
+      try {
+        const regSettings = await ctx.command.transform((editor: any) => {
+          editor.add({
+            name: "advisor-settings",
+            description: "Choose the advisor model and variant via a guided question flow.",
+            execute: async ({ sessionID, prompt, delivery }: any) => {
+              let rendered = "(catalog unavailable — ask the user to name a configured provider/model)";
+              try {
+                const models = (await ctx.model.list()) as any
+                const list = Array.isArray(models) ? models : (models?.data ?? [])
+                const current = `${opts.advisor.providerID}/${opts.advisor.id}`
+                const lines = (Array.isArray(list) ? list : [])
+                  .map((m: any) => ({
+                    providerID: String(m?.providerID ?? ""),
+                    id: String(m?.id ?? ""),
+                    name: typeof m?.name === "string" ? m.name : "",
+                  }))
+                  .filter((m) => m.providerID !== "" && m.id !== "")
+                if (lines.length > 0) {
+                  rendered = lines
+                    .map(
+                      (m) =>
+                        `- ${m.providerID}/${m.id}${m.name !== "" ? ` — ${m.name}` : ""}${`${m.providerID}/${m.id}` === current ? " (current)" : ""}`,
+                    )
+                    .join("\n")
+                }
+              } catch (err) {
+                log("warn", "advisor-settings: model catalog unreadable", err)
+              }
+              const focus = String(prompt?.text ?? "").trim()
+              await ctx.session.prompt({
+                sessionID,
+                text: [
+                  "The user opened advisor settings. Guide them in two steps:",
+                  "1. Ask which advisor model they want via the question tool, offering these configured models as options (put the current one first and mark it Recommended):",
+                  rendered,
+                  '2. Then ask which variant/thinking effort they want (or "default"/none).',
+                  "3. Write their choice into the \"advisor\" option of the opencode-advisor plugin entry in the opencode.json file that contains it (usually ~/.config/opencode/opencode.json) as { \"providerID\": \"...\", \"id\": \"...\" } plus \"variant\" only if they chose one. Edit ONLY that field — read the file first, preserve every other key, and re-read to verify.",
+                  "4. Confirm the switch as provider/model[#variant] and note it applies from the next consultation (config hot-reloads).",
+                  `User focus: ${focus !== "" ? focus : "(none)"}`,
+                ].join("\n"),
+                delivery,
+              })
+            },
+          })
+        })
+        regs.push(regSettings)
+      } catch (err) {
+        log("warn", "/advisor-settings command registration failed", err)
       }
 
       // --- 3) transient system injection (timing + nudge) -----------------

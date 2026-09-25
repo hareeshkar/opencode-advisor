@@ -3,6 +3,16 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.4.0] — 2026-09-25
+
+### Added
+- **`/advisor-settings` command**: guided model + variant selection mirroring
+  the `/models` UX — plugin renders the authoritative catalog, executor asks
+  via the native `question` tool, choice lands in `opencode.json` (V2
+  transform; V1 file + catalog-assist hook).
+- **Credit attribution**: advice framed as `ADVISOR REVIEW by <model>`;
+  executors credit the source when they use it.
+
 ## [0.3.0] — 2026-09-25
 
 ### Added

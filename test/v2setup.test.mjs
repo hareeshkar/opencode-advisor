@@ -56,6 +56,12 @@ function makeCtx(overrides = {}) {
         return { dispose: async () => {} }
       },
     },
+    model: {
+      list: async () => [
+        { providerID: "p", id: "a", name: "Advisor A" },
+        { providerID: "q", id: "b", name: "Advisor B" },
+      ],
+    },
     generate: {
       text: async () => ({ text: "UNUSED" }),
     },
@@ -64,15 +70,17 @@ function makeCtx(overrides = {}) {
   return { ctx, captured }
 }
 
-test("setup registers the advisor tool and the /advisor command", async () => {
+test("setup registers the advisor tool and both commands", async () => {
   const { ctx, captured } = makeCtx()
   const plugin = createV2Plugin()
   const cleanup = await plugin.setup(ctx)
   assert.equal(captured.tools.length, 1)
   assert.equal(captured.tools[0].name, "advisor")
   assert.ok(captured.tools[0].description.length > 20)
-  assert.equal(captured.commands.length, 1)
-  assert.equal(captured.commands[0].name, "advisor")
+  assert.deepEqual(
+    captured.commands.map((c) => c.name).sort(),
+    ["advisor", "advisor-settings"],
+  )
   assert.equal(typeof cleanup, "function")
   await cleanup()
 })
@@ -120,4 +128,20 @@ test("/advisor command submits a directive-bearing prompt", async () => {
   assert.ok(submitted.text.includes("review the cache"), "focus preserved")
   assert.ok(submitted.text.includes("[advisor requested"), "directive composed (hook will skip re-append)")
   assert.equal(submitted.delivery, "steer")
+})
+
+test("/advisor-settings composes catalog list and config-edit instruction", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const cmd = captured.commands.find((c) => c.name === "advisor-settings")
+  assert.ok(cmd, "settings command registered")
+  await cmd.execute({ sessionID: "s3", prompt: { text: "prefer cheap" }, delivery: "steer" })
+  assert.equal(captured.prompts.length, 1)
+  const submitted = captured.prompts[0].text
+  assert.ok(submitted.includes("p/a — Advisor A (current)"), "catalog with current marker")
+  assert.ok(submitted.includes("q/b — Advisor B"), "all candidates listed")
+  assert.ok(submitted.includes("question tool"), "native picker instruction")
+  assert.ok(submitted.includes("opencode.json"), "transparent config-edit path")
+  assert.ok(submitted.includes("variant"), "variant selection covered")
+  assert.ok(submitted.includes("prefer cheap"), "user focus preserved")
 })

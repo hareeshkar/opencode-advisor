@@ -181,6 +181,29 @@ export class AdvisorEngine {
     this.state(sessionID).advisorUsed = true
   }
 
+  /** Snapshot of task state for diagnostics (drives the diag:health ledger key). */
+  health(sessionID: string): {
+    calls: number
+    attempts: number
+    steps: number
+    timingInjected: boolean
+    advisorUsed: boolean
+    nudged: boolean
+  } {
+    const st = this.tasks.get(sessionID)
+    if (!st) {
+      return { calls: 0, attempts: 0, steps: 0, timingInjected: false, advisorUsed: false, nudged: false }
+    }
+    return {
+      calls: st.calls,
+      attempts: st.attempts,
+      steps: st.steps,
+      timingInjected: st.timingInjected,
+      advisorUsed: st.advisorUsed,
+      nudged: st.nudged,
+    }
+  }
+
   /**
    * Called once per model request (context hook / system transform).
    *

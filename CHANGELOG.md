@@ -3,6 +3,34 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.2.0] — 2026-09-25
+
+### Added
+- **Session-routed transport**: advisor sub-calls go through session-scoped
+  `session.generate` (the only primitive that emits session hooks and
+  inherits native session headers) with a **switchModel sandwich** for model
+  selection — validated live, including a bogus-id negative probe.
+- **Nonce-correlated header injection**: `http.request` hook attaches
+  `x-opencode-session` to sub-call native requests (required by
+  session-routed providers like opencode-go; enables their prompt caching).
+- **Recursion defense**: `generate`-kind hook strips the tool catalog on
+  exact nonce match, plus advisor prompt rule 4 (no tools, plain text).
+- **Permanent observability**: `diag:health` per consult,
+  `diag:hookcheck` per session, debug-gated diag tails on errors.
+- **Setup race-guards**: unproven hook registrations time out instead of
+  hanging setup (a hang once took the tool down silently).
+
+### Fixed
+- V2 tool evidence extraction rewritten against the real ToolState union.
+- Success-counted caps + attempt ceiling + in-flight reservation.
+- Error redaction, advice sanitization + framing, exact budget accounting.
+
+### Verified
+- 83 unit/integration tests green; 6 benchmark arms all green with zero
+  plugin interference; first true E2E (kimi executor + deepseek-v4.1-flash
+  advisor) returned sharp budget-respecting strategy faithfully consumed.
+- Full report: `logs/sessions/bench/REPORT.md`.
+
 ## [0.1.0] — 2026-09-25
 
 ### Added

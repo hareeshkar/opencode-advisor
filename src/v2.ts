@@ -358,6 +358,18 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               }
               const signal: AbortSignal = tctx?.signal ?? new AbortController().signal
               const r = await engine.consult(sessionID, signal)
+              // Observable hook-delivery signal: last-write-wins health per
+              // consult (bounded: 1 small write per consult, not per call).
+              // Lets post-hoc analysis distinguish "hooks never delivered"
+              // (timingInjected=false, steps high) from "model chose not to
+              // call" — the key ambiguity of the pilot benchmark.
+              try {
+                void ctx.storage
+                  .set("diag:health", { sessionID, time: Date.now(), ...engine.health(sessionID) })
+                  .catch(() => {})
+              } catch {
+                /* storage unavailable — diagnostics only */
+              }
               if (!r.ok) {
                 log("warn", `consult failed: ${r.errorCode} — ${r.message}`)
                 let content = `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
@@ -418,6 +430,17 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             // run only when a nudge is actually on the table.
             const canInject = Array.isArray(event?.system)
             const d = engine.noteStep(sid, () => shouldNudgeExecutor(modelId, opts.nudge), canInject)
+            // Permanent hook-delivery census: one tiny write on each session's
+            // first model call (last-write-wins single key — bounded). Lets
+            // post-hoc analysis prove hooks fire in any session type
+            // (one-shot `run`, subagents, TUI) without per-call amplification.
+            if (engine.health(sid).steps === 1) {
+              try {
+                void ctx.storage.set("diag:hookcheck", { sessionID: sid, time: Date.now() }).catch(() => {})
+              } catch {
+                /* diagnostics only */
+              }
+            }
             if (canInject) {
               if (d.injectTiming) event.system.push({ type: "text", text: EXECUTOR_TIMING_PROMPT })
               if (d.injectNudge) event.system.push({ type: "text", text: NUDGE_TEXT })

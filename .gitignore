@@ -16,8 +16,7 @@ logs/investigations/*
 !logs/investigations/2026-09-25-implementation-live-verify.md
 !logs/sessions/bench/
 logs/sessions/bench/*
-!logs/sessions/bench/TASK.md
-!logs/sessions/bench/REPORT.md
+!logs/sessions/bench/*.md
 .env
 .env.*
 

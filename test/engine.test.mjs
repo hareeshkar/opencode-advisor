@@ -182,6 +182,21 @@ test("hook-delivery warning fires once when injections never land", async () => 
   assert.ok(warnings[0].includes("context hooks"))
 })
 
+test("health() snapshots task state for diagnostics", () => {
+  const engine = new AdvisorEngine(OPTS, makeHost())
+  assert.deepEqual(engine.health("nope"), {
+    calls: 0,
+    attempts: 0,
+    steps: 0,
+    timingInjected: false,
+    advisorUsed: false,
+    nudged: false,
+  })
+  engine.noteStep("h1", true)
+  const h = engine.health("h1")
+  assert.equal(h.steps, 1)
+  assert.equal(h.timingInjected, true)
+})
 test("upstream secrets never reach the tool result", async () => {
   const host = makeHost({
     runAdvisor: async () => { throw new Error("HTTP 401 from https://x.com?api_key=SUPERSECRET: Bearer abc.def.ghi") },

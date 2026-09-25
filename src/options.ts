@@ -6,6 +6,7 @@
  * we compensate by failing loudly wherever we can.)
  */
 
+import { DEFAULT_TRIGGERS } from "./prompts.js"
 import type { AdvisorModelRef, AdvisorOptions, AdvisorSource, LogLevel } from "./types.js"
 
 const ENV = process.env as Record<string, string | undefined>
@@ -141,6 +142,19 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     nudge = optNudge
   }
   if (typeof opts.injectTimingPrompt === "boolean") injectTimingPrompt = opts.injectTimingPrompt
+  let triggers: string[] = [...DEFAULT_TRIGGERS]
+  if (opts.triggers !== undefined) {
+    if (!Array.isArray(opts.triggers)) {
+      throw new Error(`[advisor] option "triggers" must be an array of strings, got ${typeof opts.triggers}`)
+    }
+    triggers = []
+    for (const t of opts.triggers) {
+      if (typeof t !== "string" || t.trim() === "") {
+        throw new Error(`[advisor] option "triggers" must contain only non-empty strings, got ${JSON.stringify(t)}`)
+      }
+      triggers.push(t)
+    }
+  }
   const optLevel = readLogLevel(opts.logLevel)
   if (optLevel !== undefined) logLevel = optLevel
 
@@ -175,6 +189,7 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     prune: { maxToolOutputChars, transcriptBudgetChars },
     nudge,
     injectTimingPrompt,
+    triggers,
     logLevel,
   }
 }

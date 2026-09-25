@@ -1,6 +1,6 @@
 {
   "name": "opencode-advisor",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Model-agnostic advisor orchestration for OpenCode — any executor model escalates to any advisor model mid-task, with strict token budgets and zero transcript pollution.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
   "scripts": {
     "build": "bash scripts/build.sh",
     "typecheck": "tsc --noEmit",
-    "test": "bash scripts/build.sh >/dev/null && node --test test/pruner.test.mjs test/engine.test.mjs test/security.test.mjs test/normalize.test.mjs test/options.test.mjs test/providers.test.mjs",
+    "test": "bash scripts/build.sh >/dev/null && node --test test/pruner.test.mjs test/engine.test.mjs test/security.test.mjs test/normalize.test.mjs test/options.test.mjs test/providers.test.mjs test/triggers.test.mjs test/v1hooks.test.mjs test/v2setup.test.mjs",
     "install:local": "bash scripts/install-local.sh"
   },
   "devDependencies": {

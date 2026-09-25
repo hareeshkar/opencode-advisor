@@ -7,7 +7,7 @@
  */
 
 export const PLUGIN_ID = "opencode-advisor"
-export const PLUGIN_VERSION = "0.2.0"
+export const PLUGIN_VERSION = "0.3.0"
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -59,6 +59,12 @@ export interface AdvisorOptions {
   nudge: "auto" | "on" | "off"
   /** Inject the executor timing prompt (once per task, transient). */
   injectTimingPrompt: boolean
+  /**
+   * Trigger words routing user messages to the advisor flow
+   * (case-insensitive substring; empty list disables the flow).
+   * Default: ["advice", "advisor", "get consultation"].
+   */
+  triggers: string[]
   logLevel: LogLevel
 }
 

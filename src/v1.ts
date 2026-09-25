@@ -19,7 +19,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { AdvisorEngine } from "./engine.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT } from "./prompts.js"
+import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, findTrigger, hasDirective, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, Slice, UsageEntry } from "./types.js"
@@ -180,10 +180,32 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
   let currentSession = "*"
 
   return {
-    "chat.message": async (inp: { sessionID?: string }) => {
+    "chat.message": async (inp: { sessionID?: string }, output?: { parts?: unknown }) => {
       const sid = String(inp?.sessionID ?? "")
       currentSession = sid || "*"
       engine.resetTask(currentSession)
+      // Trigger-word routing: scan text parts (V1 UserMessage carries no
+      // text field — prose lives in parts) and append the consult directive
+      // to the LAST text part in place (no new part → no id assignment
+      // issues with the server's message validation).
+      try {
+        const parts = Array.isArray(output?.parts) ? (output as { parts: unknown[] }).parts : []
+        for (let i = parts.length - 1; i >= 0; i--) {
+          const p = parts[i] as { type?: unknown; text?: unknown }
+          if (p !== null && typeof p === "object" && p.type === "text" && typeof p.text === "string") {
+            if (!hasDirective(p.text)) {
+              const matched = findTrigger(p.text, opts.triggers)
+              if (matched) {
+                p.text = `${p.text}\n\n${triggerDirective(matched)}`
+                log(`advisor trigger "${matched}" — consult directive appended (v1 chat.message)`)
+              }
+            }
+            break
+          }
+        }
+      } catch (err) {
+        log(`chat.message trigger scan failed (ignored): ${err instanceof Error ? err.message : String(err)}`)
+      }
     },
     "experimental.chat.system.transform": async (
       inp: { sessionID?: string; model?: { providerID?: unknown; provider?: unknown; id?: unknown; modelID?: unknown } },
@@ -205,5 +227,31 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
       }
     },
     tool: { advisor: await makeV1Tool(engine, log) },
+    // V1 has no command-registration API, so /advisor arrives as a user
+    // command FILE (see commands/advisor.md) or any command named exactly
+    // "advisor". Intercept here and append the directive to its submitted
+    // parts (proven live refs from server source). Marker-guarded against
+    // doubles when the command path also crosses chat.message.
+    "command.execute.before": async (
+      inp: { command?: string; sessionID?: string; arguments?: string },
+      output?: { parts?: unknown },
+    ) => {
+      try {
+        if (String(inp?.command ?? "") !== "advisor") return
+        const parts = Array.isArray(output?.parts) ? (output as { parts: unknown[] }).parts : []
+        for (let i = parts.length - 1; i >= 0; i--) {
+          const p = parts[i] as { type?: unknown; text?: unknown }
+          if (p !== null && typeof p === "object" && p.type === "text" && typeof p.text === "string") {
+            if (!hasDirective(p.text)) {
+              p.text = `${p.text}\n\n${triggerDirective("/advisor")}`
+              log("advisor command intercepted (v1 command.execute.before) — directive appended")
+            }
+            break
+          }
+        }
+      } catch (err) {
+        log(`command interception failed (ignored): ${err instanceof Error ? err.message : String(err)}`)
+      }
+    },
   }
 }

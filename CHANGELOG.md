@@ -3,6 +3,26 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.3.0] — 2026-09-25
+
+### Added
+- **Native triggering stack**: task.txt-style tool description (WHEN +
+  WHEN-NOT + usage notes — the description is the router), trigger-word
+  routing (`advice`/`advisor`/`get consultation`, configurable, marker-
+  guarded against doubles), `/advisor` command (V2 programmatic
+  registration + V1 `commands/advisor.md` file + `command.execute.before`
+  interception), transient timing/nudge guidance.
+- **Dual-version slash commands**: V1 file-based + `command.execute.before`
+  interception (server-source-verified live refs); V2 transform
+  registration with disposal.
+
+### Verified
+- 100 tests green, including fake-ctx V2 setup tests and direct V1 hook tests.
+- Research: V1/V2 command systems, server-source hook semantics, permission
+  defaults (`ask` on no-match in V1; preapproved in V2), Anthropic tool-
+  design guidance, local skill invocation patterns (description-only —
+  no duplicate skill surface added, documented decision).
+
 ## [0.2.0] — 2026-09-25
 
 ### Added

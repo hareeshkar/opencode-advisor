@@ -17,7 +17,7 @@
 
 import { AdvisorEngine } from "./engine.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT } from "./prompts.js"
+import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, findTrigger, hasDirective, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, LogLevel, Slice, UsageEntry } from "./types.js"
@@ -393,15 +393,57 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         throw err
       }
 
-      // --- 2) task reset on admitted user prompts ------------------------
+      // --- 2) task reset + trigger-word routing on admitted prompts -----
+      // The prompt hook receives an owned, mutable draft: edits become the
+      // canonical persisted input. On a trigger word (advice/advisor/get
+      // consultation, configurable) append a consult directive — the
+      // executor then calls the advisor tool with full context and refines
+      // its answer. Marker-guarded: never double-append (the /advisor
+      // command composes the directive itself).
       try {
         const reg2 = await ctx.session.hook("prompt", (event: any) => {
-          const sid = String(event?.sessionID ?? "")
-          if (sid) engine.resetTask(sid)
+          try {
+            const sid = String(event?.sessionID ?? "")
+            if (sid) engine.resetTask(sid)
+            const text = typeof event?.prompt?.text === "string" ? event.prompt.text : ""
+            if (text !== "" && !hasDirective(text)) {
+              const matched = findTrigger(text, opts.triggers)
+              if (matched) {
+                event.prompt.text = `${text}\n\n${triggerDirective(matched)}`
+                log("info", `advisor trigger "${matched}" — consult directive appended`)
+              }
+            }
+          } catch (err) {
+            log("warn", "prompt hook body failed (ignored — prompt proceeds)", err)
+          }
         })
         regs.push(reg2)
       } catch (err) {
-        log("warn", "prompt hook registration failed (per-task caps degrade to per-session)", err)
+        log("warn", "prompt hook registration failed (per-task caps degrade to per-session; triggers inactive)", err)
+      }
+
+      // --- 2b) /advisor slash command ------------------------------------
+      // Programmatic command registration (V2 API). Composes the directive
+      // directly (with marker) so the prompt hook skips re-appending.
+      try {
+        const regCmd = await ctx.command.transform((editor: any) => {
+          editor.add({
+            name: "advisor",
+            description: "Consult the high-judgment advisor model about the current task or a focus question.",
+            execute: async ({ sessionID, prompt, delivery }: any) => {
+              const focus = String(prompt?.text ?? "").trim()
+              const body = focus !== "" ? `User request:\n${focus}` : "User request: (no focus given — review the current state of the task)"
+              await ctx.session.prompt({
+                sessionID,
+                text: `${body}\n\n${triggerDirective("/advisor")}`,
+                delivery,
+              })
+            },
+          })
+        })
+        regs.push(regCmd)
+      } catch (err) {
+        log("warn", "/advisor command registration failed (trigger words still work)", err)
       }
 
       // --- 3) transient system injection (timing + nudge) -----------------

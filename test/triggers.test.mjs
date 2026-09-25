@@ -1,0 +1,42 @@
+import assert from "node:assert/strict"
+import { test } from "node:test"
+import { DEFAULT_TRIGGERS, findTrigger, hasDirective, triggerDirective } from "../dist/opencode-advisor.js"
+
+test("default triggers cover advice/advisor/get consultation", () => {
+  assert.deepEqual([...DEFAULT_TRIGGERS], ["advice", "advisor", "get consultation"])
+})
+
+test("findTrigger matches case-insensitively", () => {
+  assert.equal(findTrigger("Can I get some ADVICE here?"), "advice")
+  assert.equal(findTrigger("Ask the Advisor now"), "advisor")
+})
+
+test("findTrigger matches the multi-word trigger", () => {
+  assert.equal(findTrigger("I want to get consultation on this"), "get consultation")
+})
+
+test("findTrigger returns undefined without triggers", () => {
+  assert.equal(findTrigger("hello world, how are you"), undefined)
+  assert.equal(findTrigger(""), undefined)
+})
+
+test("findTrigger respects a custom list; empty list disables", () => {
+  assert.equal(findTrigger("advice please", ["consult"]), undefined)
+  assert.equal(findTrigger("please consult the oracle", ["consult"]), "consult")
+  assert.equal(findTrigger("advice please", []), undefined)
+})
+
+test("hasDirective detects the marker", () => {
+  assert.equal(hasDirective("plain text"), false)
+  assert.equal(hasDirective(triggerDirective("advisor")), true)
+  assert.equal(hasDirective("blah [advisor requested by user — trigger: \"x\"] blah"), true)
+})
+
+test("triggerDirective names the trigger and instructs consult-then-refine", () => {
+  const d = triggerDirective("get consultation")
+  assert.ok(d.includes('"get consultation"'))
+  assert.ok(d.includes("call the `advisor` tool"))
+  assert.ok(d.includes("refining with the advice"))
+  assert.ok(d.includes("unavailable"))
+  assert.ok(d.split(/\s+/).length <= 70, "directive stays token-lean")
+})

@@ -68,6 +68,41 @@ Same bundle; the dual-export entrypoint answers `server()` automatically. V1 has
 }]]
 ```
 
+## On-demand consultation: trigger words + `/advisor`
+
+The executor decides tool timing itself (Claude-native: the tool description
+is the router), but two deterministic paths force a consultation:
+
+**Trigger words** — when your message contains `advice`, `advisor`, or `get
+consultation` (configurable via the `triggers` option; empty list disables),
+the plugin appends a consult directive to your admitted prompt. The executor
+then calls the `advisor` tool with full context and refines its answer:
+
+```text
+you:  this deploy plan looks risky — get consultation before proceeding
+      ↓ (directive appended automatically)
+exec: → advisor() → advice → refined plan citing the advice
+```
+
+**`/advisor` command** — V2 registers it automatically (`/advisor [focus]`);
+on V1 copy `commands/advisor.md` into `~/.config/opencode/commands/` (or your
+project's `.opencode/commands/`). Same flow, explicit invocation.
+
+| Option | Default | Description |
+|---|---|---|
+| `triggers` | `["advice","advisor","get consultation"]` | Case-insensitive substrings routing user messages to the flow; `[]` disables |
+
+### Permissions
+
+The advisor is a read-only escalation (it never touches tools, sessions, or
+history) and OpenCode pre-approves tools with no matching rule, so there is
+no approval friction by default. If you run a restrictive setup that asks for
+every tool, allow it explicitly:
+
+```jsonc
+{ "permissions": [{ "action": "advisor", "resource": "*", "effect": "allow" }] }
+```
+
 ## Configuration
 
 | Option | Default | Description |

@@ -19,7 +19,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { AdvisorEngine } from "./engine.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, advisorLabel, findTrigger, hasDirective, isSettingsInvocation, triggerDirective } from "./prompts.js"
+import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, Slice, UsageEntry } from "./types.js"
@@ -118,7 +118,7 @@ async function makeV1Tool(engine: AdvisorEngine, log: (msg: string) => void, opt
       const sessionID = String(tctx?.sessionID ?? "")
       const signal = tctx?.abort ?? new AbortController().signal
       const r = await engine.consult(sessionID, signal)
-      return r.ok ? frameAdvice(r.advice, advisorLabel(opts)) : `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
+      return r.ok ? frameAdvice(r.advice, advisorLabel(engine.advisor())) : `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
     },
   }
 }
@@ -178,29 +178,43 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
   // recent session from the hooks that do have it. Residual limitation:
   // truly concurrent V1 sessions share one step bucket (V2 is the fix).
   let currentSession = "*"
+  // Transient consult directives — delivered via system.transform (invisible,
+  // not persisted), never written into the user's message parts.
+  const pendingDirectives = new Map<string, { text: string; at: number }>()
+  const DIRECTIVE_TTL_MS = 15 * 60_000
+  const queueDirective = (sid: string, text: string): void => {
+    if (sid !== "" && !pendingDirectives.has(sid)) pendingDirectives.set(sid, { text, at: Date.now() })
+  }
+  const takeDirective = (sid: string): string | undefined => {
+    const d = pendingDirectives.get(sid)
+    if (!d) return undefined
+    pendingDirectives.delete(sid)
+    return Date.now() - d.at > DIRECTIVE_TTL_MS ? undefined : d.text
+  }
+  const lastTextPart = (output?: { parts?: unknown }): { text?: unknown } | undefined => {
+    const parts = Array.isArray(output?.parts) ? (output as { parts: unknown[] }).parts : []
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i] as { type?: unknown; text?: unknown }
+      if (p !== null && typeof p === "object" && p.type === "text" && typeof p.text === "string") return p
+    }
+    return undefined
+  }
 
   return {
     "chat.message": async (inp: { sessionID?: string }, output?: { parts?: unknown }) => {
       const sid = String(inp?.sessionID ?? "")
       currentSession = sid || "*"
       engine.resetTask(currentSession)
-      // Trigger-word routing: scan text parts (V1 UserMessage carries no
-      // text field — prose lives in parts) and append the consult directive
-      // to the LAST text part in place (no new part → no id assignment
-      // issues with the server's message validation).
+      // Trigger-word routing: scan text parts for triggers and QUEUE the
+      // consult directive for transient system delivery. The user's message
+      // is never modified (no visible boilerplate, nothing persisted).
       try {
-        const parts = Array.isArray(output?.parts) ? (output as { parts: unknown[] }).parts : []
-        for (let i = parts.length - 1; i >= 0; i--) {
-          const p = parts[i] as { type?: unknown; text?: unknown }
-          if (p !== null && typeof p === "object" && p.type === "text" && typeof p.text === "string") {
-            if (!hasDirective(p.text) && !isSettingsInvocation(p.text)) {
-              const matched = findTrigger(p.text, opts.triggers)
-              if (matched) {
-                p.text = `${p.text}\n\n${triggerDirective(matched)}`
-                log(`advisor trigger "${matched}" — consult directive appended (v1 chat.message)`)
-              }
-            }
-            break
+        const part = lastTextPart(output)
+        if (part && typeof part.text === "string" && !hasDirective(part.text) && !isSettingsInvocation(part.text)) {
+          const matched = findTrigger(part.text, opts.triggers)
+          if (matched) {
+            queueDirective(currentSession, triggerDirective(matched))
+            log(`advisor trigger "${matched}" — directive queued (transient system delivery, v1)`)
           }
         }
       } catch (err) {
@@ -217,8 +231,12 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
         const m = inp?.model
         const modelId = m ? `${String(m.providerID ?? m.provider ?? "")}/${String(m.id ?? m.modelID ?? "")}` : undefined
         const canInject = Array.isArray(output?.system)
-        const d = engine.noteStep(sid, () => shouldNudgeExecutor(modelId, opts.nudge), canInject)
+        const d = isAdvisorConfigured(engine.advisor())
+          ? engine.noteStep(sid, () => shouldNudgeExecutor(modelId, opts.nudge), canInject)
+          : { injectTiming: false, injectNudge: false }
         if (canInject) {
+          const directive = takeDirective(sid)
+          if (directive) output.system.push(directive)
           if (d.injectTiming) output.system.push(EXECUTOR_TIMING_PROMPT)
           if (d.injectNudge) output.system.push(NUDGE_TEXT)
         }
@@ -229,11 +247,10 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
     tool: { advisor: await makeV1Tool(engine, log, opts) },
     // V1 has no command-registration API, so /advisor arrives as a user
     // command FILE (see commands/advisor.md) or any command named exactly
-    // "advisor". Intercept here and append the directive to its submitted
-    // parts (proven live refs from server source). Marker-guarded against
-    // doubles when the command path also crosses chat.message. The
-    // /advisor-settings command gets a catalog assist instead of a consult
-    // directive (settings must never trigger spend).
+    // "advisor". Intercept here and QUEUE the consult directive for
+    // transient system delivery (server-source-verified live hook refs).
+    // The /advisor-settings command gets a catalog assist instead of a
+    // consult directive (settings must never trigger spend).
     "command.execute.before": async (
       inp: { command?: string; sessionID?: string; arguments?: string },
       output?: { parts?: unknown },
@@ -241,23 +258,18 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
       try {
         const cmd = String(inp?.command ?? "")
         if (cmd !== "advisor" && cmd !== "advisor-settings") return
-        const parts = Array.isArray(output?.parts) ? (output as { parts: unknown[] }).parts : []
-        for (let i = parts.length - 1; i >= 0; i--) {
-          const p = parts[i] as { type?: unknown; text?: unknown }
-          if (p !== null && typeof p === "object" && p.type === "text" && typeof p.text === "string") {
-            if (cmd === "advisor-settings") {
-              if (!p.text.includes("[advisor-settings assist]")) {
-                p.text =
-                  `${p.text}\n\n[advisor-settings assist] Before asking, read the configured providers from the ` +
-                  `opencode.json file containing the opencode-advisor plugin entry so the options you offer reflect reality.`
-                log("advisor-settings command intercepted (v1 command.execute.before) — assist appended")
-              }
-            } else if (!hasDirective(p.text)) {
-              p.text = `${p.text}\n\n${triggerDirective("/advisor")}`
-              log("advisor command intercepted (v1 command.execute.before) — directive appended")
-            }
-            break
+        const sid = String(inp?.sessionID ?? "") || currentSession
+        const part = lastTextPart(output)
+        if (cmd === "advisor-settings") {
+          if (part && typeof part.text === "string" && !part.text.includes("[advisor-settings assist]")) {
+            part.text =
+              `${part.text}\n\n[advisor-settings assist] Before asking, read the configured providers from the ` +
+              `opencode.json file containing the opencode-advisor plugin entry so the options you offer reflect reality.`
+            log("advisor-settings command intercepted (v1 command.execute.before) — assist appended")
           }
+        } else {
+          queueDirective(sid, triggerDirective("/advisor"))
+          log("advisor command intercepted (v1 command.execute.before) — directive queued (transient)")
         }
       } catch (err) {
         log(`command interception failed (ignored): ${err instanceof Error ? err.message : String(err)}`)

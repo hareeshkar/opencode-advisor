@@ -102,12 +102,87 @@ export function hasDirective(text: string): boolean {
 
 /** Settings invocations must never trigger consult directives. */
 export function isSettingsInvocation(text: string): boolean {
-  return text.includes("advisor-settings")
+  return text.includes("advisor-settings") || text.includes("advisor settings")
 }
 
-/** Human label for the configured advisor (framing + credit attribution). */
-export function advisorLabel(opts: AdvisorOptions): string {
-  return `${opts.advisor.providerID}/${opts.advisor.id}${opts.advisor.variant ? `#${opts.advisor.variant}` : ""}`
+/** Human label for an advisor model ref (framing + credit attribution). */
+export function advisorLabel(ref: { providerID: string; id: string; variant?: string }): string {
+  return `${ref.providerID}/${ref.id}${ref.variant ? `#${ref.variant}` : ""}`
+}
+
+/** True when an advisor model is configured (override or opencode.json). */
+export function isAdvisorConfigured(ref: { providerID: string; id: string }): boolean {
+  return ref.providerID !== "" && ref.id !== ""
+}
+
+/**
+ * Setup-carrying not_configured message. Deliberately verbose: this text is
+ * the "README at the moment of need" — the executor relays it to the user,
+ * and it must contain everything needed to get configured without leaving
+ * the conversation. Never framed as advice (it is an error result).
+ */
+export function notConfiguredMessage(): string {
+  return [
+    "No advisor model is configured yet, so no consultation happened.",
+    "Relay these setup steps to the user (do NOT invent advice):",
+    "1. In OpenCode, run the `/advisor-settings` command — it opens a picker (model, then variant/thinking effort) and applies the choice immediately (no restart needed on OpenCode V2).",
+    '2. Or set it declaratively in the opencode.json that contains the opencode-advisor plugin entry: "advisor": { "providerID": "<provider>", "id": "<model>" } inside that plugin\'s "options". V2 hot-reloads the config; restart only if your build does not.',
+    "3. List available models with `opencode models` (or `/models` in the TUI) to find provider/model IDs.",
+    "Until configured, the advisor is intentionally silent and costs nothing.",
+  ].join("\n")
+}
+
+/**
+ * Curate a short advisor-model shortlist from the full catalog: current
+ * first, then frontier-tier matches, then cheap tiers, deduplicated and
+ * capped. The native question tool always accepts a typed custom answer on
+ * top, so completeness never requires dumping 100+ models into the prompt.
+ */
+export interface ShortlistEntry {
+  providerID: string
+  id: string
+  name: string
+  current: boolean
+}
+
+const FRONTIER_HINT = /(opus|fable|mythos|sonnet|gpt-[56]|grok|kimi-k[23]|glm-5|qwen\d\S*-(max|plus)|mimo.*-pro|-pro([-. ]|$)|(^|[^\w])pro([^\w]|$)|deepseek-v4-pro|claude)/i
+const CHEAP_HINT = /(flash|mini|haiku|nano|lite|turbo)/i
+
+export function shortlistAdvisorModels(
+  models: ReadonlyArray<{ providerID: string; id: string; name?: string }>,
+  current: { providerID: string; id: string },
+  max = 8,
+): ShortlistEntry[] {
+  const seen = new Set<string>()
+  const out: ShortlistEntry[] = []
+  const push = (providerID: string, id: string, name: string): void => {
+    const key = `${providerID}/${id}`
+    if (seen.has(key) || out.length >= max) return
+    seen.add(key)
+    out.push({ providerID, id, name, current: providerID === current.providerID && id === current.id })
+  }
+  const clean = models.filter((m) => m.providerID !== "" && m.id !== "");
+  const currentConfigured = current.providerID !== "" && current.id !== ""
+  // current first (even if it matches nothing else; never a phantom entry)
+  if (currentConfigured) {
+    const cur = clean.find((m) => m.providerID === current.providerID && m.id === current.id)
+    if (cur) push(cur.providerID, cur.id, cur.name ?? "")
+  }
+  const rest = clean.filter((m) => !seen.has(`${m.providerID}/${m.id}`))
+  const rank = (m: { providerID: string; id: string }): number => {
+    const s = `${m.providerID}/${m.id}`.toLowerCase()
+    if (FRONTIER_HINT.test(s) && !CHEAP_HINT.test(s)) return 0
+    if (FRONTIER_HINT.test(s)) return 1
+    if (!CHEAP_HINT.test(s)) return 2
+    return 3
+  }
+  for (const m of [...rest].sort((a, b) => rank(a) - rank(b))) push(m.providerID, m.id, m.name ?? "")
+  // current not in catalog (e.g. renamed) and configured: still offer it first
+  if (currentConfigured && !seen.has(`${current.providerID}/${current.id}`)) {
+    out.unshift({ providerID: current.providerID, id: current.id, name: "", current: true })
+    seen.add(`${current.providerID}/${current.id}`)
+  }
+  return out.slice(0, max)
 }
 
 /**
@@ -122,6 +197,6 @@ export function triggerDirective(matched: string): string {
     `[advisor requested by user — trigger: "${matched}"]`,
     `If the user asks for consultation now (advice, review, consultation, the /advisor command), call the \`advisor\` tool before responding (no parameters; full conversation forwarded).`,
     `If they merely permit future use ("if stuck", "if needed", "you may/can use"), do NOT call now — remember it; call only if genuinely stuck or before declaring done.`,
-    `Weigh any reply as peer review, then answer, refining where it holds. Credit the advisor model named in its header when you use the advice. If the tool is unavailable, say so in one line and proceed.`,
+    `Weigh any reply as peer review, then answer, refining where it holds. Credit the advisor model named in its header when you use the advice. If it returns a not_configured error, relay its setup steps to me (do not invent advice). If it fails for another reason, say so in one line and proceed.`,
   ].join(" ")
 }

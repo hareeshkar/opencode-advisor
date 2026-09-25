@@ -11,7 +11,7 @@
  * executor turn.
  */
 
-import { buildAdvisorPrompt } from "./prompts.js"
+import { buildAdvisorPrompt, isAdvisorConfigured, notConfiguredMessage } from "./prompts.js"
 import { pruneTranscript } from "./pruner.js"
 import { redactError, sanitizeAdviceText } from "./sanitize.js"
 import type {
@@ -121,11 +121,25 @@ const MAX_TRACKED_SESSIONS = 512
 
 export class AdvisorEngine {
   private tasks = new Map<string, TaskState>()
+  /** Live advisor model — config default, overridable at runtime (settings). */
+  private advisorRef: import("./types.js").AdvisorModelRef
 
   constructor(
     private readonly opts: AdvisorOptions,
     private readonly host: Host,
-  ) {}
+  ) {
+    this.advisorRef = { ...opts.advisor }
+  }
+
+  /** The advisor model currently in effect (override or config default). */
+  advisor(): import("./types.js").AdvisorModelRef {
+    return this.advisorRef
+  }
+
+  /** Hot-swap the advisor model (used by /advisor-settings). */
+  setAdvisor(ref: import("./types.js").AdvisorModelRef): void {
+    this.advisorRef = { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) }
+  }
 
   private state(sessionID: string): TaskState {
     let st = this.tasks.get(sessionID)
@@ -236,6 +250,11 @@ export class AdvisorEngine {
 
   /** The core escalation path, invoked by the `advisor` tool executor. */
   async consult(sessionID: string, signal: AbortSignal): Promise<ConsultResult> {
+    // Unconfigured installs answer with setup steps instead of advice —
+    // before any bookkeeping, so it never consumes caps or attempts.
+    if (!isAdvisorConfigured(this.advisorRef)) {
+      return { ok: false, errorCode: "not_configured", message: notConfiguredMessage() }
+    }
     const st = this.state(sessionID)
     const started = Date.now()
     const fail = (
@@ -331,7 +350,7 @@ export class AdvisorEngine {
 
     let raw: string
     try {
-      raw = await withTimeout(this.host.runAdvisor(prompt, signal, sessionID, nonce), this.opts.timeoutMs, signal)
+      raw = await withTimeout(this.host.runAdvisor(prompt, signal, sessionID, nonce, this.advisorRef), this.opts.timeoutMs, signal)
     } catch (err) {
       const { errorCode, message } = classifyError(err)
       return fail(errorCode, message, estTokensIn)

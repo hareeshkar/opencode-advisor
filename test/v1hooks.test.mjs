@@ -8,28 +8,36 @@ const OPTS = {
   logLevel: "error",
 }
 
-test("v1 chat.message appends directive on trigger word", async () => {
+test("v1 trigger queues a transient directive; parts stay untouched", async () => {
   const hooks = await createV1Hooks({}, OPTS)
   const output = { parts: [{ type: "text", text: "need advice on the deploy" }] }
   await hooks["chat.message"]({ sessionID: "s1" }, output)
-  assert.ok(output.parts[0].text.includes("[advisor requested"), "directive appended")
-  assert.ok(output.parts[0].text.startsWith("need advice on the deploy"), "original text preserved")
+  assert.equal(output.parts[0].text, "need advice on the deploy", "user text never mutates")
+  const sys = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, sys)
+  assert.ok(sys.system.some((s) => s.includes("[advisor requested")), "directive delivered via system (transient)")
+  const sys2 = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, sys2)
+  assert.ok(!sys2.system.some((s) => s.includes("[advisor requested")), "delivered once, then consumed")
 })
 
-test("v1 chat.message leaves non-trigger messages alone", async () => {
+test("v1 non-trigger messages queue nothing", async () => {
   const hooks = await createV1Hooks({}, OPTS)
   const output = { parts: [{ type: "text", text: "deploy the thing" }] }
   await hooks["chat.message"]({ sessionID: "s1" }, output)
   assert.equal(output.parts[0].text, "deploy the thing")
+  const sys = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, sys)
+  assert.ok(!sys.system.some((s) => s.includes("[advisor requested")))
 })
 
-test("v1 chat.message skips when marker already present (idempotent)", async () => {
+test("v1 settings invocation queues nothing (never triggers spend)", async () => {
   const hooks = await createV1Hooks({}, OPTS)
-  const before = 'ask advisor now\n\n[advisor requested by user — trigger: "x"] do it'
-  const output = { parts: [{ type: "text", text: before }] }
+  const output = { parts: [{ type: "text", text: "open advisor settings please" }] }
   await hooks["chat.message"]({ sessionID: "s1" }, output)
-  assert.equal(output.parts[0].text, before)
-  assert.equal(output.parts[0].text.match(/\[advisor requested/g).length, 1)
+  const sys = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, sys)
+  assert.ok(!sys.system.some((s) => s.includes("[advisor requested")))
 })
 
 test("v1 chat.message tolerates missing/odd shapes", async () => {
@@ -39,17 +47,19 @@ test("v1 chat.message tolerates missing/odd shapes", async () => {
   await hooks["chat.message"]({ sessionID: "s1" }, { parts: [{ type: "file", uri: "x" }] })
 })
 
-test("v1 command.execute.before intercepts the advisor command", async () => {
+test("v1 command.execute.before queues director for /advisor, assist for settings", async () => {
   const hooks = await createV1Hooks({}, OPTS)
-  const output = { parts: [{ type: "text", text: "review this" }] }
-  await hooks["command.execute.before"]({ command: "advisor", sessionID: "s1", arguments: "" }, output)
-  assert.ok(output.parts[0].text.includes("[advisor requested"), "directive appended")
-  assert.ok(output.parts[0].text.startsWith("review this"), "template preserved")
-})
+  const advOut = { parts: [{ type: "text", text: "review this" }] }
+  await hooks["command.execute.before"]({ command: "advisor", sessionID: "s1", arguments: "" }, advOut)
+  assert.equal(advOut.parts[0].text, "review this", "command parts never mutate for /advisor")
+  const sys = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "s1" }, sys)
+  assert.ok(sys.system.some((s) => s.includes("[advisor requested")), "advisor directive via system")
 
-test("v1 command.execute.before ignores other commands", async () => {
-  const hooks = await createV1Hooks({}, OPTS)
-  const output = { parts: [{ type: "text", text: "run tests with advisor present" }] }
-  await hooks["command.execute.before"]({ command: "test", sessionID: "s1", arguments: "" }, output)
-  assert.equal(output.parts[0].text, "run tests with advisor present")
+  const setOut = { parts: [{ type: "text", text: "choose a model" }] }
+  await hooks["command.execute.before"]({ command: "advisor-settings", sessionID: "s2", arguments: "" }, setOut)
+  assert.ok(setOut.parts[0].text.includes("[advisor-settings assist]"), "settings assist appended (visible)")
+  const sys2 = { system: [] }
+  await hooks["experimental.chat.system.transform"]({ sessionID: "s2" }, sys2)
+  assert.ok(!sys2.system.some((s) => s.includes("[advisor requested")), "settings never queues consults")
 })

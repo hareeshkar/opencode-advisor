@@ -31,31 +31,47 @@ mkdir -p ~/.config/opencode/opencode-advisor
 cp dist/opencode-advisor.js ~/.config/opencode/opencode-advisor/index.js
 ```
 
-Plugin directories are hot-watched — **no restart required**. Then configure:
+Plugin directories are hot-watched — **no restart required**. Register the plugin (no advisor model yet — a fresh install is intentionally safe and silent):
 
 ```jsonc
 // ~/.config/opencode/opencode.json
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "./opencode-advisor",
-      "options": {
-        "advisor": { "providerID": "zai-coding-plan", "id": "glm-5.3" }
-      }
-    }
-  ]
+  "plugins": [{ "package": "./opencode-advisor" }]
 }
 ```
 
-Alternative — flat auto-discovery (drops the file into `~/.config/opencode/plugins/`): it loads with **no options**, so configuration must come from env vars instead:
+### Configure your advisor (do this before first use)
 
-```sh
-cp dist/opencode-advisor.js ~/.config/opencode/plugins/opencode-advisor.js
-export ADVISOR_PROVIDER=zai-coding-plan ADVISOR_MODEL=glm-5.3   # must be set before the service starts
+**Recommended — one command** (works immediately, nothing to edit):
+
+```text
+/advisor-settings
 ```
 
-Verify: `grep -i advisor ~/.local/share/opencode/log/opencode.log | tail` → expect `ready v0.1.0 — tool=✓ advisor=…`. A misconfigured plugin fails **loudly** (`failed to load plugin … cause: …`) and never harms the running host.
+It opens a picker: choose the advisor model (your configured models, curated
+shortlist + type your own), then the variant/thinking effort. The choice is
+saved and applied immediately — **no restart needed** on OpenCode V2.
+
+**Declarative alternative** — set it in the plugin's `options`:
+
+```jsonc
+{
+  "plugins": [{
+    "package": "./opencode-advisor",
+    "options": { "advisor": { "providerID": "zai-coding-plan", "id": "glm-5.3", "variant": "high" } }
+  }]
+}
+```
+
+V2 hot-reloads the config, so this applies without a restart too (restart only
+on V1 or builds without plugin hot-reload). List IDs with `opencode models`
+(or `/models`).
+
+**Before configuration, the advisor is deliberately silent:** it costs
+nothing, and if anything calls the `advisor` tool it returns step-by-step
+setup instructions for the model to relay — a README at the moment of need,
+never invented advice.
 
 ### OpenCode V1 ≥ 1.18.29 (experimental)
 
@@ -76,7 +92,9 @@ are expensive. Escalation happens only through explicit user intent:
 
 **Trigger words** — when your message contains `advice`, `advisor`, or `get
 consultation` (configurable via the `triggers` option; empty list disables),
-the plugin appends a consult directive to your admitted prompt. The directive
+the plugin queues a consult directive that is delivered as **invisible
+transient system text** on the next model call — your visible message is
+never modified and nothing bloats the conversation or history. The directive
 distinguishes a consultation *request* ("give me advice" → consult now) from
 a future-use *grant* ("you can use advisor if stuck" → remember, consult only
 if genuinely stuck or before declaring done) — so a casual permission never
@@ -85,25 +103,24 @@ full context and refines its answer:
 
 ```text
 you:  this deploy plan looks risky — get consultation before proceeding
-      ↓ (directive appended automatically)
+      ↓ (directive delivered invisibly via system context)
 exec: → advisor() → advice → refined plan citing the advice
 
 you:  you can use the advisor if you get stuck
-      ↓ (directive appended, grant recognized)
+      ↓ (grant recognized)
 exec: works solo, consults only if stuck
 ```
 
 **`/advisor` command** — V2 registers it automatically (`/advisor [focus]`);
 on V1 copy `commands/advisor.md` into `~/.config/opencode/commands/` (or your
-project's `.opencode/commands/`). Same flow, explicit invocation.
+project's `.opencode/commands/`). The submitted message stays lean (your
+focus, or one short line); the directive travels invisibly.
 
-**`/advisor-settings` command** — guided model selection mirroring the
-`/models` UX pattern. V2 renders your authoritative model catalog; the
-executor asks via the native `question` tool (model, then variant/thinking
-effort) and writes your choice into the plugin's `opencode.json` options —
-a transparent diff you can inspect, applied via hot-reload. On V1 copy
-`commands/advisor-settings.md` the same way (the executor reads your
-configured providers itself).
+**`/advisor-settings` command** — the configuration path (see above). V2
+curates a shortlist from your live model catalog and asks via the native
+`question` tool (model, then variant/thinking effort); the choice applies
+immediately to the next consultation. On V1 copy `commands/advisor-settings.md`
+the same way (the executor reads your configured providers itself).
 
 **Credit attribution** — advice arrives framed as `ADVISOR REVIEW by
 <provider/model>`, and executors credit the source when they use it

@@ -17,7 +17,7 @@
 
 import { AdvisorEngine } from "./engine.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, advisorLabel, findTrigger, hasDirective, isSettingsInvocation, triggerDirective } from "./prompts.js"
+import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, LogLevel, Slice, UsageEntry } from "./types.js"
@@ -168,12 +168,13 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         throw err
       }
 
-      if (!opts.advisor.providerID || !opts.advisor.id) {
-        const msg =
-          `[${PLUGIN_ID}] CONFIG ERROR: the V2 adapter routes through the host provider registry and ` +
-          `requires "advisor" = { providerID, id } (source-only config is V1-only)`
-        console.error(msg)
-        throw new Error(msg)
+      if (!isAdvisorConfigured(opts.advisor)) {
+        // Safe-by-default: fresh installs load UNCONFIGURED (zero spend).
+        // The advisor tool stays registered and answers with setup steps;
+        // /advisor-settings or the opencode.json option configures it.
+        console.warn(
+          `[${PLUGIN_ID}] no advisor model configured yet — the advisor tool will return setup steps until one is set (via /advisor-settings or the plugin's "advisor" option).`,
+        )
       }
 
       const RANK = { debug: 0, info: 1, warn: 2, error: 3 } as const
@@ -213,7 +214,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           const messages = await ctx.session.context({ sessionID })
           return normalizeV2Transcript(messages)
         },
-        runAdvisor: async (prompt, signal, sessionID, nonce) => {
+        runAdvisor: async (prompt, signal, sessionID, nonce, model) => {
           // Session-scoped transient generation (NOT ctx.generate.text):
           // only session-bound requests emit hooks and inherit the host's
           // native session headers. The transient endpoint takes no model
@@ -225,10 +226,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           // The original model is restored in `finally`; if the restore
           // fails the session is left (visibly, repairably) on the advisor.
           const advisorRef: { providerID: string; id: string; variant?: string } = {
-            providerID: opts.advisor.providerID,
-            id: opts.advisor.id,
+            providerID: model.providerID,
+            id: model.id,
           }
-          if (opts.advisor.variant) advisorRef.variant = opts.advisor.variant
+          if (model.variant) advisorRef.variant = model.variant
           if (nonce && sessionID) {
             pendingAdvisorCalls.set(nonce, sessionID)
             const timer = setTimeout(() => pendingAdvisorCalls.delete(nonce), opts.timeoutMs + 30_000)
@@ -312,9 +313,138 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         log,
       }
       const engine = new AdvisorEngine(opts, host)
-      // Hook/tool registrations must be disposed on unload — otherwise a
+      // Hook/tool/RPC registrations must be disposed on unload — otherwise a
       // plugin reload leaks callbacks and injections fire repeatedly.
       const regs: Array<{ dispose(): Promise<void> }> = []
+      // Transient consult directives (trigger words / /advisor) — delivered
+      // as invisible system text on the next primary model call, never
+      // written into the user's message (no conversation bloat, no
+      // persisted boilerplate). TTL guards against stale deliveries.
+      const pendingDirectives = new Map<string, { text: string; at: number }>()
+      const DIRECTIVE_TTL_MS = 15 * 60_000
+      const takeDirective = (sessionID: string): string | undefined => {
+        const d = pendingDirectives.get(sessionID)
+        if (!d) return undefined
+        pendingDirectives.delete(sessionID)
+        return Date.now() - d.at > DIRECTIVE_TTL_MS ? undefined : d.text
+      }
+      // Runtime advisor override (set via /advisor-settings). Persisted in
+      // plugin storage; wins over the opencode.json option until reset.
+      let overrideActive = false
+      try {
+        const saved = (await ctx.storage.get("advisor:override")) as
+          | { providerID?: unknown; id?: unknown; variant?: unknown }
+          | undefined
+        if (saved && typeof saved.providerID === "string" && typeof saved.id === "string" && saved.providerID !== "") {
+          engine.setAdvisor({
+            providerID: saved.providerID,
+            id: saved.id,
+            ...(typeof saved.variant === "string" ? { variant: saved.variant } : {}),
+          })
+          overrideActive = true
+          log("info", `advisor override active: ${advisorLabel(engine.advisor())}`)
+        }
+      } catch {
+        /* storage unavailable — stay on config default */
+      }
+      const persistAdvisorOverride = async (
+        ref: { providerID: string; id: string; variant?: string } | null,
+      ): Promise<void> => {
+        if (ref === null) {
+          overrideActive = false
+          engine.setAdvisor(opts.advisor)
+          await ctx.storage.remove("advisor:override").catch(() => {})
+          log("info", `advisor override cleared — back to ${advisorLabel(engine.advisor())}`)
+          return
+        }
+        engine.setAdvisor(ref)
+        overrideActive = true
+        await ctx.storage.set("advisor:override", engine.advisor()).catch(() => {})
+        log("info", `advisor set to ${advisorLabel(engine.advisor())} (override persisted)`)
+      }
+      // RPC surface for the TUI settings picker (and any client). Plain
+      // portable definition — no runtime dependency on @opencode/plugin/rpc.
+      try {
+        const regRpc = await ctx.rpc.register(
+          {
+            id: "opencode-advisor",
+            methods: {
+              get: {
+                input: { type: "object", properties: {}, additionalProperties: false },
+                output: {
+                  type: "object",
+                  properties: {
+                    providerID: { type: "string" },
+                    id: { type: "string" },
+                    variant: { type: "string" },
+                    source: { type: "string" },
+                  },
+                  required: ["providerID", "id", "source"],
+                  additionalProperties: false,
+                },
+              },
+              set: {
+                input: {
+                  type: "object",
+                  properties: {
+                    providerID: { type: "string" },
+                    id: { type: "string" },
+                    variant: { type: "string" },
+                  },
+                  required: ["providerID", "id"],
+                  additionalProperties: false,
+                },
+                output: {
+                  type: "object",
+                  properties: { providerID: { type: "string" }, id: { type: "string" }, variant: { type: "string" } },
+                  required: ["providerID", "id"],
+                  additionalProperties: false,
+                },
+              },
+              reset: {
+                input: { type: "object", properties: {}, additionalProperties: false },
+                output: {
+                  type: "object",
+                  properties: { providerID: { type: "string" }, id: { type: "string" }, variant: { type: "string" } },
+                  required: ["providerID", "id"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            events: {},
+          },
+          {
+            get: async () => {
+              const ref = engine.advisor()
+              return {
+                providerID: ref.providerID,
+                id: ref.id,
+                ...(ref.variant ? { variant: ref.variant } : {}),
+                source: overrideActive ? "override" : "config",
+              }
+            },
+            set: async (input: any) => {
+              const providerID = String(input?.providerID ?? "")
+              const id = String(input?.id ?? "")
+              const variant = typeof input?.variant === "string" && input.variant !== "" ? String(input.variant) : undefined
+              if (providerID === "" || id === "") throw new Error("advisor.set requires providerID and id")
+              await persistAdvisorOverride({ providerID, id, ...(variant ? { variant } : {}) })
+              const ref = engine.advisor()
+              return { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) }
+            },
+            reset: async () => {
+              await persistAdvisorOverride(null)
+              const ref = engine.advisor()
+              return { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) }
+            },
+          },
+        )
+        regs.push(regRpc)
+      } catch (err) {
+        log("warn", "RPC registration failed (TUI settings picker will be unavailable; executor settings flow still works)", err)
+      }
+      // Hook/tool registrations must be disposed on unload — otherwise a
+      // plugin reload leaks callbacks and injections fire repeatedly.
       const sessionModel = new Map<string, { providerID: string; id: string; variant?: string }>()
       // In-flight advisor sub-calls awaiting native dispatch: evidence
       // nonce → originating sessionID. Lets the http.request hook attach
@@ -378,7 +508,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 }
                 return { content }
               }
-              return { content: frameAdvice(r.advice, advisorLabel(opts)) }
+              return { content: frameAdvice(r.advice, advisorLabel(engine.advisor())) }
             },
           })
           try {
@@ -394,23 +524,28 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       }
 
       // --- 2) task reset + trigger-word routing on admitted prompts -----
-      // The prompt hook receives an owned, mutable draft: edits become the
-      // canonical persisted input. On a trigger word (advice/advisor/get
-      // consultation, configurable) append a consult directive — the
-      // executor then calls the advisor tool with full context and refines
-      // its answer. Marker-guarded: never double-append (the /advisor
-      // command composes the directive itself).
+      // Trigger words (advice/advisor/get consultation, configurable) queue
+      // a TRANSIENT consult directive — delivered as invisible system text
+      // on the next primary model call, never written into the user's
+      // message. The visible conversation stays clean; nothing is persisted
+      // into history or compaction.
       try {
         const reg2 = await ctx.session.hook("prompt", (event: any) => {
           try {
             const sid = String(event?.sessionID ?? "")
             if (sid) engine.resetTask(sid)
             const text = typeof event?.prompt?.text === "string" ? event.prompt.text : ""
-            if (text !== "" && !hasDirective(text) && !isSettingsInvocation(text)) {
+            if (
+              sid !== "" &&
+              text !== "" &&
+              !hasDirective(text) &&
+              !isSettingsInvocation(text) &&
+              !pendingDirectives.has(sid)
+            ) {
               const matched = findTrigger(text, opts.triggers)
               if (matched) {
-                event.prompt.text = `${text}\n\n${triggerDirective(matched)}`
-                log("info", `advisor trigger "${matched}" — consult directive appended`)
+                pendingDirectives.set(sid, { text: triggerDirective(matched), at: Date.now() })
+                log("info", `advisor trigger "${matched}" — directive queued (transient system delivery)`)
               }
             }
           } catch (err) {
@@ -423,8 +558,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       }
 
       // --- 2b) /advisor slash command ------------------------------------
-      // Programmatic command registration (V2 API). Composes the directive
-      // directly (with marker) so the prompt hook skips re-appending.
+      // The user's visible prompt stays minimal (their focus, or one short
+      // line); the consult directive travels as transient system text.
       try {
         const regCmd = await ctx.command.transform((editor: any) => {
           editor.add({
@@ -432,10 +567,12 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             description: "Consult the high-judgment advisor model about the current task or a focus question.",
             execute: async ({ sessionID, prompt, delivery }: any) => {
               const focus = String(prompt?.text ?? "").trim()
-              const body = focus !== "" ? `User request:\n${focus}` : "User request: (no focus given — review the current state of the task)"
+              if (sessionID && !pendingDirectives.has(sessionID)) {
+                pendingDirectives.set(sessionID, { text: triggerDirective("/advisor"), at: Date.now() })
+              }
               await ctx.session.prompt({
                 sessionID,
-                text: `${body}\n\n${triggerDirective("/advisor")}`,
+                text: focus !== "" ? focus : "Review the current task with the advisor.",
                 delivery,
               })
             },
@@ -462,19 +599,19 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               try {
                 const models = (await ctx.model.list()) as any
                 const list = Array.isArray(models) ? models : (models?.data ?? [])
-                const current = `${opts.advisor.providerID}/${opts.advisor.id}`
-                const lines = (Array.isArray(list) ? list : [])
+                const clean = (Array.isArray(list) ? list : [])
                   .map((m: any) => ({
                     providerID: String(m?.providerID ?? ""),
                     id: String(m?.id ?? ""),
                     name: typeof m?.name === "string" ? m.name : "",
                   }))
                   .filter((m) => m.providerID !== "" && m.id !== "")
-                if (lines.length > 0) {
-                  rendered = lines
+                const entries = shortlistAdvisorModels(clean, engine.advisor())
+                if (entries.length > 0) {
+                  rendered = entries
                     .map(
                       (m) =>
-                        `- ${m.providerID}/${m.id}${m.name !== "" ? ` — ${m.name}` : ""}${`${m.providerID}/${m.id}` === current ? " (current)" : ""}`,
+                        `- ${m.providerID}/${m.id}${m.name !== "" ? ` — ${m.name}` : ""}${m.current ? " (current, Recommended)" : ""}`,
                     )
                     .join("\n")
                 }
@@ -485,8 +622,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               await ctx.session.prompt({
                 sessionID,
                 text: [
-                  "The user opened advisor settings. Guide them in two steps:",
-                  "1. Ask which advisor model they want via the question tool, offering these configured models as options (put the current one first and mark it Recommended):",
+                  "The user opened advisor settings. Keep it token-lean — do NOT list the full model catalog.",
+                  "1. Ask which advisor model they want via the question tool with EXACTLY these options (the tool also accepts a typed custom answer):",
                   rendered,
                   '2. Then ask which variant/thinking effort they want (or "default"/none).',
                   "3. Write their choice into the \"advisor\" option of the opencode-advisor plugin entry in the opencode.json file that contains it (usually ~/.config/opencode/opencode.json) as { \"providerID\": \"...\", \"id\": \"...\" } plus \"variant\" only if they chose one. Edit ONLY that field — read the file first, preserve every other key, and re-read to verify.",
@@ -528,7 +665,11 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             // injection for the whole task. Eligibility is lazy so tier regexes
             // run only when a nudge is actually on the table.
             const canInject = Array.isArray(event?.system)
-            const d = engine.noteStep(sid, () => shouldNudgeExecutor(modelId, opts.nudge), canInject)
+            // Unconfigured installs inject nothing: no timing guidance for a
+            // tool that would only return setup steps (token discipline).
+            const d = isAdvisorConfigured(engine.advisor())
+              ? engine.noteStep(sid, () => shouldNudgeExecutor(modelId, opts.nudge), canInject)
+              : { injectTiming: false, injectNudge: false }
             // Permanent hook-delivery census: one tiny write on each session's
             // first model call (last-write-wins single key — bounded). Lets
             // post-hoc analysis prove hooks fire in any session type
@@ -541,6 +682,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               }
             }
             if (canInject) {
+              // Consult directives first (user-triggered), then once-per-task
+              // guidance. All transient — nothing persisted or visible.
+              const directive = takeDirective(sid)
+              if (directive) event.system.push({ type: "text", text: directive })
               if (d.injectTiming) event.system.push({ type: "text", text: EXECUTOR_TIMING_PROMPT })
               if (d.injectNudge) event.system.push({ type: "text", text: NUDGE_TEXT })
             }

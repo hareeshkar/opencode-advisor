@@ -45,8 +45,10 @@ test("array options throw loudly instead of becoming {}", () => {
   assert.throws(() => resolveOptions([]), /must be an object, got an array/)
 })
 
-test("missing advisor without source throws with guidance", () => {
-  assert.throws(() => resolveOptions({}), /no advisor model configured/)
+test("missing advisor resolves to the unconfigured state (safe default)", () => {
+  const o = resolveOptions({})
+  assert.equal(o.advisor.providerID, "")
+  assert.equal(o.advisor.id, "")
 })
 
 test("source-only config is accepted (V1 path)", () => {

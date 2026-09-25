@@ -3,6 +3,30 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.5.0] — 2026-09-26
+
+### Added
+- **Safe-by-default unconfigured state**: fresh installs load with NO advisor
+  model (zero spend), register the tool anyway, and answer consults with a
+  setup-carrying `not_configured` error (steps for `/advisor-settings` and
+  the declarative option) that the executor relays — a README at the moment
+  of need, never invented advice. No timing/nudge injections while
+  unconfigured (token discipline).
+- **Runtime advisor hot-swap + RPC** (`opencode-advisor/get|set|reset`):
+  `/advisor-settings`-style configuration applies immediately via plugin
+  storage, no config editing, no restart; override survives restarts and
+  can be reset back to the declarative option.
+- **Transient consult directives**: trigger words and `/advisor` deliver
+  their directive as invisible system text; user messages and history are
+  never modified or bloated.
+
+### Changed
+- `/advisor-settings` uses a curated shortlist (current first, frontier-tier
+  ranked, typed custom answer still possible) instead of dumping the full
+  catalog into the conversation.
+- README restructured: install → configure → use, with the `/advisor-settings`
+  one-command path first.
+
 ## [0.4.0] — 2026-09-25
 
 ### Added

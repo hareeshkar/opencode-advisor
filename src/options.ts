@@ -159,16 +159,12 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   if (optLevel !== undefined) logLevel = optLevel
 
   if (!advisor.providerID || !advisor.id) {
-    if (source) {
-      // Source-only config: valid for the V1 adapter (direct provider calls).
-      // The V2 adapter validates the advisor ref itself at setup.
-      advisor = { providerID: "", id: "" }
-    } else {
-      throw new Error(
-        "[advisor] no advisor model configured. Set plugin option \"advisor\" = { providerID, id } " +
-          "(or env ADVISOR_PROVIDER + ADVISOR_MODEL). Run `opencode models` to list configured models.",
-      )
-    }
+    // NOT an error: the plugin loads in an unconfigured state. The advisor
+    // tool stays registered and returns a setup-carrying not_configured
+    // error; /advisor-settings (or the opencode.json option) configures it.
+    // This keeps a fresh install safe (zero advisor spend) and friendly
+    // (the tool itself teaches the setup steps at the moment of need).
+    advisor = { providerID: "", id: "" }
   }
 
   // sanity: transcript budget must accommodate several slices

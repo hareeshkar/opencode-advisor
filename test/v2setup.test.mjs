@@ -11,6 +11,8 @@ function makeCtx(overrides = {}) {
     commands: [],
     prompts: [],
     storage: new Map(),
+    rpcHandlers: new Map(),
+    switchModelCalls: [],
   }
   const ctx = {
     options: { advisor: { providerID: "p", id: "a" }, logLevel: "error" },
@@ -36,8 +38,16 @@ function makeCtx(overrides = {}) {
         captured.prompts.push(args)
         return {}
       },
-      switchModel: async () => {},
+      switchModel: async (args) => {
+        captured.switchModelCalls.push(args)
+      },
       get: async () => ({ model: { providerID: "p", id: "exec" } }),
+    },
+    rpc: {
+      register: async (definition, handlers) => {
+        captured.rpcHandlers.set(definition.id, handlers)
+        return { dispose: async () => {}, events: { emit: async () => {} } }
+      },
     },
     tool: {
       transform: async (cb) => {
@@ -85,24 +95,34 @@ test("setup registers the advisor tool and both commands", async () => {
   await cleanup()
 })
 
-test("prompt hook appends directive on trigger, skips otherwise", async () => {
+test("prompt hook queues a transient directive; context hook delivers it invisibly", async () => {
   const { ctx, captured } = makeCtx()
   await createV2Plugin().setup(ctx)
   assert.equal(captured.promptHooks.length, 1)
-  const hook = captured.promptHooks[0]
+  const promptHook = captured.promptHooks[0]
+  const contextHook = captured.contextHooks[0]
 
   const event = { sessionID: "s1", prompt: { text: "give me some advice on caching" } }
-  await hook(event)
-  assert.ok(event.prompt.text.includes("[advisor requested"), "directive appended")
-  assert.ok(event.prompt.text.startsWith("give me some advice on caching"), "user text preserved")
+  await promptHook(event)
+  assert.equal(event.prompt.text, "give me some advice on caching", "user text never mutates")
 
-  const plain = { sessionID: "s1", prompt: { text: "deploy the cache" } }
-  await hook(plain)
-  assert.equal(plain.prompt.text, "deploy the cache", "no trigger, no edit")
+  const first = { sessionID: "s1", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
+  await contextHook(first)
+  assert.ok(first.system.some((t) => t.text.includes("[advisor requested")), "directive delivered via system")
 
-  const marked = { sessionID: "s1", prompt: { text: 'hi advisor\n\n[advisor requested by user — trigger: "x"]' } }
-  await hook(marked)
-  assert.equal(marked.prompt.text.match(/\[advisor requested/g).length, 1, "marker prevents doubles")
+  const second = { sessionID: "s1", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
+  await contextHook(second)
+  assert.ok(!second.system.some((t) => t.text.includes("[advisor requested")), "delivered once, then consumed")
+
+  const plain = { sessionID: "s2", prompt: { text: "deploy the cache" } }
+  await promptHook(plain)
+  assert.equal(plain.prompt.text, "deploy the cache")
+
+  const settings = { sessionID: "s3", prompt: { text: "open advisor settings" } }
+  await promptHook(settings)
+  const sys = { sessionID: "s3", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
+  await contextHook(sys)
+  assert.ok(!sys.system.some((t) => t.text.includes("[advisor requested")), "settings invocation never queues")
 })
 
 test("advisor tool executes end to end through the fake session", async () => {
@@ -117,20 +137,59 @@ test("advisor tool executes end to end through the fake session", async () => {
   assert.equal(health.sessionID, "s9")
 })
 
-test("/advisor command submits a directive-bearing prompt", async () => {
+test("/advisor command submits lean visible text and queues the directive", async () => {
   const { ctx, captured } = makeCtx()
   await createV2Plugin().setup(ctx)
-  const cmd = captured.commands[0]
+  const cmd = captured.commands.find((c) => c.name === "advisor")
   await cmd.execute({ sessionID: "s2", prompt: { text: "review the cache" }, delivery: "steer" })
   assert.equal(captured.prompts.length, 1)
   const submitted = captured.prompts[0]
   assert.equal(submitted.sessionID, "s2")
-  assert.ok(submitted.text.includes("review the cache"), "focus preserved")
-  assert.ok(submitted.text.includes("[advisor requested"), "directive composed (hook will skip re-append)")
+  assert.equal(submitted.text, "review the cache", "focus only — no boilerplate in the visible prompt")
   assert.equal(submitted.delivery, "steer")
+
+  const sys = { sessionID: "s2", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
+  await captured.contextHooks[0](sys)
+  assert.ok(sys.system.some((t) => t.text.includes("[advisor requested")), "directive delivered invisibly")
 })
 
-test("/advisor-settings composes catalog list and config-edit instruction", async () => {
+test("/advisor with no focus uses one short line", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const cmd = captured.commands.find((c) => c.name === "advisor")
+  await cmd.execute({ sessionID: "s2", prompt: { text: "" }, delivery: "steer" })
+  assert.equal(captured.prompts[0].text, "Review the current task with the advisor.")
+})
+
+test("RPC set hot-swaps the advisor model and persists an override", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  assert.ok(rpc, "rpc registered")
+
+  const before = await rpc.get()
+  assert.equal(before.source, "config")
+  assert.equal(before.providerID, "p")
+
+  const updated = await rpc.set({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
+  assert.deepEqual(updated, { providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
+  const after = await rpc.get()
+  assert.equal(after.source, "override")
+  assert.equal(captured.storage.get("advisor:override").providerID, "zai-coding-plan")
+
+  // next consult: the sandwich switches the session to the OVERRIDE model
+  await captured.tools[0].execute({}, { sessionID: "s9", signal: new AbortController().signal })
+  const switched = captured.switchModelCalls.find((c) => c.model.providerID === "zai-coding-plan")
+  assert.ok(switched, "override model used for the sub-call")
+  assert.equal(switched.model.id, "glm-5.3")
+  assert.equal(switched.model.variant, "high")
+
+  const reset = await rpc.reset()
+  assert.equal(reset.providerID, "p")
+  assert.equal(captured.storage.get("advisor:override"), undefined)
+})
+
+test("/advisor-settings composes a lean shortlist and config-edit instruction", async () => {
   const { ctx, captured } = makeCtx()
   await createV2Plugin().setup(ctx)
   const cmd = captured.commands.find((c) => c.name === "advisor-settings")
@@ -138,10 +197,30 @@ test("/advisor-settings composes catalog list and config-edit instruction", asyn
   await cmd.execute({ sessionID: "s3", prompt: { text: "prefer cheap" }, delivery: "steer" })
   assert.equal(captured.prompts.length, 1)
   const submitted = captured.prompts[0].text
-  assert.ok(submitted.includes("p/a — Advisor A (current)"), "catalog with current marker")
-  assert.ok(submitted.includes("q/b — Advisor B"), "all candidates listed")
+  assert.ok(submitted.includes("p/a — Advisor A (current, Recommended)"), "shortlist with current marker")
+  assert.ok(submitted.includes("q/b — Advisor B"), "candidates listed")
+  assert.ok(submitted.includes("token-lean"), "lean instruction present")
   assert.ok(submitted.includes("question tool"), "native picker instruction")
   assert.ok(submitted.includes("opencode.json"), "transparent config-edit path")
   assert.ok(submitted.includes("variant"), "variant selection covered")
   assert.ok(submitted.includes("prefer cheap"), "user focus preserved")
+})
+
+test("unconfigured install loads safely and the tool teaches setup", async () => {
+  const { ctx, captured } = makeCtx({ options: { logLevel: "error" } })
+  await createV2Plugin().setup(ctx)
+  assert.equal(captured.tools.length, 1, "tool still registers so errors can teach")
+  const result = await captured.tools[0].execute({}, { sessionID: "s-nc", signal: new AbortController().signal })
+  assert.ok(result.content.includes("not_configured"), "error code surfaced")
+  assert.ok(result.content.includes("/advisor-settings"), "settings step present")
+  assert.ok(result.content.includes("opencode.json"), "declarative step present")
+  assert.ok(!result.content.startsWith("ADVISOR REVIEW"), "never framed as advice")
+})
+
+test("unconfigured install injects no timing guidance (token discipline)", async () => {
+  const { ctx, captured } = makeCtx({ options: { logLevel: "error" } })
+  await createV2Plugin().setup(ctx)
+  const sys = { sessionID: "s-nc2", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
+  await captured.contextHooks[0](sys)
+  assert.equal(sys.system.length, 0, "nothing injected while unconfigured")
 })

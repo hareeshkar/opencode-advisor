@@ -218,3 +218,24 @@ test("prompt-enforced budget appears in the advisor prompt", async () => {
   assert.ok(seenPrompt.includes("EVIDENCE"), "injection defense present")
   assert.ok(seenPrompt.includes("transcript pruned"), "pruning manifest present (F7)")
 })
+
+test("unconfigured advisor returns setup steps without consuming caps", async () => {
+  const engine = new AdvisorEngine({ ...OPTS, advisor: { providerID: "", id: "" } }, makeHost())
+  const sig = new AbortController().signal
+  const first = await engine.consult("nc", sig)
+  assert.equal(first.ok, false)
+  assert.equal(first.errorCode, "not_configured")
+  assert.ok(first.message.includes("/advisor-settings"), "carries the settings command step")
+  assert.ok(first.message.includes("providerID"), "carries the config shape")
+  assert.ok(first.message.includes("opencode models"), "carries model discovery step")
+  // repeated calls stay not_configured (no attempt/cap consumption)
+  const second = await engine.consult("nc", sig)
+  assert.equal(second.errorCode, "not_configured")
+})
+
+test("setAdvisor hot-swaps the model and exposes it via advisor()", () => {
+  const engine = new AdvisorEngine({ ...OPTS, advisor: { providerID: "", id: "" } }, makeHost())
+  assert.equal(engine.advisor().providerID, "")
+  engine.setAdvisor({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
+  assert.deepEqual(engine.advisor(), { providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
+})

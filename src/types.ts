@@ -7,7 +7,7 @@
  */
 
 export const PLUGIN_ID = "opencode-advisor"
-export const PLUGIN_VERSION = "0.4.0"
+export const PLUGIN_VERSION = "0.5.0"
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -126,11 +126,17 @@ export interface Host {
   getTranscript(sessionID: string): Promise<readonly Slice[]>
   /**
    * Run the advisor sub-call. Must be tool-less and history-less.
-   * Receives the sessionID so adapters can attach provider-required
-   * routing headers (e.g. opencode-go's x-opencode-session), plus the
-   * per-call evidence nonce for native-request correlation.
+   * Receives the sessionID (provider routing headers), the per-call
+   * evidence nonce (native-request correlation), and the CURRENT advisor
+   * model ref (hot-swappable via settings).
    */
-  runAdvisor(prompt: string, signal: AbortSignal, sessionID: string, nonce: string): Promise<string>
+  runAdvisor(
+    prompt: string,
+    signal: AbortSignal,
+    sessionID: string,
+    nonce: string,
+    model: AdvisorModelRef,
+  ): Promise<string>
   /** Durable usage aggregation (fire-and-forget semantics). */
   persistUsage(entry: UsageEntry): Promise<void>
   log(level: LogLevel, message: string, data?: unknown): void

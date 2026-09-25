@@ -15,6 +15,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 - **Dual-version slash commands**: V1 file-based + `command.execute.before`
   interception (server-source-verified live refs); V2 transform
   registration with disposal.
+- **Frugal-by-default UX**: no autonomous advisor spend — tool description,
+  timing prompt, and default `nudge: "off"` all enforce user-gated
+  escalation (explicit request, `/advisor`, or granted stuck-use); the
+  trigger directive distinguishes request-now from permit-later.
 
 ### Verified
 - 100 tests green, including fake-ctx V2 setup tests and direct V1 hook tests.

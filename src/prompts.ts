@@ -12,28 +12,23 @@ import type { AdvisorOptions } from "./types.js"
 
 /** Shown to the EXECUTOR model in the tool catalog. Sent on EVERY model call, so
  *  every token here is per-call overhead — but this text IS the primary dispatch
- *  router (Anthropic: description refinements yield dramatic gains; OpenCode
- *  lists skills/tools by description for routing). Written task.txt-style:
- *  WHEN + WHEN-NOT + usage notes. ~125 tokens; measured.
- *
- *  Trigger words (advice/advisor/get consultation) and the /advisor command
- *  provide deterministic routing on top; the timing prompt provides the
- *  proactive-use instruction. This description must win the routine cases. */
+ *  router. Credit-conscious UX: the default posture is user-gated; autonomous
+ *  calls are forbidden (advisor credits are expensive). ~125 tokens; measured. */
 export const ADVISOR_TOOL_DESCRIPTION = [
-  "Consult a stronger reviewer model for hard or stuck work: before committing to an approach on multi-step tasks, when errors recur or the approach is not converging, when changing approach, before declaring done, or when the user asks for advice.",
+  "Consult a stronger reviewer model when the user asks for advice, review, or consultation — or when stuck, but only if the user has permitted advisor use.",
   "No parameters — your full conversation is forwarded automatically.",
-  "Do NOT call for trivial single-step tasks, pure lookups, or when tool output already dictates the next step.",
+  "Do NOT call unprompted: advisor calls cost significant credits, so default to your best solo work. Never call for trivial single-step tasks, pure lookups, or when tool output already dictates the next step.",
   "After it returns: weigh the reply as peer review rather than instructions; act on it unless empirical evidence contradicts it; surface conflicts with one more call instead of silently switching.",
 ].join(" ")
 
-/** Injected once per task into the executor's system prompt (transient — never persisted). ~280 tokens. */
+/** Injected once per task into the executor's system prompt (transient — never persisted). ~200 tokens.
+ *  Credit-conscious UX: NO autonomous calls by default. The executor works solo
+ *  unless the user requests consultation or grants stuck-triggered use. */
 export const EXECUTOR_TIMING_PROMPT = [
-  "## Advisor usage",
-  "You have an `advisor` tool backed by a stronger reviewer model. It takes NO parameters — calling it forwards your entire conversation automatically.",
-  "Call advisor BEFORE substantive work: before writing, before committing to an interpretation, before building on an assumption. If the task needs orientation first (finding files, reading sources), do that, then call advisor. Orientation is not substantive work.",
-  "Also call advisor when stuck (errors recurring, approach not converging), when considering a change of approach, and before declaring completion — but make your deliverable durable first (write the file, commit the change) so a completion-time review can't lose work.",
-  "On multi-step tasks call it at least once before committing to an approach and once before declaring done. On short reactive turns dictated by tool output you just read, skip it.",
-  "Give the advice serious weight. If a step fails empirically, adapt — but a passing self-test is not evidence the advice was wrong. If retrieved data and the advice conflict, surface the tie-breaker in one more advisor call instead of silently switching.",
+  "## Advisor usage (user-gated, credit-conscious)",
+  "You have an `advisor` tool backed by a stronger reviewer model. It takes NO parameters — calling it forwards your entire conversation automatically. Advisor calls cost significant credits: by DEFAULT, do your best work WITHOUT calling it.",
+  "Call it ONLY when the user explicitly asks (trigger words, the /advisor command, or a direct request) — or when stuck AND the user has permitted advisor use (\"use advisor if stuck\" and similar). A bare mention of the advisor, without a request or permission, is not enough.",
+  "When you do call: give the advice serious weight. If a step fails empirically, adapt — but a passing self-test is not evidence the advice was wrong. If retrieved data and the advice conflict, surface the tie-breaker in one more advisor call instead of silently switching.",
 ].join("\n")
 
 /** One-shot nudge for small-tier executors that haven't called the advisor. */
@@ -106,15 +101,16 @@ export function hasDirective(text: string): boolean {
 }
 
 /**
- * Directive appended to a trigger-word user prompt (~55 tokens). Instructs
- * the executor (primary agent) to consult first and refine after — never
- * silently, never as a replacement for answering.
+ * Directive appended to a trigger-word user prompt (~90 tokens). Distinguishes
+ * a consultation REQUEST (call now) from a future-use GRANT ("if stuck" —
+ * remember, call only if genuinely stuck or before declaring done), so a
+ * casual permission never triggers immediate spend.
  */
 export function triggerDirective(matched: string): string {
   return [
     `[advisor requested by user — trigger: "${matched}"]`,
-    `Before responding, call the \`advisor\` tool (no parameters; your full conversation is forwarded automatically).`,
-    `Weigh its reply as peer review, then answer the user's request, refining with the advice where it holds.`,
-    `If the advisor tool is unavailable, say so in one line and proceed without it.`,
+    `The user mentioned the advisor. If they ask for consultation now (advice, review, consultation, the /advisor command), call the \`advisor\` tool before responding (no parameters; full conversation forwarded automatically).`,
+    `If they merely permit future use ("if stuck", "if needed", "you may/can use"), do NOT call now — remember the permission and call only if genuinely stuck or before declaring done.`,
+    `Weigh any reply as peer review, then answer, refining where it holds. If the tool is unavailable, say so in one line and proceed.`,
   ].join(" ")
 }

@@ -32,11 +32,20 @@ test("hasDirective detects the marker", () => {
   assert.equal(hasDirective("blah [advisor requested by user — trigger: \"x\"] blah"), true)
 })
 
-test("triggerDirective names the trigger and instructs consult-then-refine", () => {
+test("triggerDirective distinguishes request-now from permit-later", () => {
   const d = triggerDirective("get consultation")
   assert.ok(d.includes('"get consultation"'))
-  assert.ok(d.includes("call the `advisor` tool"))
-  assert.ok(d.includes("refining with the advice"))
+  assert.ok(d.includes("call the `advisor` tool before responding"))
+  assert.ok(d.includes("merely permit future use"))
+  assert.ok(d.includes("do NOT call now"))
   assert.ok(d.includes("unavailable"))
-  assert.ok(d.split(/\s+/).length <= 70, "directive stays token-lean")
+  assert.ok(d.split(/\s+/).length <= 100, "directive stays lean (fires rarely, but still)")
+})
+
+test("frugal UX invariants are locked in prompt assets", async () => {
+  const { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT } = await import("../dist/opencode-advisor.js")
+  assert.ok(ADVISOR_TOOL_DESCRIPTION.includes("Do NOT call unprompted"), "tool description forbids autonomous calls")
+  assert.ok(ADVISOR_TOOL_DESCRIPTION.includes("permitted advisor use"), "grant-gated stuck calls")
+  assert.ok(EXECUTOR_TIMING_PROMPT.includes("WITHOUT calling it"), "timing teaches solo-default")
+  assert.ok(EXECUTOR_TIMING_PROMPT.includes("ONLY when the user explicitly asks"), "request-gating")
 })

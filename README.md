@@ -70,18 +70,27 @@ Same bundle; the dual-export entrypoint answers `server()` automatically. V1 has
 
 ## On-demand consultation: trigger words + `/advisor`
 
-The executor decides tool timing itself (Claude-native: the tool description
-is the router), but two deterministic paths force a consultation:
+**Design principle: user-gated, credit-conscious.** The executor defaults to
+its best solo work and NEVER calls the advisor unprompted — advisor credits
+are expensive. Escalation happens only through explicit user intent:
 
 **Trigger words** — when your message contains `advice`, `advisor`, or `get
 consultation` (configurable via the `triggers` option; empty list disables),
-the plugin appends a consult directive to your admitted prompt. The executor
-then calls the `advisor` tool with full context and refines its answer:
+the plugin appends a consult directive to your admitted prompt. The directive
+distinguishes a consultation *request* ("give me advice" → consult now) from
+a future-use *grant* ("you can use advisor if stuck" → remember, consult only
+if genuinely stuck or before declaring done) — so a casual permission never
+triggers immediate spend. The executor then calls the `advisor` tool with
+full context and refines its answer:
 
 ```text
 you:  this deploy plan looks risky — get consultation before proceeding
       ↓ (directive appended automatically)
 exec: → advisor() → advice → refined plan citing the advice
+
+you:  you can use the advisor if you get stuck
+      ↓ (directive appended, grant recognized)
+exec: works solo, consults only if stuck
 ```
 
 **`/advisor` command** — V2 registers it automatically (`/advisor [focus]`);
@@ -91,6 +100,7 @@ project's `.opencode/commands/`). Same flow, explicit invocation.
 | Option | Default | Description |
 |---|---|---|
 | `triggers` | `["advice","advisor","get consultation"]` | Case-insensitive substrings routing user messages to the flow; `[]` disables |
+| `nudge` | `"off"` | Under-calling nudge is OPT-IN (autonomous spend); `"on"` enables, `"auto"` limits to small-tier executors |
 
 ### Permissions
 

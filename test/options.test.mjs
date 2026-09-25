@@ -77,3 +77,8 @@ test("out-of-range values throw with bounds", () => {
   assert.throws(() => resolveOptions({ advisor: { providerID: "a", id: "b" }, nudge: "sometimes" }), /auto\|on\|off/)
   assert.throws(() => resolveOptions({ advisor: { providerID: "a" } }), /providerID, id/)
 })
+
+test("nudge defaults to off (credit-conscious: no autonomous spend)", () => {
+  const o = resolveOptions({ advisor: { providerID: "p", id: "m" } })
+  assert.equal(o.nudge, "off")
+})

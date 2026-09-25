@@ -21,7 +21,7 @@ export const DEFAULTS = {
   // plus original-task pinning preserves signal at roughly ⅔ the cost of 48k
   // (efficiency review F-ledger; tune per workload).
   transcriptBudgetChars: 32_000,
-  nudge: "auto" as const,
+  nudge: "off" as const,
   injectTimingPrompt: true,
   logLevel: "info" as const,
 }

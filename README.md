@@ -252,9 +252,9 @@ The executor receives only the framed advice, as ADVISOR REVIEW by provider/mode
 
 ## Development
 
-npm install, then npm run typecheck for the strict type check, npm test for the test suite (161 tests green), and npm run build for the bundles. The installable artifacts are the two files in dist/. Design notes and prior art live in the research directory, and working documents live in plans.
+npm install, then npm run typecheck for the strict type check, npm test for the test suite (167 tests green), and npm run build for the bundles. The installable artifacts are the two files in dist/. Design notes and prior art live in the research directory, and working documents live in plans.
 
-Current version: 0.8.1. Zero runtime dependencies.
+Current version: 0.9.0. Zero runtime dependencies.
 
 ## License
 

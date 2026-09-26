@@ -750,3 +750,20 @@ test("empty direct responses retry once before falling back", async () => {
   assert.equal(captured.switchModelCalls.length, 0, "no fallback needed — the retry recovered it")
 })
 
+test("config changes apply at consult dispatch without reload (freshness at dispatch)", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const dir = join(ctx.location.directory, ".opencode")
+  await mkdir(dir, { recursive: true })
+  // Thorough preset ⇒ the advice budget becomes 16K tokens, which is visible
+  // in the composed prompt (rule 1: "under 16000 tokens").
+  await writeFile(join(dir, "opencode-advisor.json"), JSON.stringify({ preset: "thorough" }))
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  await advisorTool.execute({}, { sessionID: "s-fresh", signal: new AbortController().signal })
+  const sent = captured.generateTextInputs[0]
+  assert.ok(
+    sent.prompt.includes("under 16000 tokens"),
+    "on-disk config applied at consult dispatch — no reload needed (A3 fix, dispatch side)",
+  )
+})
+

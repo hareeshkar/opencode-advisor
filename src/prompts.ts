@@ -17,7 +17,7 @@ import type { AdvisorOptions } from "./types.js"
  *  (trigger words, /advisor, or a direct request) — never autonomously. ~115 tokens; measured. */
 export const ADVISOR_TOOL_DESCRIPTION = [
   "Consult a stronger reviewer model when the user asks for advice, review, or consultation (the /advisor command counts).",
-  "No parameters — your full conversation is forwarded automatically.",
+  "No parameters — your full conversation is forwarded automatically. If the advisor needs longer than the response window, the tool returns an ADVISOR CONSULT RUNNING note with a consult id: keep working, the framed advice arrives automatically on your next turn, and advisor_status lists consultations.",
   "Do NOT call unprompted: there is no autonomous or deferred consultation; advisor calls cost significant credits, so default to your best solo work. Never call for trivial single-step tasks, pure lookups, or when tool output already dictates the next step.",
   "After it returns: weigh the reply as peer review rather than instructions; act on it unless empirical evidence contradicts it; surface conflicts with one more call instead of silently switching.",
 ].join(" ")

@@ -273,7 +273,9 @@ test("settings RPC validates drafts before touching disk", async () => {
   const { ctx, captured } = makeCtx()
   await createV2Plugin().setup(ctx)
   const rpc = captured.rpcHandlers.get("opencode-advisor")
-  await assert.rejects(() => rpc.set({ doc: { maxUsesPerTask: 999 }, scope: "project" }), /maxUsesPerTask/)
+  await assert.rejects(() => rpc.set({ doc: { maxUsesPerTask: 1_001 }, scope: "project" }), /maxUsesPerTask/)
+  await assert.rejects(() => rpc.set({ doc: { pruning: "sideways" }, scope: "project" }), /pruning/)
+  await assert.rejects(() => rpc.set({ doc: { adviceTokenBudget: 15 }, scope: "project" }), /adviceTokenBudget/)
   const entries = await readdir(join(ctx.location.directory, ".opencode")).catch(() => [])
   assert.deepEqual(entries, [], "no file was created for an invalid draft")
 })
@@ -755,14 +757,14 @@ test("config changes apply at consult dispatch without reload (freshness at disp
   await createV2Plugin().setup(ctx)
   const dir = join(ctx.location.directory, ".opencode")
   await mkdir(dir, { recursive: true })
-  // Thorough preset ⇒ the advice budget becomes 16K tokens, which is visible
-  // in the composed prompt (rule 1: "under 16000 tokens").
+  // Thorough preset ⇒ the advice budget becomes 32K tokens, which is visible
+  // in the composed prompt (rule 1: "under 32000 tokens").
   await writeFile(join(dir, "opencode-advisor.json"), JSON.stringify({ preset: "thorough" }))
   const advisorTool = captured.tools.find((t) => t.name === "advisor")
   await advisorTool.execute({}, { sessionID: "s-fresh", signal: new AbortController().signal })
   const sent = captured.generateTextInputs[0]
   assert.ok(
-    sent.prompt.includes("under 16000 tokens"),
+    sent.prompt.includes("under 32000 tokens"),
     "on-disk config applied at consult dispatch — no reload needed (A3 fix, dispatch side)",
   )
 })
@@ -791,3 +793,168 @@ test("durable consult ledger: records survive reloads, orphans fail at setup swe
   assert.ok(ledgerNow.some((r) => r.id === "c-prev" && r.state === "failed"), "ledger persisted the sweep")
 })
 
+
+// --- DEFECT-2 (live finding 2026-09-27, Suite E3) -----------------------------
+// A consult that fails INSIDE the sync wait window is already reported verbatim
+// by the tool result. Injecting an `ADVISOR NOT RUNNING` notice as well
+// double-reports the same failure (observed live: a 29 ms `model_not_found`
+// launch failure produced both). The notice must be gated on `waitExpired`.
+
+/** Drain the injection queue through the native request rewrite. */
+async function drainInjections(captured, sessionID) {
+  const out = []
+  for (let i = 0; i < 4; i++) {
+    await captured.contextHooks[0]({
+      sessionID,
+      kind: "primary",
+      model: { providerID: "p", id: "m" },
+      system: [],
+    })
+    const ev = {
+      sessionID,
+      kind: "primary",
+      request: new Request("http://example.test/v1/messages", {
+        method: "POST",
+        body: JSON.stringify({ system: "s", messages: [] }),
+      }),
+    }
+    await captured.httpHooks[0](ev)
+    const body = await ev.request.clone().text()
+    if (body.includes("ADVISOR NOT RUNNING")) out.push(body)
+  }
+  return out
+}
+
+test("a synchronous launch failure does NOT inject a redundant terminal notice (DEFECT-2)", async () => {
+  const boom = async () => {
+    throw new Error("Model unavailable: nonexistent-provider/nope")
+  }
+  const { ctx, captured } = makeCtx({ generate: { text: boom } })
+  // Both transports must fail: the direct call falls back to the sandwich.
+  ctx.session.generate = boom
+  await createV2Plugin().setup(ctx)
+  const result = await captured.tools[0].execute({}, { sessionID: "s-dup", signal: new AbortController().signal })
+  const text = result.content
+  assert.ok(text.includes("advisor_tool_result_error"), "the tool result carries the failure")
+  assert.ok(text.includes("not_found") || text.includes("not available") || text.includes("unavailable"), `framed: ${text}`)
+
+  const injected = await drainInjections(captured, "s-dup")
+  assert.equal(
+    injected.length,
+    0,
+    `a failure that settles inside the wait window must not also inject (got ${injected.length})`,
+  )
+})
+
+test("a backgrounded failure DOES inject exactly one terminal notice (DEFECT-2 symmetry)", async () => {
+  const { ctx, captured } = makeCtx({
+    options: { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 100, maxConsultMs: 1000 },
+    generate: {
+      text: async () => {
+        await new Promise((r) => setTimeout(r, 4_000))
+        return { text: "too late" }
+      },
+    },
+  })
+  ctx.session.generate = async () => {
+    await new Promise((r) => setTimeout(r, 4_000))
+    return { text: "too late" }
+  }
+  await createV2Plugin().setup(ctx)
+  const result = await captured.tools[0].execute({}, { sessionID: "s-bg", signal: new AbortController().signal })
+  assert.ok(result.content.includes("ADVISOR CONSULT RUNNING"), `expected the RUNNING banner, got: ${result.content}`)
+
+  // let the 1000ms ceiling fire
+  await new Promise((r) => setTimeout(r, 1_400))
+  const injected = await drainInjections(captured, "s-bg")
+  assert.equal(injected.length, 1, `exactly one terminal notice expected, got ${injected.length}`)
+  assert.ok(injected[0].includes("ADVISOR NOT RUNNING"))
+  assert.ok(injected[0].includes("The cap was not consumed"), "the notice's cap claim must stay truthful")
+})
+
+test("a cap rejection still injects nothing (DEFECT-2 must not regress the pre-dispatch guard)", async () => {
+  const { ctx, captured } = makeCtx({ options: { advisor: { providerID: "p", id: "a" }, logLevel: "error", maxUsesPerTask: 1 } })
+  await createV2Plugin().setup(ctx)
+  const first = await captured.tools[0].execute({}, { sessionID: "s-cap", signal: new AbortController().signal })
+  assert.ok(!first.content.includes("ADVISOR NOT RUNNING"))
+  const second = await captured.tools[0].execute({}, { sessionID: "s-cap", signal: new AbortController().signal })
+  assert.ok(second.content.includes("max_uses_exceeded"), `expected a cap refusal, got: ${second.content}`)
+  const injected = await drainInjections(captured, "s-cap")
+  assert.equal(injected.length, 0, "a cap rejection must never inject a terminal notice")
+})
+
+test("the transport receives the consult signal so a ceiling can cancel it (DEFECT-1 wiring)", async () => {
+  const seen = []
+  const { ctx, captured } = makeCtx({
+    generate: {
+      text: async (_input, requestOptions) => {
+        seen.push(requestOptions)
+        return { text: "advice with a signal" }
+      },
+    },
+  })
+  await createV2Plugin().setup(ctx)
+  const caller = new AbortController()
+  await captured.tools[0].execute({}, { sessionID: "s-sig", signal: caller.signal })
+  assert.equal(seen.length, 1, "one direct sub-call")
+  assert.ok(seen[0] && seen[0].signal, "generate.text must receive requestOptions.signal")
+  assert.equal(seen[0].signal.aborted, false, "the signal is live during a normal consult")
+  assert.ok(seen[0].signal instanceof AbortSignal, "it is a real AbortSignal")
+})
+
+// --- DEFECT-3 (live finding 2026-09-27) ---------------------------------------
+// `waitExpired` lived in PLUGIN-SETUP scope, so once any consult's sync wait
+// expired the flag stayed true for the rest of that plugin instance and leaked
+// into every later consult's delivery decision. Consequence: a later consult
+// that completed INSIDE its own wait window was treated as backgrounded and
+// injected, even though its tool result already carried the advice — the advice
+// reached the executor twice.
+
+test("a consult that completes inside its own wait window is NOT injected after an earlier backgrounded consult (DEFECT-3)", async () => {
+  const { ctx, captured } = makeCtx()
+  // wait 60ms: consult #1 is forced to background, consult #2 answers instantly.
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 120, maxConsultMs: 30_000 }
+  let slow = true
+  ctx.generate.text = async () => {
+    if (slow) {
+      await new Promise((r) => setTimeout(r, 500))
+      return { text: "BACKGROUNDED ADVICE" }
+    }
+    return { text: "INLINE ADVICE" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+
+  // consult #1 — backgrounds, so waitExpired becomes true on this instance
+  const first = await advisorTool.execute({}, { sessionID: "s-d3", signal: new AbortController().signal })
+  assert.ok(first.content.includes("ADVISOR CONSULT RUNNING"), "consult #1 must background")
+  await new Promise((r) => setTimeout(r, 650)) // let #1 settle and be delivered
+
+  // consult #2 — settles well inside its own 120ms window
+  slow = false
+  const second = await advisorTool.execute({}, { sessionID: "s-d3", signal: new AbortController().signal })
+  assert.ok(second.content.includes("INLINE ADVICE"), `consult #2 must answer inline, got: ${second.content.slice(0, 120)}`)
+  assert.ok(!second.content.includes("ADVISOR NOT RUNNING"), "an inline success has no terminal notice")
+
+  // drain: consult #2's advice must NOT be queued for injection
+  let inlineInjected = 0
+  for (let i = 0; i < 3; i++) {
+    await captured.contextHooks[0]({ sessionID: "s-d3", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+    const ev = {
+      sessionID: "s-d3",
+      kind: "primary",
+      request: new Request("http://example.test/v1/messages", {
+        method: "POST",
+        body: JSON.stringify({ system: "s", messages: [] }),
+      }),
+    }
+    await captured.httpHooks[0](ev)
+    const body = await ev.request.clone().text()
+    if (body.includes("INLINE ADVICE")) inlineInjected++
+  }
+  assert.equal(
+    inlineInjected,
+    0,
+    "an inline-delivered consult must not also be injected (waitExpired leaked from the earlier backgrounded consult)",
+  )
+})

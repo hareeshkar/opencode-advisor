@@ -198,7 +198,9 @@ export const ADVISOR_CONFIG_KEYS = [
   "timeoutMs",
   "adviceTokenBudget",
   "transcriptBudgetTokens",
+  "maxToolOutputTokens",
   "maxToolOutputChars",
+  "pruning",
   "triggers",
   "logLevel",
 ] as const

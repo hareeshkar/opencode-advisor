@@ -11,6 +11,12 @@ import type { AdvisorModelRef, AdvisorOptions, AdvisorSource, LogLevel } from ".
 
 const ENV = process.env as Record<string, string | undefined>
 
+/** The one chars↔tokens conversion constant in the plugin. 4 is the
+ *  industry-standard approximation for English + code (GPT/Claude/Gemini all
+ *  land within ±10%). Every token budget is multiplied by this to reach the
+ *  pruner's exact char arithmetic, and by this to reach the response cap. */
+export const CHARS_PER_TOKEN = 4
+
 /** Dedicated config file names, lowest → highest precedence. */
 export const CONFIG_FILE_RELATIVE = "opencode-advisor.json"
 
@@ -34,23 +40,25 @@ export function mergeAdvisorConfigLayers(layers: Array<unknown>): Record<string,
  *  chars/token. Numbers are deliberately generous — advice output is the
  *  cheapest part of a consult. */
 export const PRESETS: Record<string, Partial<Record<string, unknown>>> = {
-  economy: { maxUsesPerTask: 1, transcriptBudgetTokens: "8k", adviceTokenBudget: 4_000 },
-  balanced: { maxUsesPerTask: 3, transcriptBudgetTokens: "16k", adviceTokenBudget: 8_000 },
-  thorough: { maxUsesPerTask: 5, transcriptBudgetTokens: "32k", adviceTokenBudget: 16_000 },
-  exhaustive: { maxUsesPerTask: 8, transcriptBudgetTokens: "64k", adviceTokenBudget: 32_000 },
+  economy: { maxUsesPerTask: 1, transcriptBudgetTokens: "16k", adviceTokenBudget: 8_000 },
+  balanced: { maxUsesPerTask: 3, transcriptBudgetTokens: "32k", adviceTokenBudget: 16_000 },
+  thorough: { maxUsesPerTask: 5, transcriptBudgetTokens: "64k", adviceTokenBudget: 32_000 },
+  exhaustive: { maxUsesPerTask: 8, transcriptBudgetTokens: "128k", adviceTokenBudget: 64_000 },
 }
 
 export const DEFAULTS = {
   advisor: { providerID: "", id: "" } as AdvisorModelRef,
   maxUsesPerTask: 3,
-  adviceTokenBudget: 8_000,
+  adviceTokenBudget: 16_000,
   advisorResponseWaitMs: 90_000,
   maxConsultMs: 3_600_000,
-  maxToolOutputChars: 1_500,
-  // 16k tokens ≈ 64k chars: balanced default — the recency-weighted excerpt
+  // 750 tokens ≈ 3,000 chars: a whole file section or a full stack trace.
+  maxToolOutputTokens: 750,
+  // 32k tokens ≈ 128k chars: balanced default — the recency-weighted excerpt
   // plus original-task pinning preserves signal at roughly ⅔ the cost of a
   // larger window (efficiency review F-ledger; tune per workload).
-  transcriptBudgetTokens: 16_000,
+  transcriptBudgetTokens: 32_000,
+  pruning: "standard" as const,
   advisorMode: "review" as const,
   logLevel: "info" as const,
 }
@@ -148,7 +156,8 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   let adviceTokenBudget = DEFAULTS.adviceTokenBudget
   let advisorResponseWaitMs = DEFAULTS.advisorResponseWaitMs
   let maxConsultMs = DEFAULTS.maxConsultMs
-  let maxToolOutputChars = DEFAULTS.maxToolOutputChars
+  let maxToolOutputTokens = DEFAULTS.maxToolOutputTokens
+  let maxToolOutputChars = maxToolOutputTokens * CHARS_PER_TOKEN
   let transcriptBudgetTokens = DEFAULTS.transcriptBudgetTokens
   let advisorMode: AdvisorOptions["advisorMode"] = DEFAULTS.advisorMode
   let logLevel: LogLevel = DEFAULTS.logLevel
@@ -160,7 +169,7 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   }
   if (ENV.ADVISOR_MAX_USES) {
     const n = Number.parseInt(ENV.ADVISOR_MAX_USES, 10)
-    if (!Number.isFinite(n) || n < 1 || n > 50) throw new Error(`[advisor] ADVISOR_MAX_USES must be 1..50, got "${ENV.ADVISOR_MAX_USES}"`)
+    if (!Number.isFinite(n) || n < 1 || n > 1_000) throw new Error(`[advisor] ADVISOR_MAX_USES must be 1..1000, got "${ENV.ADVISOR_MAX_USES}"`)
     maxUsesPerTask = n
   }
   if (ENV.ADVISOR_LOG) {
@@ -197,29 +206,53 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     }
     if (preset.maxUsesPerTask !== undefined) maxUsesPerTask = preset.maxUsesPerTask as number
     if (preset.transcriptBudgetTokens !== undefined) {
-      transcriptBudgetTokens = readSize({ v: preset.transcriptBudgetTokens as string }, "v", 2_000, 1_000_000) ?? transcriptBudgetTokens
+      transcriptBudgetTokens = readSize({ v: preset.transcriptBudgetTokens as string }, "v", 1_000, 2_000_000) ?? transcriptBudgetTokens
     }
     if (preset.adviceTokenBudget !== undefined) adviceTokenBudget = preset.adviceTokenBudget as number
   }
 
-  maxUsesPerTask = readInt(opts, "maxUsesPerTask", 1, 50) ?? maxUsesPerTask
-  let maxAttempts = readInt(opts, "maxAttempts", 1, 100) ?? 0 // 0 = derive from cap
-  adviceTokenBudget = readInt(opts, "adviceTokenBudget", 500, 64_000) ?? adviceTokenBudget
-  const waitExplicit = readInt(opts, "advisorResponseWaitMs", 100, 600_000)
-  const waitLegacy = readInt(opts, "timeoutMs", 1_000, 600_000)
+  maxUsesPerTask = readInt(opts, "maxUsesPerTask", 1, 1_000) ?? maxUsesPerTask
+  let maxAttempts = readInt(opts, "maxAttempts", 1, 10_000) ?? 0 // 0 = derive from cap
+  adviceTokenBudget = readInt(opts, "adviceTokenBudget", 16, 1_000_000) ?? adviceTokenBudget
+  const waitExplicit = readInt(opts, "advisorResponseWaitMs", 1, 3_600_000)
+  const waitLegacy = readInt(opts, "timeoutMs", 1, 3_600_000)
   advisorResponseWaitMs = waitExplicit ?? waitLegacy ?? advisorResponseWaitMs
   if (waitExplicit === undefined && waitLegacy !== undefined) {
     console.warn("[advisor] timeoutMs is deprecated — rename it to advisorResponseWaitMs")
   }
-  maxConsultMs = readSize(opts, "maxConsultMs", 1_000, 86_400_000) ?? maxConsultMs
+  maxConsultMs = readSize(opts, "maxConsultMs", 1_000, 604_800_000) ?? maxConsultMs
   if (maxConsultMs < advisorResponseWaitMs) {
     console.warn(
       `[advisor] maxConsultMs (${maxConsultMs}) raised to advisorResponseWaitMs (${advisorResponseWaitMs}) — the ceiling must cover the wait window`,
     )
     maxConsultMs = advisorResponseWaitMs
   }
-  maxToolOutputChars = readSize(opts, "maxToolOutputChars", 100, 200_000) ?? maxToolOutputChars
-  transcriptBudgetTokens = readSize(opts, "transcriptBudgetTokens", 2_000, 1_000_000) ?? transcriptBudgetTokens
+  // Tool-output ceiling: `maxToolOutputTokens` is canonical (tokens are the
+  // unit providers bill in). `maxToolOutputChars` is still accepted and
+  // divided by 4, so a pre-1.0 config keeps working and reads honestly.
+  const toolTokExplicit = readSize(opts, "maxToolOutputTokens", 4, 4_000_000)
+  const toolTokLegacy = readSize(opts, "maxToolOutputChars", 16, 16_000_000)
+  if (toolTokExplicit === undefined && toolTokLegacy !== undefined) {
+    maxToolOutputTokens = Math.max(4, Math.ceil(toolTokLegacy / CHARS_PER_TOKEN))
+    console.warn(
+      `[advisor] maxToolOutputChars is deprecated — use maxToolOutputTokens ` +
+        `(${maxToolOutputTokens} tokens ≈ ${maxToolOutputTokens * CHARS_PER_TOKEN} chars)`,
+    )
+  } else {
+    maxToolOutputTokens = toolTokExplicit ?? maxToolOutputTokens
+  }
+  maxToolOutputChars = maxToolOutputTokens * CHARS_PER_TOKEN
+  transcriptBudgetTokens = readSize(opts, "transcriptBudgetTokens", 64, 32_000_000) ?? transcriptBudgetTokens
+
+  // Pruning policy: "standard" (window + truncate) or "none" (verbatim).
+  let pruning: "standard" | "none" = DEFAULTS.pruning
+  const optPruning = readString(opts, "pruning")
+  if (optPruning !== undefined) {
+    if (optPruning !== "standard" && optPruning !== "none") {
+      throw new Error(`[advisor] option "pruning" must be "standard" | "none", got ${JSON.stringify(optPruning)}`)
+    }
+    pruning = optPruning
+  }
   let triggers: string[] = [...DEFAULT_TRIGGERS]
   if (opts.triggers !== undefined) {
     if (!Array.isArray(opts.triggers)) {
@@ -267,9 +300,11 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     maxAttempts: maxAttempts > 0 ? maxAttempts : maxUsesPerTask * 3 + 2,
     adviceTokenBudget,
     transcriptBudgetTokens,
+    maxToolOutputTokens,
+    pruning,
     advisorResponseWaitMs,
     maxConsultMs,
-    prune: { maxToolOutputChars, transcriptBudgetChars: transcriptBudgetTokens * 4 },
+    prune: { maxToolOutputChars, transcriptBudgetChars: transcriptBudgetTokens * CHARS_PER_TOKEN, pruning },
     advisorMode,
     triggers,
     logLevel,

@@ -7,7 +7,7 @@
  */
 
 export const PLUGIN_ID = "opencode-advisor"
-export const PLUGIN_VERSION = "0.9.1"
+export const PLUGIN_VERSION = "1.0.0"
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -32,10 +32,24 @@ export interface AdvisorSource {
 }
 
 export interface PruneOptions {
-  /** Maximum characters per tool output after truncation. */
+  /**
+   * Per-tool-output slice ceiling, in CHARS. Derived from the user-facing
+   * `maxToolOutputTokens` (tokens × CHARS_PER_TOKEN) — the pruner measures
+   * exactly, the user budgets in the unit models are billed in.
+   */
   maxToolOutputChars: number
-  /** Total character budget for the pruned transcript. */
+  /** Total character budget for the pruned transcript (tokens × 4). */
   transcriptBudgetChars: number
+  /**
+   * "standard" — window + truncate to the configured budgets (default).
+   * "none"      — NO windowing and NO truncation. The advisor receives the
+   *              entire transcript verbatim (only noise/blob removal and
+   *              label neutralisation still run, because role contamination
+   *              is a correctness issue, not a size issue). Bounded only by
+   *              the advisor model's own context window. For maximum-fidelity
+   *              reviews where the transcript is already curated.
+   */
+  pruning: "standard" | "none"
 }
 
 export interface AdvisorOptions {
@@ -57,6 +71,19 @@ export interface AdvisorOptions {
    * the pruner — the pruner measures exactly, the user budgets natively.
    */
   transcriptBudgetTokens: number
+  /**
+   * Per-tool-output slice ceiling in TOKENS (native unit). Default 750
+   * (≈3,000 chars). Set high (or pair with `pruning: "none"`) when the
+   * advisor must read whole files rather than excerpts.
+   */
+  maxToolOutputTokens: number
+  /**
+   * Pruning policy. "standard" (default) windows and truncates the transcript
+   * to the configured token budgets; "none" sends it whole. Range: the whole
+   * point is to not be cost-saving — the advisor's own context window is the
+   * real ceiling.
+   */
+  pruning: "standard" | "none"
   /**
    * How long the executor's tool call waits for the advisor response before
    * returning control (the consult keeps running in the background and the

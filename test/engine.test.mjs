@@ -244,3 +244,112 @@ test("health() reflects the generation counter bump", () => {
   const h = engine.health("g1")
   assert.equal(h.steps, 0)
 })
+
+// --- DEFECT-1 (live finding 2026-09-27, scenario E7) -------------------------
+// A ceiling expiry must ABORT the in-flight provider request, not merely stop
+// waiting for it. Before the fix `withTimeout` only rejected, so the transport
+// promise kept running and the provider billed a consult the ledger recorded as
+// `calls: 0`.
+
+test("ceiling expiry aborts the in-flight sub-call instead of abandoning it (E7)", async () => {
+  let transportSignal = null
+  const host = makeHost({
+    runAdvisor: (_prompt, signal) =>
+      new Promise((resolve) => {
+        transportSignal = signal
+        // A well-behaved transport completes only when cancelled.
+        signal.addEventListener("abort", () => resolve("cancelled"), { once: true })
+      }),
+  })
+  const engine = new AdvisorEngine({ ...OPTS, maxConsultMs: 30 }, host)
+  const r = await engine.consult("s-abort-1", new AbortController().signal)
+  assert.equal(r.ok, false)
+  assert.equal(r.errorCode, "execution_time_exceeded")
+  assert.ok(transportSignal, "the transport must receive a signal")
+  assert.equal(transportSignal.aborted, true, "the transport signal must be aborted on ceiling expiry")
+})
+
+test("caller interruption also aborts the transport signal (E7 linkage)", async () => {
+  let transportSignal = null
+  const host = makeHost({
+    runAdvisor: (_prompt, signal) =>
+      new Promise((resolve) => {
+        transportSignal = signal
+        signal.addEventListener("abort", () => resolve("cancelled"), { once: true })
+      }),
+  })
+  const engine = new AdvisorEngine({ ...OPTS, maxConsultMs: 60_000 }, host)
+  const caller = new AbortController()
+  const pending = engine.consult("s-abort-2", caller.signal)
+  await new Promise((r) => setTimeout(r, 5))
+  caller.abort()
+  const r = await pending
+  assert.equal(r.ok, false)
+  assert.equal(transportSignal.aborted, true, "caller abort must propagate to the transport")
+})
+
+test("ceiling expiry keeps the exact ceiling wording even though the transport saw the abort (E7)", async () => {
+  // A transport that rejects with its own abort error must still surface the
+  // ceiling wording, so the user-facing message does not change shape.
+  const host = makeHost({
+    runAdvisor: (_prompt, signal) =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("The operation was aborted")), { once: true })
+      }),
+  })
+  const engine = new AdvisorEngine({ ...OPTS, maxConsultMs: 25 }, host)
+  const r = await engine.consult("s-abort-3", new AbortController().signal)
+  assert.equal(r.ok, false)
+  assert.equal(r.errorCode, "execution_time_exceeded")
+  assert.match(r.message, /advisor sub-call timed out after 25ms/)
+})
+
+test("a ceiling-expired consult records an error and never consumes the success cap (E7)", async () => {
+  const host = makeHost({
+    runAdvisor: (_prompt, signal) =>
+      new Promise((resolve) => signal.addEventListener("abort", () => resolve("x"), { once: true })),
+  })
+  const engine = new AdvisorEngine({ ...OPTS, maxConsultMs: 25, maxUsesPerTask: 1 }, host)
+  const first = await engine.consult("s-abort-4", new AbortController().signal)
+  assert.equal(first.ok, false)
+  const h = engine.health("s-abort-4")
+  assert.equal(h.calls, 0, "a ceiling-expired consult must not consume the success cap")
+  assert.ok(host.usage.some((u) => u.errors === 1), "the failure is still recorded in usage")
+})
+
+/* ---------------- v1.0.0: pruning policy reaches the engine ---------------- */
+
+test("pruning:none sends the whole transcript; standard windows it", async () => {
+  const long = Array.from({ length: 40 }, (_, i) => ({ role: "user", text: `step ${i} ${"w".repeat(300)}` }))
+  const seen = []
+  const host = makeHost({
+    transcript: long,
+    async runAdvisor(prompt) {
+      seen.push(prompt)
+      return "advice"
+    },
+  })
+
+  const std = new AdvisorEngine(OPTS, host)
+  const rStd = await std.consult("s-std", new AbortController().signal)
+  assert.equal(rStd.ok, true)
+  assert.ok(rStd.stats.prune.outChars <= 1_000 + 2, `standard respects the 1k char budget (got ${rStd.stats.prune.outChars})`)
+
+  const none = new AdvisorEngine({ ...OPTS, prune: { ...OPTS.prune, pruning: "none" } }, host)
+  const rNone = await none.consult("s-none", new AbortController().signal)
+  assert.equal(rNone.ok, true)
+  assert.ok(
+    rNone.stats.prune.outChars > rStd.stats.prune.outChars * 10,
+    `unpruned reaches the advisor whole (${rNone.stats.prune.outChars} vs ${rStd.stats.prune.outChars})`,
+  )
+  const prompt = seen[seen.length - 1]
+  assert.ok(prompt.includes("step 0"), "the OLDEST slice survives under pruning:none")
+  assert.ok(prompt.includes("step 39"), "the newest slice survives too")
+})
+
+test("pruning: defaults to standard when the key is absent (backwards-safe)", () => {
+  const legacy = { ...OPTS, prune: { maxToolOutputChars: 200, transcriptBudgetChars: 1_000 } }
+  assert.equal(legacy.prune.pruning, undefined)
+  const engine = new AdvisorEngine(legacy, makeHost())
+  assert.equal(engine.opts.prune.pruning === "none", false, "absent key is NOT treated as unpruned")
+})

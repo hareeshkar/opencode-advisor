@@ -39,9 +39,16 @@ function hardCapTokens(text: string, tokens: number): string {
   return `${(lastSpace > maxChars * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()} ${MARKER}`
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number, signal: AbortSignal): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, ms: number, signal: AbortSignal, onTimeout?: () => void): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`advisor sub-call timed out after ${ms}ms`)), ms)
+    const timer = setTimeout(() => {
+      // Cancel the in-flight work BEFORE rejecting. Rejecting alone leaves the
+      // provider request running to completion: the ledger records a zero-call
+      // failure while the provider still bills the tokens (live finding
+      // 2026-09-27 — E7).
+      onTimeout?.()
+      reject(new Error(`advisor sub-call timed out after ${ms}ms`))
+    }, ms)
     const onAbort = () => {
       clearTimeout(timer)
       reject(new Error("advisor sub-call aborted"))
@@ -296,7 +303,13 @@ export class AdvisorEngine {
     started: number,
     gen: number,
   ): Promise<ConsultResult> {
-    const pruned = pruneTranscript(windowTranscript(transcript, this.opts.prune.transcriptBudgetChars), this.opts.prune)
+    // pruning:"none" ⇒ skip the recency window entirely; the pruner then
+    // applies no size reduction either, so the advisor sees the whole task.
+    const windowed =
+      this.opts.prune.pruning === "none"
+        ? transcript
+        : windowTranscript(transcript, this.opts.prune.transcriptBudgetChars)
+    const pruned = pruneTranscript(windowed, this.opts.prune)
     if (pruned.text.trim() === "") {
       return fail("unavailable", "Transcript is empty after pruning — nothing to advise on.")
     }
@@ -309,14 +322,38 @@ export class AdvisorEngine {
     const estTokensIn = Math.ceil(promptChars / 4)
 
     let raw: string
+    // The consult's own cancellation scope. The ceiling must ABORT the in-flight
+    // provider request, not merely stop waiting for it: `withTimeout` rejects on
+    // expiry, but the transport promise keeps running and bills the provider for
+    // a consult the ledger records as `calls: 0` (live finding 2026-09-27 - E7).
+    // Linking the caller's signal keeps executor interruption working, and
+    // `ceilingFired` preserves the exact ceiling wording even though the abort
+    // (not the timer) is what the transport observes first.
+    const consultAbort = new AbortController()
+    const onCallerAbort = (): void => consultAbort.abort()
+    if (signal.aborted) onCallerAbort()
+    else signal.addEventListener("abort", onCallerAbort, { once: true })
+    let ceilingFired = false
     try {
-      // The lifetime ceiling (maxConsultMs) — NOT a UX kill switch. The executor's
-    // wait window (advisorResponseWaitMs) is enforced by the adapter, which
-    // backgrounds the consult instead of aborting it.
-    raw = await withTimeout(this.host.runAdvisor(prompt, signal, sessionID, nonce, this.advisorRef), this.opts.maxConsultMs, signal)
+      // The lifetime ceiling (maxConsultMs) - NOT a UX kill switch. The executor's
+      // wait window (advisorResponseWaitMs) is enforced by the adapter, which
+      // backgrounds the consult instead of aborting it.
+      raw = await withTimeout(
+        this.host.runAdvisor(prompt, consultAbort.signal, sessionID, nonce, this.advisorRef),
+        this.opts.maxConsultMs,
+        consultAbort.signal,
+        () => {
+          ceilingFired = true
+          consultAbort.abort()
+        },
+      )
     } catch (err) {
       const { errorCode, message } = classifyError(err)
+      // The ceiling is the cause regardless of which timer the transport saw.
+      if (ceilingFired) return fail("execution_time_exceeded", `advisor sub-call timed out after ${this.opts.maxConsultMs}ms`, estTokensIn)
       return fail(errorCode, message, estTokensIn)
+    } finally {
+      signal.removeEventListener("abort", onCallerAbort)
     }
 
     const advice = sanitizeAdviceText(hardCapTokens(raw.trim(), this.opts.adviceTokenBudget))

@@ -57,36 +57,43 @@ test("explicit options beat environment", () => {
 })
 
 test("out-of-range values throw with bounds", () => {
-  assert.throws(() => resolveOptions({ advisor: { providerID: "a", id: "b" }, maxUsesPerTask: 0 }), /1 and 50/)
-  assert.throws(() => resolveOptions({ advisor: { providerID: "a", id: "b" }, adviceTokenBudget: 100 }), /500 and 64000/)
+  assert.throws(() => resolveOptions({ advisor: { providerID: "a", id: "b" }, maxUsesPerTask: 0 }), /1 and 1000/)
+  assert.throws(() => resolveOptions({ advisor: { providerID: "a", id: "b" }, adviceTokenBudget: 15 }), /16 and 1000000/)
+  assert.throws(() => resolveOptions({ advisor: { providerID: "a", id: "b" }, adviceTokenBudget: 1_000_001 }), /16 and 1000000/)
   assert.throws(() => resolveOptions({ advisor: { providerID: "a" } }), /providerID, id/)
 })
 
 /* ---------------- token budgets ---------------- */
 
-test("defaults are token-native: 16k context + 8k advice tokens", () => {
+test("defaults are token-native and generous: 32k context + 16k advice tokens", () => {
   const o = resolveOptions({})
-  assert.equal(o.transcriptBudgetTokens, 16_000)
-  assert.equal(o.prune.transcriptBudgetChars, 64_000, "pruner budget derives at ≈4 chars/token")
-  assert.equal(o.adviceTokenBudget, 8_000, "default = balanced preset, never below economy")
+  assert.equal(o.transcriptBudgetTokens, 32_000)
+  assert.equal(o.prune.transcriptBudgetChars, 128_000, "pruner budget derives at CHARS_PER_TOKEN")
+  assert.equal(o.adviceTokenBudget, 16_000, "default = balanced preset, never below economy")
   assert.equal(o.maxUsesPerTask, 3)
+  assert.equal(o.maxToolOutputTokens, 750, "per-tool cap is a token budget")
+  assert.equal(o.prune.maxToolOutputChars, 3_000, "750 tokens ≈ 3,000 chars for the pruner")
+  assert.equal(o.pruning, "standard", "pruning defaults to standard")
 })
 
-test("adviceTokenBudget is validated at 500..64000", () => {
+test("adviceTokenBudget spans 16..1M tokens — generous, not cost-saving", () => {
   const base = { advisor: { providerID: "p", id: "m" } }
-  assert.equal(resolveOptions({ ...base, adviceTokenBudget: 500 }).adviceTokenBudget, 500)
-  assert.equal(resolveOptions({ ...base, adviceTokenBudget: 64_000 }).adviceTokenBudget, 64_000)
-  assert.throws(() => resolveOptions({ ...base, adviceTokenBudget: 499 }), /500 and 64000/)
-  assert.throws(() => resolveOptions({ ...base, adviceTokenBudget: 64_001 }), /500 and 64000/)
+  assert.equal(resolveOptions({ ...base, adviceTokenBudget: 16 }).adviceTokenBudget, 16)
+  assert.equal(resolveOptions({ ...base, adviceTokenBudget: 1_000_000 }).adviceTokenBudget, 1_000_000)
+  assert.throws(() => resolveOptions({ ...base, adviceTokenBudget: 15 }), /16 and 1000000/)
+  assert.throws(() => resolveOptions({ ...base, adviceTokenBudget: 1_000_001 }), /16 and 1000000/)
 })
 
 test("human budgets: transcriptBudgetTokens (64k/500k) parse; chars derive at ≈4/token", () => {
   const base = { advisor: { providerID: "p", id: "m" } }
   assert.equal(resolveOptions({ ...base, transcriptBudgetTokens: "64k" }).transcriptBudgetTokens, 64_000)
   assert.equal(resolveOptions({ ...base, transcriptBudgetTokens: "64k" }).prune.transcriptBudgetChars, 256_000)
-  assert.equal(resolveOptions({ ...base, transcriptBudgetTokens: "500k" }).prune.transcriptBudgetChars, 2_000_000)
+  assert.equal(resolveOptions({ ...base, transcriptBudgetTokens: "8m" }).prune.transcriptBudgetChars, 32_000_000)
+  assert.equal(resolveOptions({ ...base, maxToolOutputTokens: "3k" }).prune.maxToolOutputChars, 12_000)
+  // Legacy char key still works: divided by CHARS_PER_TOKEN into the token budget.
+  assert.equal(resolveOptions({ ...base, maxToolOutputChars: "3k" }).maxToolOutputTokens, 750)
   assert.equal(resolveOptions({ ...base, maxToolOutputChars: "3k" }).prune.maxToolOutputChars, 3_000)
-  assert.throws(() => resolveOptions({ ...base, transcriptBudgetTokens: "2m" }), /2000 and 1000000/)
+  assert.throws(() => resolveOptions({ ...base, transcriptBudgetTokens: "33m" }), /64 and 32000000/)
   assert.throws(() => resolveOptions({ ...base, transcriptBudgetTokens: "huge" }), /size like "64k"/)
 })
 
@@ -95,25 +102,25 @@ test("presets tune the token curve; explicit options override them", () => {
 
   const economy = resolveOptions({ ...ref, preset: "economy" })
   assert.equal(economy.maxUsesPerTask, 1)
-  assert.equal(economy.transcriptBudgetTokens, 8_000)
-  assert.equal(economy.prune.transcriptBudgetChars, 32_000)
-  assert.equal(economy.adviceTokenBudget, 4_000)
+  assert.equal(economy.transcriptBudgetTokens, 16_000)
+  assert.equal(economy.prune.transcriptBudgetChars, 64_000)
+  assert.equal(economy.adviceTokenBudget, 8_000)
 
   const balanced = resolveOptions({ ...ref, preset: "balanced" })
   assert.equal(balanced.maxUsesPerTask, 3)
-  assert.equal(balanced.transcriptBudgetTokens, 16_000)
-  assert.equal(balanced.adviceTokenBudget, 8_000)
+  assert.equal(balanced.transcriptBudgetTokens, 32_000)
+  assert.equal(balanced.adviceTokenBudget, 16_000)
 
   const thorough = resolveOptions({ ...ref, preset: "thorough" })
   assert.equal(thorough.maxUsesPerTask, 5)
-  assert.equal(thorough.transcriptBudgetTokens, 32_000)
-  assert.equal(thorough.adviceTokenBudget, 16_000)
+  assert.equal(thorough.transcriptBudgetTokens, 64_000)
+  assert.equal(thorough.adviceTokenBudget, 32_000)
 
   const exhaustive = resolveOptions({ ...ref, preset: "exhaustive" })
   assert.equal(exhaustive.maxUsesPerTask, 8)
-  assert.equal(exhaustive.transcriptBudgetTokens, 64_000)
-  assert.equal(exhaustive.prune.transcriptBudgetChars, 256_000)
-  assert.equal(exhaustive.adviceTokenBudget, 32_000)
+  assert.equal(exhaustive.transcriptBudgetTokens, 128_000)
+  assert.equal(exhaustive.prune.transcriptBudgetChars, 512_000)
+  assert.equal(exhaustive.adviceTokenBudget, 64_000)
 
   const overridden = resolveOptions({ ...ref, preset: "economy", maxUsesPerTask: 4 })
   assert.equal(overridden.maxUsesPerTask, 4)
@@ -156,10 +163,22 @@ test("advisorResponseWaitMs: deprecated timeoutMs alias, precedence, and clamp",
   const base = { advisor: { providerID: "p", id: "m" } }
   const alias = resolveOptions({ ...base, timeoutMs: 120_000 })
   assert.equal(alias.advisorResponseWaitMs, 120_000, "timeoutMs maps to the response wait")
-  assert.throws(() => resolveOptions({ ...base, advisorResponseWaitMs: 50 }), /between 100 and 600000/)
+  // The wait window is now genuinely patient: 1ms..1h. A 10s wait is legal.
+  assert.equal(resolveOptions({ ...base, advisorResponseWaitMs: 1 }).advisorResponseWaitMs, 1)
+  assert.equal(resolveOptions({ ...base, advisorResponseWaitMs: 3_600_000 }).advisorResponseWaitMs, 3_600_000)
+  assert.throws(() => resolveOptions({ ...base, advisorResponseWaitMs: 0 }), /between 1 and 3600000/)
+  assert.throws(() => resolveOptions({ ...base, advisorResponseWaitMs: 3_600_001 }), /between 1 and 3600000/)
   const both = resolveOptions({ ...base, timeoutMs: 120_000, advisorResponseWaitMs: 30_000 })
   assert.equal(both.advisorResponseWaitMs, 30_000, "new key wins when both set")
   const clamped = resolveOptions({ ...base, advisorResponseWaitMs: 600_000, maxConsultMs: 300_000 })
   assert.equal(clamped.maxConsultMs, 600_000, "ceiling raised to cover the wait window")
+  // The ceiling itself is not a cost knob: 7 days is legal, not clamped down.
+  assert.equal(
+    resolveOptions({ ...base, maxConsultMs: 604_800_000 }).maxConsultMs,
+    604_800_000,
+    "a week-long ceiling is honoured verbatim",
+  )
+  assert.equal(resolveOptions({ ...base, maxUsesPerTask: 1_000 }).maxUsesPerTask, 1_000)
+  assert.throws(() => resolveOptions({ ...base, maxUsesPerTask: 1_001 }), /1 and 1000/)
 })
 

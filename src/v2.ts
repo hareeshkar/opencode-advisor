@@ -186,6 +186,16 @@ export function extractLastAssistantText(messages: unknown): string {
 
 const EMPTY_INPUT = { type: "object", properties: {}, additionalProperties: false }
 
+/** Stop a child session's in-flight turn. Best-effort: an interrupt that the
+ *  host rejects must never mask the original consult failure. */
+async function interruptChild(ctx: any, childID: string): Promise<void> {
+  try {
+    await ctx.session.interrupt?.({ sessionID: childID })
+  } catch {
+    /* best-effort */
+  }
+}
+
 export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise<() => void> } {
   return {
     id: PLUGIN_ID,
@@ -249,7 +259,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           // tool calls to verify claims before advising — Anthropic's
           // principle (full-transcript strategy) plus grounded exploration.
           if (opts.advisorMode === "agent") {
-            return runAdvisorAgent(prompt, model)
+            return runAdvisorAgent(prompt, model, signal)
           }
           // Session-scoped transient generation (NOT ctx.generate.text):
           // only session-bound requests emit hooks and inherit the host's
@@ -302,7 +312,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               let text = ""
               let shape = "undefined"
               for (let attempt = 1; attempt <= 2; attempt++) {
-                const res = (await ctx.generate.text({ prompt: dispatchPrompt, model: advisorRef })) as { text?: unknown } | undefined
+                if (signal.aborted) throw new Error("advisor sub-call aborted")
+                const res = (await ctx.generate.text({ prompt: dispatchPrompt, model: advisorRef }, { signal })) as { text?: unknown } | undefined
                 text = typeof res?.text === "string" ? res.text : ""
                 shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
                 if (text.trim() !== "") break
@@ -359,7 +370,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               let text = ""
               let shape = "undefined"
               for (let attempt = 1; attempt <= 2; attempt++) {
-                const res = (await ctx.session.generate({ sessionID, prompt: dispatchPrompt })) as { text?: unknown } | undefined
+                if (signal.aborted) throw new Error("advisor sub-call aborted")
+                const res = (await ctx.session.generate({ sessionID, prompt: dispatchPrompt }, { signal })) as { text?: unknown } | undefined
                 text = typeof res?.text === "string" ? res.text : ""
                 shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
                 if (text.trim() !== "") break
@@ -453,6 +465,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       const runAdvisorAgent = async (
         prompt: string,
         model: { providerID: string; id: string; variant?: string },
+        signal: AbortSignal,
       ): Promise<string> => {
         const created = (await ctx.session.create({
           title: "advisor consult",
@@ -470,12 +483,19 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         if (childID === "") throw new Error("agent-mode advisor: child session creation returned no id")
         advisorChildSessions.add(childID)
         try {
-          await ctx.session.prompt({ sessionID: childID, text: `${AGENT_MODE_PREFIX}${prompt}` })
+          // Forward the consult signal: a ceiling expiry must cancel the child's in-flight turn, not leave it running.
+          await ctx.session.prompt({ sessionID: childID, text: `${AGENT_MODE_PREFIX}${prompt}` }, { signal })
           // Poll to completion (idle message marks the end of the run).
           const deadline = Date.now() + opts.maxConsultMs
           let lastText = ""
           for (;;) {
             if (Date.now() > deadline) throw new Error(`advisor_not_running — no response within ${Math.round(opts.maxConsultMs / 1000)}s`)
+            // Ceiling/caller abort: stop the child's turn before giving up, so an
+            // abandoned agent consult does not keep billing the provider.
+            if (signal.aborted) {
+              await interruptChild(ctx, childID)
+              throw new Error("advisor sub-call aborted")
+            }
             await new Promise((r) => setTimeout(r, 1_500))
             let messages: unknown[] = []
             try {
@@ -508,6 +528,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           }
         } finally {
           advisorChildSessions.delete(childID)
+          // Interrupt first: removing the session must not race a live turn.
+          if (signal.aborted) await interruptChild(ctx, childID)
           try {
             await (ctx.session as { remove?: (input: { sessionID: string }) => Promise<void> }).remove?.({ sessionID: childID })
           } catch {
@@ -740,7 +762,6 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       let messagesDropped = 0
       let systemPartsStripped = 0
       let transportUsed = "none"
-      let waitExpired = false
       let lastHistoryDelta = "n/a"
       // Executor model per session, tracked from primary context-hook
       // events. Lets runAdvisor restore the exact model after the advisor
@@ -762,6 +783,13 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             description: ADVISOR_TOOL_DESCRIPTION,
             input: EMPTY_INPUT,
             execute: async (_input: unknown, tctx: any) => {
+              // PER-CONSULT, not per-plugin-instance. This flag used to live in
+              // setup scope, so once any consult's sync wait expired the flag stayed
+              // true for the rest of that instance and leaked into every later
+              // consult's delivery decision: a later consult that completed INSIDE
+              // its own wait window was injected even though its tool result already
+              // carried the advice (double delivery). Live finding 2026-09-27.
+              let waitExpired = false
               const sessionID = String(tctx?.sessionID ?? "")
               if (!sessionID) {
                 return { content: "advisor_tool_result_error: unavailable — tool context carries no sessionID" }
@@ -841,21 +869,28 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                     }
                     log("info", `background consult ${consultId} completed (${waitExpired ? "delivered via injection" : "delivered inline"})`)
                   } else {
-                    // Pre-dispatch policy rejections (cap reached, not
-                    // configured) never launched — the tool result already
-                    // carries the error synchronously, so no terminal notice
-                    // is injected and the ledger records the true reason.
-                    // Post-dispatch failures get the ceiling wording.
-                    const preDispatch = r.errorCode === "max_uses_exceeded" || r.errorCode === "not_configured"
+                    // Delivery symmetry (failure side): the executor needs the
+                    // terminal notice ONLY when it already heard RUNNING, i.e.
+                    // when the consult outlived the sync wait window. A failure
+                    // that settles INSIDE the window is already carried verbatim
+                    // by the tool result, so injecting as well double-reports
+                    // it (live finding 2026-09-27: a 29 ms `model_not_found`
+                    // launch failure produced both the tool error and an
+                    // `ADVISOR NOT RUNNING` injection for the same consult).
+                    //
+                    // Gating on `waitExpired` also subsumes the old
+                    // `preDispatch` allowlist: `max_uses_exceeded` and
+                    // `not_configured` are decided before any await, so they
+                    // can only ever settle inside the window and therefore
+                    // never inject.
                     const reason =
                       r.errorCode === "execution_time_exceeded"
                         ? `advisor_not_running — no response within ${Math.round(opts.maxConsultMs / 1000)}s`
                         : `${r.errorCode} — ${r.message}`
                     ledger.fail(consultId, reason)
-                    if (!preDispatch) {
-                      // Terminal-failure delivery symmetry: the executor
-                      // already heard RUNNING — it must also learn the
-                      // consult died.
+                    if (waitExpired) {
+                      // The executor already heard RUNNING — it must also learn
+                      // the consult died.
                       queueSystemInjection(sessionID, [
                         `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
                       ])
@@ -866,9 +901,13 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 .catch((err: unknown) => {
                   const reason = `advisor_not_running — ${redactError(err instanceof Error ? err.message : String(err))}`
                   ledger.fail(consultId, reason)
-                  queueSystemInjection(sessionID, [
-                    `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
-                  ])
+                  // Same gate as above: an unexpected throw that settles
+                  // inside the wait window is already in the tool result.
+                  if (waitExpired) {
+                    queueSystemInjection(sessionID, [
+                      `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
+                    ])
+                  }
                   log("warn", `background consult ${consultId} failed`, err)
                 })
               // Synchronous wait window: block the executor for a normal

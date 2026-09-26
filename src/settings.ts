@@ -38,7 +38,8 @@ export const CONFIG_OUTPUT_SCHEMA = {
         maxConsultMs: { type: "number" },
         adviceTokenBudget: { type: "number" },
         transcriptBudgetTokens: { type: "number" },
-        maxToolOutputChars: { type: "number" },
+        maxToolOutputTokens: { type: "number" },
+        pruning: { type: "string", enum: ["standard", "none"] },
         triggers: { type: "array", items: { type: "string" } },
         logLevel: { type: "string" },
       },
@@ -55,7 +56,8 @@ export const CONFIG_OUTPUT_SCHEMA = {
         "maxConsultMs",
         "adviceTokenBudget",
         "transcriptBudgetTokens",
-        "maxToolOutputChars",
+        "maxToolOutputTokens",
+        "pruning",
         "triggers",
         "logLevel",
       ],
@@ -106,7 +108,8 @@ export interface AdvisorSettingsView {
     maxConsultMs: number
     adviceTokenBudget: number
     transcriptBudgetTokens: number
-    maxToolOutputChars: number
+    maxToolOutputTokens: number
+    pruning: "standard" | "none"
     triggers: string[]
     logLevel: string
   }
@@ -372,7 +375,10 @@ export interface LimitsDisplay {
   contextTokens: number
   /** OUTPUT budget for the advisor's reply, in tokens. */
   adviceTokens: number
+  /** Per-tool-output ceiling, in tokens (native unit). */
   toolCap: number
+  /** Pruning policy: "standard" (window+truncate) or "none" (verbatim). */
+  pruning: "standard" | "none"
   attempts: number
   logLevel: string
   inherit: Record<string, boolean>
@@ -391,9 +397,10 @@ export function currentLimits(view: AdvisorSettingsView, draft: SettingsDraft): 
     consults: pick("maxUsesPerTask", 3) as number,
     responseWaitMs: pick("advisorResponseWaitMs", 90_000) as number,
     ceilingMs: pick("maxConsultMs", 3_600_000) as number,
-    contextTokens: pick("transcriptBudgetTokens", 16_000) as number,
-    adviceTokens: pick("adviceTokenBudget", 8_000) as number,
-    toolCap: pick("maxToolOutputChars", 1_500) as number,
+    contextTokens: pick("transcriptBudgetTokens", 32_000) as number,
+    adviceTokens: pick("adviceTokenBudget", 16_000) as number,
+    toolCap: pick("maxToolOutputTokens", 750) as number,
+    pruning: (pick("pruning", "standard") === "none" ? "none" : "standard") as "standard" | "none",
     attempts: pick("maxAttempts", 11) as number,
     logLevel: pick("logLevel", "info") as string,
     inherit,
@@ -450,8 +457,8 @@ export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): Menu
     {
       category: "Advanced",
       value: "toolcap",
-      title: `Per-tool output cap — ${formatSize(limits.toolCap)} chars`,
-      description: "Maximum characters kept from a single tool output",
+      title: `Per-tool output cap — ${formatSize(limits.toolCap)} tokens`,
+      description: "Maximum tokens kept from a single tool output",
     },
     {
       category: "Advanced",
@@ -592,12 +599,12 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
           title: "Context budget",
           description: "INPUT tokens of pruned conversation sent to the advisor",
           current: currentLimits(view, draft).contextTokens,
-          choices: [8_000, 16_000, 32_000, 64_000, 128_000, 500_000, 1_000_000],
+          choices: [16_000, 32_000, 64_000, 128_000, 256_000, 1_000_000, 4_000_000],
           format: formatSize,
           parse: parseHumanSize,
-          min: 2_000,
-          max: 1_000_000,
-          rangeHint: "2K–1M tokens, e.g. 128k",
+          min: 64,
+          max: 32_000_000,
+          rangeHint: "64–32M tokens, e.g. 128k",
         })
         break
       case "advice":
@@ -605,25 +612,25 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
           title: "Advice length",
           description: "OUTPUT token budget for the advisor's reply",
           current: currentLimits(view, draft).adviceTokens,
-          choices: [4_000, 8_000, 16_000, 32_000],
+          choices: [8_000, 16_000, 32_000, 64_000, 128_000, 256_000],
           format: formatSize,
           parse: parseHumanSize,
-          min: 500,
-          max: 64_000,
-          rangeHint: "500–64000 tokens (model caps are typically 8K–65K)",
+          min: 16,
+          max: 1_000_000,
+          rangeHint: "16–1M tokens (the model's own output limit is the real ceiling)",
         })
         break
       case "toolcap":
         next = await pickNumber(ports, {
           title: "Per-tool output cap",
-          description: "Maximum characters kept from a single tool output",
+          description: "Maximum tokens kept from a single tool output",
           current: currentLimits(view, draft).toolCap,
-          choices: [500, 1_000, 1_500, 3_000, 8_000],
+          choices: [250, 750, 2_000, 8_000, 32_000, 128_000],
           format: formatSize,
           parse: parseHumanSize,
-          min: 100,
-          max: 200_000,
-          rangeHint: "100–200000 chars",
+          min: 4,
+          max: 4_000_000,
+          rangeHint: "4–4,000,000 tokens",
         })
         break
       case "retries":
@@ -670,7 +677,7 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
                 : choice === "advice"
                   ? "adviceTokenBudget"
                   : choice === "toolcap"
-                    ? "maxToolOutputChars"
+                    ? "maxToolOutputTokens"
                     : "maxAttempts"
       draft[key] = next
     }

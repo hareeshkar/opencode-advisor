@@ -83,10 +83,12 @@ One word expands to consults/task, context tokens, and advice tokens:
 
 | Preset | Consults/task | Context tokens (input) | Advice tokens (output) |
 |---|---|---|---|
-| Economy | 1 | 8K | 4K |
-| Balanced *(recommended, default)* | 3 | 16K | 8K |
-| Thorough | 5 | 32K | 16K |
-| Exhaustive | 8 | 64K | 32K |
+| Economy | 1 | 16K | 8K |
+| Balanced *(recommended, default)* | 3 | 32K | 16K |
+| Thorough | 5 | 64K | 32K |
+| Exhaustive | 8 | 128K | 64K |
+
+Advice is the cheapest part of a consult, so the defaults are deliberately generous: these are real-workload numbers, not safety minima.
 
 Patience is *uniform across presets*: every preset waits 90 seconds for a synchronous answer and allows a 1-hour consult ceiling — presets scale *budget*, never *patience*.
 
@@ -105,10 +107,21 @@ The advice frame states its evidence basis, so you always know what was verified
 - **Consult ceiling** (`maxConsultMs`, default 1h) — maximum advisor lifetime; expiry fails the consult without consuming the consult cap.
 - **Consults/task** (`maxUsesPerTask`, default 3) — successful consults per user task.
 - **Retry ceiling** (`maxAttempts`, default 3× consults + 2) — *transport attempts, never extra paid consults*.
-- **Context tokens** (`transcriptBudgetTokens`, default 16K) and **advice tokens** (`adviceTokenBudget`, default 8K) — overridden by presets; configurable directly.
-- **Per-tool output cap** (`maxToolOutputChars`, default 1500) and **log level**.
+- **Context tokens** (`transcriptBudgetTokens`, default 32K) and **advice tokens** (`adviceTokenBudget`, default 16K) — overridden by presets; configurable directly.
+- **Per-tool output cap** (`maxToolOutputTokens`, default 750) — the ceiling on one tool output, in tokens.
+- **Pruning** (`pruning`, default `standard`) — see below.
+- **Log level**.
 
-Trade-off worth knowing: advice re-enters the executor's context and is re-paid on subsequent turns until compaction, so Exhaustive advice can add ~32K tokens to that task. Raise it knowingly.
+Trade-off worth knowing: advice re-enters the executor's context and is re-paid on subsequent turns until compaction, so Exhaustive advice can add ~64K tokens to that task. Raise it knowingly.
+
+### Pruning — `standard` or `none`
+
+Every budget is denominated in **tokens**, because that is the unit providers are billed in. The pruner measures exactly in characters internally and converts once, at a single documented constant (4 chars/token).
+
+- **`standard`** *(default)* — the transcript is recency-windowed to `transcriptBudgetTokens` and each tool output is truncated to `maxToolOutputTokens`. Cheap, and for most tasks the window keeps everything that matters.
+- **`none`** — **no windowing and no truncation.** The advisor receives the task whole, bounded only by its own context window. Use it for maximum-fidelity reviews on an already-curated transcript: a full-file audit, a long trace, a security review where a missing hunk changes the conclusion.
+
+`none` is verbatim about *size* and still strict about *safety*. Injection defences always run: forged `[system]`/`[user]`/`[assistant]` labels in tool output are quoted so they cannot impersonate a turn, bidi and zero-width controls are stripped, and a true opaque paste (a base64 dump on one unbroken line) is still dropped. Dropping is only ever applied to provably worthless content — a real file, however large, is never silently deleted.
 
 ---
 
@@ -135,18 +148,21 @@ The `/advisor-settings` menu reads the file when it opens and writes it atomical
 | `advisor` | model ref | none | `{ providerID, id, variant? }` | The model that advises. Unset ⇒ unconfigured, zero spend |
 | `preset` | enum | balanced *(implied)* | economy / balanced / thorough / exhaustive | How much the advisor may use |
 | `advisorMode` | enum | review | review, agent (`review-agent` accepted) | Review = advice from the pruned conversation; agent = Review + Agent, read-only file verification |
-| `maxUsesPerTask` | number | preset (3) | 1–50 | Successful consults per user task; a safety cap |
-| `maxAttempts` | number | 3 × consults + 2 (11) | 1–100 | Transport attempts per task — never extra paid consults |
-| `advisorResponseWaitMs` | ms (number) | `90000` | 100–600,000 | How long the tool call waits for advice before continuing in the background (the advisor keeps running). `timeoutMs` accepted as a deprecated alias |
-| `maxConsultMs` | ms (number or size) | `3600000` | 1,000–86,400,000 | Maximum advisor lifetime; expiry fails the consult without consuming the cap |
-| `adviceTokenBudget` | tokens (number) | preset (8,000) | 500–64,000 | Advisor **output** tokens — the reply length cap |
-| `transcriptBudgetTokens` | tokens (number or size) | preset (16,000) | 2,000–1,000,000 | **Input** context tokens sent to the advisor (≈4 chars/token for the pruner) |
-| `maxToolOutputChars` | chars (number or size) | `1500` | 100–200,000 | Characters kept from a single tool output |
+| `maxUsesPerTask` | number | preset (3) | 1–1,000 | Successful consults per user task; a safety cap |
+| `maxAttempts` | number | 3 × consults + 2 (11) | 1–10,000 | Transport attempts per task — never extra paid consults |
+| `advisorResponseWaitMs` | ms (number) | `90000` | 1–3,600,000 | How long the tool call waits for advice before continuing in the background (the advisor keeps running). `timeoutMs` accepted as a deprecated alias |
+| `maxConsultMs` | ms (number or size) | `3600000` | 1,000–604,800,000 | Maximum advisor lifetime; expiry fails the consult without consuming the cap |
+| `adviceTokenBudget` | tokens (number) | preset (16,000) | 16–1,000,000 | Advisor **output** tokens — the reply length cap |
+| `transcriptBudgetTokens` | tokens (number or size) | preset (32,000) | 64–32,000,000 | **Input** context tokens sent to the advisor (×4 chars for the pruner) |
+| `maxToolOutputTokens` | tokens (number or size) | `750` | 4–4,000,000 | Tokens kept from a single tool output. `maxToolOutputChars` still accepted and divided by 4, with a deprecation warning |
+| `pruning` | enum | `standard` | standard / none | `none` disables windowing and truncation — see [Pruning](#pruning--standard-or-none) |
 | `triggers` | string list | advice, advisor, get consultation | non-empty strings; `[]` disables | Words that route a consult request; a mere mention never spends |
 | `logLevel` | enum | info | debug / info / warn / error | Plugin diagnostics verbosity |
 | `source` | object | none | V1 only: kind, baseURL, apiKeyEnv, model, optional extraHeaders | Direct provider endpoint for the V1 adapter |
 
-Notes: the files are **strict JSON** — no comments, no trailing commas (`opencode.json` is JSONC and allows both). `transcriptBudgetTokens` and `maxToolOutputChars` accept a number or a 1000-based size string (`"32k"`, `"1.5m"`). If the context budget is smaller than the per-tool cap, it is raised to match, with a warning. The response wait is clamped to the consult ceiling.
+Notes: the files are **strict JSON** — no comments, no trailing commas (`opencode.json` is JSONC and allows both). The token budgets accept a number or a 1000-based size string (`"32k"`, `"1.5m"`). If the context budget is smaller than the per-tool cap, it is raised to match, with a warning. The consult ceiling is raised to cover the response wait.
+
+**On the ranges:** they are typo-detectors, not budgets. Each one spans every plausible real workload and fails only on a value that is certainly a mistake — a chars-for-tokens slip, a stray zero, a paste of the wrong field. The model's own context window is the real ceiling on context, and its own output limit is the real ceiling on advice. Nothing here silently trims a number you chose.
 
 Env vars: `ADVISOR_PROVIDER`, `ADVISOR_MODEL`, `ADVISOR_VARIANT`, `ADVISOR_MAX_USES`, `ADVISOR_LOG`, `ADVISOR_MODE`, `ADVISOR_SOURCE_KIND/URL/KEY_ENV/MODEL`.
 
@@ -260,7 +276,7 @@ npm test            # node --test — the full suite
 npm run build       # esbuild → dist/opencode-advisor.js + dist/tui.js
 ```
 
-Zero runtime dependencies; the bundles are the installable artifacts. Design notes and prior art live in [`research/`](research/).
+Zero runtime dependencies; the bundles are the installable artifacts. Current version: **1.0.0**. Design notes and prior art live in [`research/`](research/).
 
 ## License
 

@@ -1,0 +1,82 @@
+{
+  "A2R_before": {
+    "adviceChars": 307991,
+    "calls": 64,
+    "date": "2026-09-26",
+    "errors": 7,
+    "estTokensIn": 1215282,
+    "estTokensOut": 77021
+  },
+  "C_before": {
+    "adviceChars": 301753,
+    "calls": 63,
+    "date": "2026-09-26",
+    "errors": 7,
+    "estTokensIn": 1200455,
+    "estTokensOut": 75461
+  },
+  "D7_before": {
+    "adviceChars": 319031,
+    "calls": 66,
+    "date": "2026-09-26",
+    "errors": 7,
+    "estTokensIn": 1258373,
+    "estTokensOut": 79782
+  },
+  "D_before": {
+    "adviceChars": 307991,
+    "calls": 64,
+    "date": "2026-09-26",
+    "errors": 7,
+    "estTokensIn": 1215282,
+    "estTokensOut": 77021
+  },
+  "E2_before": {
+    "adviceChars": 319031,
+    "calls": 66,
+    "date": "2026-09-26",
+    "errors": 9,
+    "estTokensIn": 1305244,
+    "estTokensOut": 79782
+  },
+  "E_before": {
+    "adviceChars": 319031,
+    "calls": 66,
+    "date": "2026-09-26",
+    "errors": 8,
+    "estTokensIn": 1288735,
+    "estTokensOut": 79782
+  },
+  "F8_before": {
+    "adviceChars": 348375,
+    "calls": 70,
+    "date": "2026-09-26",
+    "errors": 9,
+    "estTokensIn": 1435374,
+    "estTokensOut": 87120
+  },
+  "F_before": {
+    "adviceChars": 326054,
+    "calls": 67,
+    "date": "2026-09-26",
+    "errors": 9,
+    "estTokensIn": 1337047,
+    "estTokensOut": 81538
+  },
+  "H_before": {
+    "adviceChars": 368605,
+    "calls": 73,
+    "date": "2026-09-26",
+    "errors": 9,
+    "estTokensIn": 1533728,
+    "estTokensOut": 92178
+  },
+  "RUN_BASE": {
+    "adviceChars": 301753,
+    "calls": 63,
+    "date": "2026-09-26",
+    "errors": 7,
+    "estTokensIn": 1200455,
+    "estTokensOut": 75461
+  }
+}

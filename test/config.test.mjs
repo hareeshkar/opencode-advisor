@@ -75,7 +75,7 @@ test("precedence: deployment < global < project root < project .opencode", async
 
       const effective = resolveOptions(snap.merged)
       assert.equal(effective.maxUsesPerTask, 9, "explicit project key beats the preset quantity")
-      assert.equal(effective.prune.transcriptBudgetChars, 128_000, "thorough (32k tokens) expands to 128k pruner chars")
+      assert.equal(effective.prune.transcriptBudgetChars, 256_000, "thorough (64k tokens) expands to 256k pruner chars")
       assert.equal(effective.adviceTokenBudget, 5_000, "explicit deployment key beats the preset value")
     })
   } finally {

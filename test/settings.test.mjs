@@ -33,9 +33,10 @@ function makeView(overrides = {}) {
       maxAttempts: 11,
       advisorResponseWaitMs: 90_000,
       maxConsultMs: 3_600_000,
-      adviceTokenBudget: 8_000,
-      transcriptBudgetTokens: 16_000,
-      maxToolOutputChars: 1_500,
+      adviceTokenBudget: 16_000,
+      transcriptBudgetTokens: 32_000,
+      maxToolOutputTokens: 750,
+      pruning: "standard",
       triggers: ["advice"],
       logLevel: "info",
       ...(overrides.config ?? {}),
@@ -106,10 +107,10 @@ function scripted(options = {}) {
 
 test("preset table is exactly the documented quantities (single source: PRESETS)", () => {
   const expected = {
-    economy: "1 consult/task · 8K context tokens · 4K advice tokens",
-    balanced: "3 consults/task · 16K context tokens · 8K advice tokens",
-    thorough: "5 consults/task · 32K context tokens · 16K advice tokens",
-    exhaustive: "8 consults/task · 64K context tokens · 32K advice tokens",
+    economy: "1 consult/task · 16K context tokens · 8K advice tokens",
+    balanced: "3 consults/task · 32K context tokens · 16K advice tokens",
+    thorough: "5 consults/task · 64K context tokens · 32K advice tokens",
+    exhaustive: "8 consults/task · 128K context tokens · 64K advice tokens",
   }
   for (const [name, blurb] of Object.entries(expected)) assert.equal(presetBlurb(name), blurb, name)
   assert.equal(presetTitle("balanced"), "Balanced (recommended)")
@@ -134,7 +135,7 @@ test("formatting: sizes, durations, human input", () => {
 test("display state and menu rows reflect the effective view + draft", () => {
   // The server returns PRESET-RESOLVED values: thorough ⇒ 5 / 32K / 16K.
   const view = makeView({
-    config: { preset: "thorough", maxUsesPerTask: 5, transcriptBudgetTokens: 32_000, adviceTokenBudget: 16_000 },
+    config: { preset: "thorough", maxUsesPerTask: 5, transcriptBudgetTokens: 64_000, adviceTokenBudget: 32_000 },
   })
   const model = currentModel(view, {})
   assert.equal(model.label, "glm-5.3 · high")
@@ -148,7 +149,7 @@ test("display state and menu rows reflect the effective view + draft", () => {
   assert.ok(rows.find((r) => r.value === "preset").title.includes("Thorough"))
   assert.ok(rows.find((r) => r.value === "limits").title.includes("5 consults/task"))
   assert.ok(
-    rows.find((r) => r.value === "limits").description.includes("32K context tokens · 16K advice tokens"),
+    rows.find((r) => r.value === "limits").description.includes("64K context tokens · 32K advice tokens"),
     "limits row speaks tokens",
   )
 
@@ -161,20 +162,26 @@ test("display state and menu rows reflect the effective view + draft", () => {
   assert.equal(tierLabel(undefined), "default")
 
   assert.equal(currentLimits(view, {}).consults, 5, "limits follow the preset-resolved effective view")
-  assert.equal(currentLimits(view, {}).contextTokens, 32_000)
-  assert.equal(currentLimits(view, {}).adviceTokens, 16_000)
+  assert.equal(currentLimits(view, {}).contextTokens, 64_000)
+  assert.equal(currentLimits(view, {}).adviceTokens, 32_000)
+  assert.equal(currentLimits(view, {}).toolCap, 750, "per-tool cap is a token budget")
+  assert.equal(currentLimits(view, {}).pruning, "standard")
   assert.equal(currentMode(view, {}).mode, "review")
   assert.equal(limitRows(view, {}).length, 9, "9 rows: consults, wait, ceiling, context, advice, toolcap, retries, loglevel, back")
   assert.ok(limitRows(view, {}).some((r) => r.value === "wait" && r.title.includes("Response wait — 90s")))
   assert.ok(limitRows(view, {}).some((r) => r.value === "ceiling" && r.title.includes("Consult ceiling — 1h")))
-  assert.ok(limitRows(view, {}).some((r) => r.value === "advice" && r.title.includes("16K tokens")))
+  assert.ok(limitRows(view, {}).some((r) => r.value === "advice" && r.title.includes("32K tokens")))
+  assert.ok(
+    limitRows(view, {}).some((r) => r.value === "toolcap" && r.title.includes("750 tokens")),
+    "per-tool cap speaks tokens, not characters",
+  )
   assert.ok(summaryMessage(makeView()).includes("Applies immediately"))
 })
 
 test("preset display: matching values report the preset; deviations compute Custom", () => {
   // (c) file-attributed values matching a preset exactly → that preset
   const explicit = makeView({
-    config: { preset: "", maxUsesPerTask: 5, transcriptBudgetTokens: 32_000, adviceTokenBudget: 16_000 },
+    config: { preset: "", maxUsesPerTask: 5, transcriptBudgetTokens: 64_000, adviceTokenBudget: 32_000 },
     tiers: { maxUsesPerTask: "project", transcriptBudgetTokens: "project", adviceTokenBudget: "project" },
   })
   const matched = currentPreset(explicit, {})
@@ -266,14 +273,14 @@ test("flow: context and advice pickers offer the token presets through the draft
   const contextPicker = calls.selects.find((s) => s.title === "Context budget")
   assert.deepEqual(
     contextPicker.options.filter((o) => /^\d+$/.test(o.value)).map((o) => Number(o.value)),
-    [8_000, 16_000, 32_000, 64_000, 128_000, 500_000, 1_000_000],
-    "context choices run up to 1M tokens",
+    [16_000, 32_000, 64_000, 128_000, 256_000, 1_000_000, 4_000_000],
+    "context choices run up to 4M tokens",
   )
   const advicePicker = calls.selects.find((s) => s.title === "Advice length")
   assert.deepEqual(
     advicePicker.options.filter((o) => /^\d+$/.test(o.value)).map((o) => Number(o.value)),
-    [4_000, 8_000, 16_000, 32_000],
-    "advice choices are output-token presets",
+    [8_000, 16_000, 32_000, 64_000, 128_000, 256_000],
+    "advice choices are generous output-token presets",
   )
 })
 

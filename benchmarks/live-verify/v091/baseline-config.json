@@ -1,0 +1,8 @@
+{
+  "advisor": {
+    "providerID": "zai-coding-plan",
+    "id": "glm-5.3"
+  },
+  "transcriptBudgetTokens": 32000,
+  "maxToolOutputChars": 3000
+}

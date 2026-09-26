@@ -270,11 +270,11 @@ A fresh install ships with **no advisor model** — zero spend — and registers
 ```sh
 npm install
 npm run typecheck   # tsc --noEmit (strict)
-npm test            # node --test — 159 tests green
+npm test            # node --test — 161 tests green
 npm run build       # esbuild → dist/opencode-advisor.js + dist/tui.js
 ```
 
-Current version: **0.8.0**. Zero runtime dependencies; the bundles are the installable artifacts. Design notes and prior art live in [`research/`](research/).
+Current version: **0.8.1**. Zero runtime dependencies; the bundles are the installable artifacts. Design notes and prior art live in [`research/`](research/).
 
 ## License
 

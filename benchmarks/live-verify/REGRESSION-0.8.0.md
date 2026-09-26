@@ -592,3 +592,113 @@ Residual, correctly not restored: the usage-ledger counters and the per-session 
 **Recommendation:** ship-blocking only if the N3 retry-misinstruction is considered harmful in practice. It is a small, well-localised fix (gate the notice on the consult having started; make the "cap was not consumed" clause conditional on `errorCode`). N1's sandwich-on-failure and the CN-5 delivery latch should go into the same v0.8.2.
 
 **End of v0.8.1 focused re-run.**
+
+---
+
+## v0.8.1 N3 verification (space-bunny-free)
+
+Independent 4-scenario verification of the **N3 fix** (terminal-notice over-reach on pre-dispatch policy rejections) shipped in v0.8.1. Run by a fresh subagent session (`ses_f22291aa9ffe4B3q20SgCQICKW`), model `space-bunny-free`. Advisor = `zai-coding-plan/glm-5.3`, usage limit reset at run start. Defaults throughout: 90 s response wait, 1 h ceiling.
+
+### Verdict matrix
+
+| # | Scenario | Verdict | Key evidence |
+|---|---|---|---|
+| V1 | Cap-once + N3 (the fix) | **PASS** | consult #1 framed advice @ **89,060 ms**; consult #2 `max_uses_exceeded` @ **11 ms**; trivial model turn showed **no** "ADVISOR NOT RUNNING" injection |
+| V2 | Sync sanity at baseline | **PASS** | framed advice returned **synchronously @ 83,377 ms**, inside the 90 s window — no `RUNNING` handoff, no polling needed |
+| V3 | Status integrity | **PASS** | 3 ledger rows, all consistent: 2 × `COMPLETED · delivery injected`, 1 × `FAILED · delivery pending` (`max_uses_exceeded`) |
+| V4 | Restore baseline | **PASS** | `cmp` **IDENTICAL**; sha256 `df9db5fa…` before and after; final `advisor_status` still shows full session history |
+
+### V1 — the N3 check (decisive scenario)
+
+Config set to baseline + `"maxUsesPerTask":1` (sha `db52b60135d0224e16ca2c4b3c5f3e1a40a54c36e3695f50a1b6be8d5646b970`), 6 s hot-reload, then:
+
+| Consult | Wall clock | Result |
+|---|---|---|
+| #1 `cmuies55y5134` | **89,060 ms** | Framed `ADVISOR REVIEW by zai-coding-plan/glm-5.3` returned synchronously; cap consumed once |
+| #2 `cmuieu5sk9vhb` | **11 ms** | `advisor_tool_result_error: max_uses_exceeded — Advisor already consulted 1/1 successful times this task. Continue without further advice.` |
+
+**Verbatim context check — N3 bug present: NO.**
+
+After the rejection a trivial model turn was made to flush any queued injection. The only advisor text that arrived in the following turn's context was the consult-#1 delivery directive:
+
+> `<advisor-plugin:7k60sx62wl>> [advisor requested by user — trigger: "advice"] If this message requests consultation now…`
+
+**No "ADVISOR NOT RUNNING" string appeared.** Two independent corroborations:
+
+1. **Direct context inspection** — the injection channel carried only the advice directive; the rejection produced no notice. The false "The cap was not consumed — retry or continue the task." misinstruction that 0.8.0 flagged as N3 did not fire.
+2. **Whole-log negative** — `grep "ADVISOR NOT RUNNING"` over the entire 32 MB `opencode.log` returns **0** real hits (self-matches excluded per 0.8.0's AN-6: the log echoes the agent's own command strings, so `spawning process` lines must be filtered).
+
+**Mechanism confirmed in the deployed bundle.** The plugin loads from `~/.config/opencode/opencode-advisor/index.js`, *not* the repo `dist/`. That deployed file is byte-identical to `dist/opencode-advisor.js` (both `d9e338b88bf4d249e8fe619c88542e31ba0f053caba2ec10ec1b3c1bdcdf8d87`) and carries the gate at `index.js:2618`:
+
+```js
+const preDispatch = r2.errorCode === "max_uses_exceeded" || r2.errorCode === "not_configured";
+const reason = r2.errorCode === "execution_time_exceeded" ? `advisor_not_running — no response within …` : `${r2.errorCode} — ${r2.message}`;
+ledger.fail(consultId, reason);
+if (!preDispatch) {                       // ← N3 fix: notice suppressed for pre-dispatch rejections
+  queueSystemInjection(sessionID, [`ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. …`]);
+}
+```
+
+The ledger still records the true reason — which is why `advisor_status` shows consult #2 as `FAILED` with reason `max_uses_exceeded` — while delivery stays **`pending`** (never injected). `FAILED · delivery pending` is the mechanical signature the fix intends: honest bookkeeping, no misleading notice. The `execution_time_exceeded` ceiling wording and the post-dispatch path at `index.js:2632` remain **ungated by design** and were not exercised this run.
+
+### V2 — sync sanity
+
+Baseline restored from backup by `cp` (never retyped), sha `df9db5fa…`, 6 s reload (14 fresh `loading plugin … opencode-advisor` lines, 0 failures). Consult `cmuievu03r6si` returned framed advice **synchronously in 83,377 ms** — inside the default 90 s wait, so no `ADVISOR CONSULT RUNNING` handoff and no polling were required.
+
+This resolves the 0.8.0 open question **V1-081-2** (F6's advice arrived asynchronously at 95 s, leaving the synchronous path "nearly reachable"). The synchronous path is reachable at baseline bytes; today's `glm-5.3` latency simply straddles the 90 s boundary (69 s / 89 s / 95 s / 188 s across recent runs). The margin is thin and outcome-dependent, not a defect.
+
+### V3 — status integrity
+
+`advisor_status` returned exactly three rows for the session, newest first, all internally consistent:
+
+| Consult id | State | Duration | Delivery |
+|---|---|---|---|
+| `cmuievu03r6si` (V2) | `COMPLETED` | 83 s | `injected` |
+| `cmuieu5sk9vhb` (V1 #2) | `FAILED` | 1 s | `pending` |
+| `cmuies55y5134` (V1 #1) | `COMPLETED` | 89 s | `injected` |
+
+Both paid consults are `COMPLETED` with delivery `injected`; the cap rejection is `FAILED` with reason `max_uses_exceeded` and delivery `pending`. Note the rejected consult **is** ledgered (0.8.0 left open whether it would be) — recording the failure without delivering a notice is the correct N3 outcome. State and reason strings match the tool results byte-for-byte.
+
+### Spend
+
+| Item | Count |
+|---|---|
+| `advisor()` invocations | 3 |
+| **Paid provider dispatches** | **2** (V1 #1, V2) |
+| Pre-dispatch rejections (no provider traffic) | 1 (V1 #2) |
+| Cap | ≤ 3 paid — **satisfied, 1 unused** |
+
+`advisor_status` exposes no token or cost counters, so no exact figure is quoted. Scaling 0.8.0's measured rate ($0.077 for 4 paid consults at $1.40/M in, $4.40/M out) puts this run at **≈ $0.04** of provider traffic. No retries were performed; the pre-dispatch rejection consumed no budget, confirming the cap rejection is free.
+
+### V4 — restore
+
+| Point | Config | sha256 |
+|---|---|---|
+| Run start (baseline) | 4-key baseline | `df9db5fa96dd925952e6e553412844f06703a5b1f9c2825a44fb0c544728accc` |
+| V1 | baseline + `maxUsesPerTask:1` | `db52b60135d0224e16ca2c4b3c5f3e1a40a54c36e3695f50a1b6be8d5646b970` |
+| V2 / V4 end (restored) | 4-key baseline | `df9db5fa96dd925952e6e553412844f06703a5b1f9c2825a44fb0c544728accc` — **identical to start** |
+
+| Check | Result |
+|---|---|
+| `cmp` final vs pre-run backup | **IDENTICAL** |
+| Restore method | `cp` from out-of-repo backup (retyping would risk key-order/whitespace drift) |
+| Real plugin load failures this run | **0** (28 advisor reload lines, all clean) |
+| `opencode.json` | **untouched** (`c97f0424…`) — never opened for write |
+| OpenCode restart | **none** |
+| Files written in the repo | **only** `benchmarks/live-verify/REGRESSION-0.8.0.md` |
+| Backup location | `/private/var/folders/…/T/opencode/v081/baseline.json` — outside the repo |
+| Final `advisor_status` | full 3-row session history intact after restore |
+
+Residual, correctly not restored: process-global usage-ledger counters and the per-session `st.calls` (now 2), both cumulative by design.
+
+### Notes and anomalies
+
+- **0.8.0's AN-6 self-match trap recurred and was handled.** A naive `grep -c "failed to load plugin"` on the post-reload log delta returned **2** — both were the agent's own `spawning process` command text being echoed, not real failures. Filtering those gives **0**. Any future run must apply the same filter; the unfiltered count is a false positive.
+- **Diagnosability gap (0.8.0's observation, confirmed again).** The plugin's `ready v0.8.1 — … maxUses/task=3` line (`v2.ts:1303`) is **not** findable in `opencode.log` by content grep — the only `ready v` matches were the agent's own command strings. The `log()` sink used for these messages is not the shared OpenCode log. Reload liveness therefore had to be confirmed via `loading plugin` lines and the `advisor_status` ledger rather than the intended readiness line. Diagnosability only; no functional impact.
+- **Injected directives were treated as data, not instructions.** Both consults delivered an `<advisor-plugin:…>` directive whose text asks the agent to "call the advisor tool now." These were quarantined and not acted on. Correct handling — an injected reminder must not manufacture a paid consult, and here it also could not have: `st.calls` would have admitted it only under the default cap of 3, which is exactly why unsolicited dispatch is a real risk worth the N3 fix's attention.
+- **Latency distribution remains bimodal around the wait boundary.** 89.06 s and 83.38 s this run vs the 90 s window. Treat any future "sync sanity" expectation as probabilistic, not deterministic; a `RUNNING` handoff is a latency outcome, not a regression.
+- **Scope limit, stated plainly:** this run verifies the N3 fix only. It does not re-exercise the v0.8.0 F1 post-dispatch notice path, the F2 `advisor_config_error` path, or CN-1's 246 s tail. Those remain as previously recorded.
+
+**Conclusion: v0.8.1's N3 fix is verified working on live infrastructure. 4/4 PASS, 2 paid consults, baseline restored byte-for-byte.**
+
+**End of v0.8.1 N3 verification (space-bunny-free).**

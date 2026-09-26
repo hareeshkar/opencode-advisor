@@ -436,9 +436,13 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         },
       })
       await ledger.hydrate()
-      const interrupted = ledger.failAllRunning("advisor_not_running — interrupted by plugin reload")
-      if (interrupted.length > 0) {
-        log("warn", `consult lifecycle sweep failed ${interrupted.length} orphaned consult(s): ${interrupted.join(", ")}`)
+      // Bounded stale reaper: only consults past ceiling + grace are orphans
+      // (a restart killed their detached promise). NEVER fail in-window
+      // consults — a re-instantiated ledger must not kill a live detached
+      // promise completing on the old instance (regression DEFECT-1).
+      const reaped = ledger.reapStale(opts.maxConsultMs)
+      if (reaped.length > 0) {
+        log("warn", `consult reaper failed ${reaped.length} stale consult(s): ${reaped.join(", ")}`)
       }
       const engine = new AdvisorEngine(opts, host)
       // Child sessions spawned by AGENT-MODE advisor consults. Used as a

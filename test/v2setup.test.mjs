@@ -771,12 +771,13 @@ test("durable consult ledger: records survive reloads, orphans fail at setup swe
   const { ctx, captured } = makeCtx()
   // A previous instance saved a RUNNING consult record, then the plugin
   // reloaded (hot-reload mid-consult, live scenario D4).
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
   const record = {
     id: "c-prev",
     sessionID: "s-prev",
     mode: "review",
     model: "p/a",
-    startedAt: Date.now() - 60_000,
+    startedAt: Date.now() - 120_000,
     state: "running",
     delivery: "pending",
   }
@@ -785,7 +786,7 @@ test("durable consult ledger: records survive reloads, orphans fail at setup swe
   const statusTool = captured.tools.find((t) => t.name === "advisor_status")
   const status = await statusTool.execute({}, { sessionID: "s-prev", signal: new AbortController().signal })
   assert.ok(status.content.includes("FAILED"), "orphaned running entry failed by the sweep")
-  assert.ok(status.content.includes("interrupted by plugin reload"), "interruption reason recorded")
+  assert.ok(status.content.includes("orphaned by restart"), "interruption reason recorded (bounded reaper)")
   const ledgerNow = captured.storage.get("consult:ledger")
   assert.ok(ledgerNow.some((r) => r.id === "c-prev" && r.state === "failed"), "ledger persisted the sweep")
 })

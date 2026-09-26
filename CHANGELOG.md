@@ -18,6 +18,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
 ### Fixed
 - Empty provider completions (the A3-class transient) now retry the same
   transport once before any fallback, on both the direct and sandwich paths.
+- Bounded stale reaper: consults orphaned past ceiling + grace (a process
+  restart killed their detached promise) are failed exactly once; in-window
+  consults are never touched — fixes the setup-sweep race (DEFECT-1) where
+  re-instantiation bursts could permanently falsify a delivered consult.
 
 ## [0.8.2] — 2026-09-26
 

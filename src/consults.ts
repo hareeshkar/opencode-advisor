@@ -172,19 +172,24 @@ export class ConsultLedger {
   }
 
   /**
-   * Setup-time lifecycle sweep: EVERY running/starting entry is stale by
-   * definition (this process owns no detached promises from a previous
-   * instance). Failing them all unconditionally prevents hot-reload orphans
-   * from permanently occupying concurrency slots. Idempotent.
+   * Reap consults still RUNNING past the lifetime ceiling plus a grace
+   * window. Two honest cases: (a) a process restart orphaned the consult
+   * (its detached promise died with the old engine), or (b) the consult is
+   * genuinely overdue (the engine ceiling timer already failed it in-instance
+   * — such entries are `failed` and skipped here). NEVER fail entries inside
+   * the window: an in-flight consult owns its slot until it settles, and a
+   * re-instantiated ledger must not kill a live detached promise. Idempotent.
    */
-  failAllRunning(reason: string): string[] {
+  reapStale(ceilingMs: number, graceMs = 30_000): string[] {
+    const threshold = this.clock.now() - (ceilingMs + graceMs)
     const reaped: string[] = []
     for (const r of this.entries.values()) {
-      if (r.state === "starting" || r.state === "running") {
-        this.fail(r.id, reason)
+      if ((r.state === "starting" || r.state === "running") && r.startedAt < threshold) {
+        this.fail(r.id, `advisor_not_running — no response within ${Math.round(ceilingMs / 1000)}s (orphaned by restart)`)
         reaped.push(r.id)
       }
     }
+    this.persist()
     return reaped
   }
 

@@ -36,15 +36,18 @@ test("consult ledger: fail is idempotent — reload mid-consult cannot double-fa
   assert.equal(r?.error, "advisor_not_running — interrupted by plugin reload")
 })
 
-test("lifecycle sweep: setup fails ALL running entries (hot-reload orphans cannot occupy slots)", () => {
-  const ledger = new ConsultLedger(fakeClock())
-  ledger.start({ id: "c1", ...REC })
-  ledger.start({ id: "c2", ...REC })
-  const reaped = ledger.failAllRunning("advisor_not_running — interrupted by plugin reload")
-  assert.deepEqual(reaped.sort(), ["c1", "c2"])
-  assert.equal(ledger.runningCount(), 0, "no orphan occupies a concurrency slot")
-  // Idempotent second sweep.
-  assert.deepEqual(ledger.failAllRunning("again"), [])
+test("reaper: consults past ceiling + grace are orphans — in-window consults untouched", () => {
+  const clock = fakeClock()
+  const ledger = new ConsultLedger(clock)
+  // An orphan from a process restart: started 2h ago, ceiling 1h.
+  const orphan = ledger.start({ id: "c-orphan", ...REC, startedAt: clock.now() - 7_200_000 })
+  // A live consult inside the window: started 90s ago — NEVER touched.
+  const live = ledger.start({ id: "c-live", ...REC, startedAt: clock.now() - 90_000 })
+  const reaped = ledger.reapStale(3_600_000)
+  assert.deepEqual(reaped, ["c-orphan"])
+  assert.equal(ledger.get("c-orphan")?.state, "failed")
+  assert.equal(ledger.get("c-live")?.state, "running", "in-window consult untouched")
+  assert.deepEqual(ledger.reapStale(3_600_000), [], "idempotent second sweep")
 })
 
 test("concurrency guard constant is 2", () => {

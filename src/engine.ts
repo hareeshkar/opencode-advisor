@@ -254,7 +254,10 @@ export class AdvisorEngine {
       return {
         ok: false,
         errorCode: "max_uses_exceeded",
-        message: `Advisor already consulted ${st.calls}/${this.opts.maxUsesPerTask} successful times this task. Continue without further advice.`,
+        message:
+          st.calls > this.opts.maxUsesPerTask
+            ? `Advisor already consulted ${st.calls} times this task; the cap was lowered below that after the fact (${this.opts.maxUsesPerTask}). Start a new task — the cap applies per task.`
+            : `Advisor already consulted ${st.calls}/${this.opts.maxUsesPerTask} successful times this task. Continue without further advice.`,
       }
     }
 

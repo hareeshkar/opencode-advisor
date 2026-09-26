@@ -3,6 +3,22 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.8.1] — 2026-09-26
+
+### Fixed
+- **Terminal-failure delivery symmetry**: when a backgrounded consult fails,
+  the executor now receives a framed one-line notice (`ADVISOR NOT RUNNING —
+  consult <id>: <reason>. The cap was not consumed.`) through the same native
+  injection channel as successful advice — previously a failed background
+  consult left the executor believing a consult was still in flight.
+- **Broken config at dispatch** returns a framed `advisor_config_error`
+  instead of ever consulting against unknown options (config freshness reads
+  are checked at every consult dispatch).
+
+### Changed
+- Config-freshness failures at dispatch fail the consult loudly rather than
+  continuing on last-known-good options.
+
 ## [0.8.0] — 2026-09-26
 
 ### Added

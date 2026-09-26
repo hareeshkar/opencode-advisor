@@ -485,7 +485,7 @@ test("fallback sandwich is isolated too: history, system parts, and tools are st
 
 test("async consults: long advisor work returns RUNNING, then delivers automatically", async () => {
   const { ctx, captured } = makeCtx()
-  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000, maxUsesPerTask: 1 }
   let release
   ctx.generate.text = async () => {
     await new Promise((r) => { release = r })
@@ -516,23 +516,37 @@ test("async consults: long advisor work returns RUNNING, then delivers automatic
   await captured.httpHooks[0](ev)
   const body = await ev.request.clone().text()
   assert.ok(body.includes("LATE-ARRIVING ADVICE"), "advice auto-delivered on the next model call")
+
+  // the delivered consult consumed the cap exactly once
+  const second = await advisorTool.execute({}, { sessionID: "s-async", signal: new AbortController().signal })
+  assert.ok(second.content.includes("max_uses_exceeded"), "delivered advice consumed the cap once")
 })
 
 test("async consults: concurrency guard rejects the third without consuming the cap", async () => {
   const { ctx, captured } = makeCtx()
   ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
-  let release
+  const resolvers = []
+  let gCalls = 0
   ctx.generate.text = async () => {
-    await new Promise((r) => { release = r })
+    gCalls++
+    if (gCalls <= 2) {
+      await new Promise((r) => resolvers.push(r))
+      return { text: "LATE" }
+    }
     return { text: "LATE" }
   }
   await createV2Plugin().setup(ctx)
   const advisorTool = captured.tools.find((t) => t.name === "advisor")
-  await advisorTool.execute({}, { sessionID: "s-a1", signal: new AbortController().signal })
-  await advisorTool.execute({}, { sessionID: "s-a2", signal: new AbortController().signal })
+  const first = await advisorTool.execute({}, { sessionID: "s-a1", signal: new AbortController().signal })
+  const second = await advisorTool.execute({}, { sessionID: "s-a2", signal: new AbortController().signal })
   const third = await advisorTool.execute({}, { sessionID: "s-a3", signal: new AbortController().signal })
+  assert.ok(first.content.includes("ADVISOR CONSULT RUNNING"), "first backgrounded")
+  assert.ok(second.content.includes("ADVISOR CONSULT RUNNING"), "second backgrounded")
   assert.ok(third.content.includes("maximum 2 consultations already running"), "third rejected explicitly")
-  release()
+  resolvers.forEach((r) => r()) // release both held consults
+  await new Promise((r) => setTimeout(r, 30))
+  const followup = await advisorTool.execute({}, { sessionID: "s-a4", signal: new AbortController().signal })
+  assert.ok(followup.content.includes("LATE"), "the rejected consult consumed nothing — a fresh consult works")
   await new Promise((r) => setTimeout(r, 20))
   const after = captured.tools.find((t) => t.name === "advisor_status")
   void after
@@ -582,5 +596,60 @@ test("ceiling expiry fails the consult without consuming the cap", async () => {
   assert.ok(status.content.includes("advisor_not_running"), "advisor_not_running wording")
   const ok = await advisorTool.execute({}, { sessionID: "s-ceiling2", signal: new AbortController().signal })
   assert.ok(ok.content.includes("NEVER-SEEN"), "cap NOT consumed by the expired consult")
+})
+
+test("backgrounded failures are delivered too — the executor learns the consult died", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
+  let directCalls = 0
+  let sandwichCalls = 0
+  ctx.generate.text = async () => {
+    directCalls++
+    if (directCalls === 1) {
+      await new Promise((r) => setTimeout(r, 400))
+      throw new Error("provider connection reset")
+    }
+    return { text: "RECOVERED" }
+  }
+  ctx.session.generate = async () => {
+    sandwichCalls++
+    if (sandwichCalls === 1) {
+      await new Promise((r) => setTimeout(r, 400))
+      throw new Error("provider connection reset")
+    }
+    return { text: "RECOVERED" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+
+  const running = await advisorTool.execute({}, { sessionID: "s-fail", signal: new AbortController().signal })
+  assert.ok(running.content.includes("ADVISOR CONSULT RUNNING"), "backgrounded")
+  await new Promise((r) => setTimeout(r, 900)) // primary fails at ~400ms → fallback fails at ~800ms → failure injected
+
+  await captured.contextHooks[0]({ sessionID: "s-fail", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: JSON.stringify({ system: "s", messages: [] }) })
+  const ev = { sessionID: "s-fail", kind: "primary", request }
+  await captured.httpHooks[0](ev)
+  const body = await ev.request.clone().text()
+  assert.ok(body.includes("ADVISOR NOT RUNNING"), "terminal failure delivered to the executor")
+  assert.ok(body.includes("provider connection reset"), "reason named")
+  assert.ok(body.includes("cap was not consumed"), "no-cap-consumption promise kept")
+
+  // recovery: the next consult succeeds and consumes the cap once
+  const ok = await advisorTool.execute({}, { sessionID: "s-fail2", signal: new AbortController().signal })
+  assert.ok(ok.content.includes("RECOVERED"), "recovered after the failure")
+})
+
+test("broken config at dispatch returns a framed config error — never a stale consult", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const dir = join(ctx.location.directory, ".opencode")
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, "opencode-advisor.json"), "{ broken json")
+  const result = await advisorTool.execute({}, { sessionID: "s-cfg", signal: new AbortController().signal })
+  assert.ok(result.content.includes("advisor_config_error"), "framed config error")
+  assert.ok(result.content.includes("invalid JSON"), "config problem named")
+  assert.ok(!result.content.includes("ADVISOR REVIEW"), "no consult ran against unknown config")
 })
 

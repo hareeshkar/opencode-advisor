@@ -719,10 +719,11 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                   log("info", "config changed on disk — applied to the running instance")
                 }
               } catch (err) {
-                // A broken config surfaces loudly at load/reload; here we keep
-                // serving with the last-known-good options rather than failing
-                // a consult on a transient read.
-                log("warn", "config freshness check failed (continuing with current options)", err)
+                // A broken config must never produce a consult against unknown
+                // options: fail the consult with a framed config error (the
+                // load/reload path already surfaced the same problem loudly).
+                const reason = err instanceof Error ? err.message : String(err)
+                return { content: `advisor_tool_result_error: advisor_config_error — ${reason}` }
               }
               if (ledger.runningCount() >= CONSULT_CONCURRENCY) {
                 // Nothing started — the consult cap is not consumed.
@@ -772,11 +773,20 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                         ? `advisor_not_running — no response within ${Math.round(opts.maxConsultMs / 1000)}s`
                         : `${r.errorCode} — ${r.message}`
                     ledger.fail(consultId, reason)
+                    // Terminal-failure delivery symmetry: the executor already
+                    // heard RUNNING — it must also learn the consult died.
+                    queueSystemInjection(sessionID, [
+                      `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
+                    ])
                     log("warn", `background consult ${consultId} failed: ${reason}`)
                   }
                 })
                 .catch((err: unknown) => {
-                  ledger.fail(consultId, `advisor_not_running — ${err instanceof Error ? err.message : String(err)}`)
+                  const reason = `advisor_not_running — ${err instanceof Error ? err.message : String(err)}`
+                  ledger.fail(consultId, reason)
+                  queueSystemInjection(sessionID, [
+                    `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
+                  ])
                   log("warn", `background consult ${consultId} failed`, err)
                 })
               // Synchronous wait window: block the executor for a normal

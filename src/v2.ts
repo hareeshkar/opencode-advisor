@@ -264,6 +264,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             id: model.id,
           }
           if (model.variant) advisorRef.variant = model.variant
+          transportUsed = "none"
           if (nonce && sessionID) {
             pendingAdvisorCalls.set(nonce, sessionID)
             const timer = setTimeout(() => pendingAdvisorCalls.delete(nonce), opts.timeoutMs + 30_000)
@@ -271,76 +272,87 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               (timer as { unref(): void }).unref()
             }
           }
-          let prev = sessionModel.get(sessionID)
-          if (!prev) {
-            try {
-              const info = (await ctx.session.get({ sessionID })) as {
-                model?: { providerID?: string; id?: string; variant?: string }
-              }
-              if (info?.model?.providerID && info?.model?.id) {
-                prev = {
-                  providerID: info.model.providerID,
-                  id: info.model.id,
-                  ...(info.model.variant ? { variant: info.model.variant } : {}),
-                }
-                sessionModel.set(sessionID, prev)
-              }
-            } catch {
-              /* fall through to the guard below */
-            }
-          }
-          if (!prev) {
-            throw new Error(
-              "refusing unsafe model sandwich: no tracked executor model for this session and session.get failed",
-            )
-          }
-          const sameModel =
-            prev.providerID === advisorRef.providerID &&
-            prev.id === advisorRef.id &&
-            (prev.variant ?? undefined) === (advisorRef.variant ?? undefined)
-          if (!sameModel) {
-            await ctx.session.switchModel({ sessionID, model: advisorRef })
-          }
-          let before = -1
-          if (opts.logLevel === "debug") {
-            try {
-              before = ((await ctx.session.context({ sessionID })) as unknown[]).length
-            } catch {
-              before = -1
-            }
-          }
           try {
-            const res = (await ctx.session.generate({ sessionID, prompt })) as { text?: unknown } | undefined
-            const text = res?.text
-            if (typeof text !== "string" || text.trim() === "") {
-              const shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
-              throw new Error(`advisor sub-call returned no text (response shape: ${shape})`)
+            // PRIMARY — history-less direct generation: the native transport
+            // for a session-less job. No session context, no model-switch
+            // sandwich, no mutation fidelity required. The nonce lets the http
+            // hook attach provider routing (x-opencode-session), exactly as it
+            // did for the sandwich.
+            try {
+              const res = (await ctx.generate.text({ prompt, model: advisorRef })) as { text?: unknown } | undefined
+              const text = res?.text
+              if (typeof text !== "string" || text.trim() === "") {
+                const shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
+                throw new Error(`generate.text returned no text (response shape: ${shape})`)
+              }
+              transportUsed = "direct"
+              return text
+            } catch (err) {
+              log(
+                "warn",
+                `direct (generate.text) transport failed — falling back to the session sandwich: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              )
             }
-            if (opts.logLevel === "debug" && before >= 0) {
+            // FALLBACK — session sandwich (session-scoped generate). The host
+            // attaches its own conversation; the generate hook isolates it away
+            // (messages/system/tools). Kept for hosts where generate.text lacks
+            // provider routing or credentials.
+            let prev = sessionModel.get(sessionID)
+            if (!prev) {
               try {
-                const after = ((await ctx.session.context({ sessionID })) as unknown[]).length
-                lastHistoryDelta = `${before}→${after}`
-                if (after !== before) {
-                  log("warn", `HISTORY CANARY: session.generate changed persisted history (${before} → ${after} messages)`)
+                const info = (await ctx.session.get({ sessionID })) as {
+                  model?: { providerID?: string; id?: string; variant?: string }
+                }
+                if (info?.model?.providerID && info?.model?.id) {
+                  prev = {
+                    providerID: info.model.providerID,
+                    id: info.model.id,
+                    ...(info.model.variant ? { variant: info.model.variant } : {}),
+                  }
+                  sessionModel.set(sessionID, prev)
                 }
               } catch {
-                lastHistoryDelta = "census-failed"
+                /* fall through to the guard below */
               }
             }
-            return text
+            if (!prev) {
+              throw new Error(
+                "refusing unsafe model sandwich: no tracked executor model for this session and session.get failed",
+              )
+            }
+            const sameModel =
+              prev.providerID === advisorRef.providerID &&
+              prev.id === advisorRef.id &&
+              (prev.variant ?? undefined) === (advisorRef.variant ?? undefined)
+            if (!sameModel) {
+              await ctx.session.switchModel({ sessionID, model: advisorRef })
+            }
+            try {
+              const res = (await ctx.session.generate({ sessionID, prompt })) as { text?: unknown } | undefined
+              const text = res?.text
+              if (typeof text !== "string" || text.trim() === "") {
+                const shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
+                throw new Error(`advisor sub-call returned no text (response shape: ${shape})`)
+              }
+              transportUsed = "sandwich"
+              return text
+            } finally {
+              if (!sameModel) {
+                try {
+                  await ctx.session.switchModel({ sessionID, model: prev })
+                } catch (err) {
+                  log(
+                    "error",
+                    `FAILED to restore executor model ${prev.providerID}/${prev.id} — session left on advisor model; the next consult will repair it`,
+                    err,
+                  )
+                }
+              }
+            }
           } finally {
             if (nonce) pendingAdvisorCalls.delete(nonce)
-            if (!sameModel) {
-              try {
-                await ctx.session.switchModel({ sessionID, model: prev })
-              } catch (err) {
-                log(
-                  "error",
-                  `FAILED to restore executor model ${prev.providerID}/${prev.id} — session left on advisor model; the next consult will repair it`,
-                  err,
-                )
-              }
-            }
           }
         },
         persistUsage,
@@ -647,6 +659,9 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       let nonceMatches = 0
       let toolsStripped = 0
       let toolsSeen = 0
+      let messagesDropped = 0
+      let systemPartsStripped = 0
+      let transportUsed = "none"
       let lastHistoryDelta = "n/a"
       // Executor model per session, tracked from primary context-hook
       // events. Lets runAdvisor restore the exact model after the advisor
@@ -696,7 +711,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 log("warn", `consult failed: ${r.errorCode} — ${r.message}`)
                 let content = `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
                 if (opts.logLevel === "debug") {
-                  content += ` [diag: httpHookLive=${httpHookLive} kinds=[${[...observedKinds].join(",")}] mrKinds=[${[...modelRequestKinds].join(",")}] genKinds=[${[...generateKinds].join(",")}] nonceMatches=${nonceMatches} stripped=${toolsStripped} seen=${toolsSeen} hist=${lastHistoryDelta} pending=${pendingAdvisorCalls.size}]`
+                  content += ` [diag: httpHookLive=${httpHookLive} kinds=[${[...observedKinds].join(",")}] mrKinds=[${[...modelRequestKinds].join(",")}] genKinds=[${[...generateKinds].join(",")}] nonceMatches=${nonceMatches} stripped=${toolsStripped} seen=${toolsSeen} msgDrop=${messagesDropped} sysStrip=${systemPartsStripped} hist=${lastHistoryDelta} pending=${pendingAdvisorCalls.size}]`
                 }
                 return { content }
               }
@@ -978,7 +993,13 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 }
               }
 
-              // (a) advisor sub-call routing header via nonce correlation
+              // (a) advisor sub-call routing header + ISOLATION PROOF
+              // Correlate by evidence nonce and attach the routing header.
+              // Also capture a privacy-safe summary of the outgoing body for
+              // this sub-call only: does it carry exactly our prompt message
+              // (history stripped, as the generate hook intends), or did the
+              // host ignore the mutation? Counts + needle flags only — never
+              // content. diag:body is last-write-wins (bounded).
               if (pendingAdvisorCalls.size > 0) {
                 const body = await req.clone().text().catch(() => "")
                 if (body) {
@@ -987,6 +1008,29 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                       req.headers.set("x-opencode-session", advisorSid)
                       nonceMatches++
                       log("debug", `attached x-opencode-session for advisor sub-call (kind=${kind})`)
+                      try {
+                        const parsed = JSON.parse(body) as { messages?: unknown; system?: unknown; tools?: unknown }
+                        const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+                        const system =
+                          typeof parsed.system === "string" ? [parsed.system] : Array.isArray(parsed.system) ? parsed.system : []
+                        const tools = parsed.tools && typeof parsed.tools === "object" ? Object.keys(parsed.tools as object).length : 0
+                        const NEEDLES = ["ADVISOR REVIEW by ", "no preamble", "evidence tail", "Retrying once", "role switch declined"]
+                        const needles = NEEDLES.filter((n) => body.includes(n))
+                        void ctx.storage
+                          .set("diag:body", {
+                            kind,
+                            transport: transportUsed,
+                            messages: messages.length,
+                            systemParts: system.length,
+                            tools,
+                            needles,
+                            chars: body.length,
+                            at: Date.now(),
+                          })
+                          .catch(() => {})
+                      } catch {
+                        /* body not JSON — skip the proof capture */
+                      }
                       break
                     }
                   }
@@ -1003,13 +1047,15 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         log("warn", "http.request hook unavailable (session-routed providers may refuse advisor calls)", err)
       }
 
-      // --- 4c) generate-kind tool stripping (recursion defense) ---------
-      // session.generate assembles the session's tool catalog unless told
-      // otherwise — including our own `advisor` tool. Correlate EXACTLY via
-      // the evidence nonce in the transient messages (the generate hook
-      // carries full messages, unlike http.request which needs body reads),
-      // and strip tools only for our own sub-calls. All other generate-kind
-      // requests pass through untouched.
+      // --- 4c) generate-kind request isolation (history + recursion) ------
+      // session.generate assembles the session's conversation AND tool
+      // catalog. Left alone, the advisor sub-call receives the caller's
+      // entire transcript on top of our prompt — observed live as role
+      // contamination (the consulted model adopting the executor's identity
+      // and narrating the consultation instead of advising, 2026-09-26).
+      // Correlate EXACTLY via the evidence nonce in the transient messages,
+      // then ISOLATE the request to our prompt: drop history, system parts,
+      // and tools. All other generate-kind requests pass through untouched.
       try {
         const regGen = await Promise.race([
           ctx.session.hook("generate", (event: any) => {
@@ -1019,29 +1065,52 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               }
               if (pendingAdvisorCalls.size === 0) return
               const messages = Array.isArray(event?.messages) ? event.messages : []
-              let haystack = ""
-              for (const m of messages) {
+              const textOf = (m: unknown): string => {
                 const c = (m as { content?: unknown })?.content
-                if (typeof c === "string") haystack += c + "\n"
-                else if (Array.isArray(c)) {
-                  for (const p of c) {
-                    const part = p as { text?: unknown }
-                    if (part && typeof part.text === "string") haystack += part.text + "\n"
-                  }
+                if (typeof c === "string") return c
+                if (!Array.isArray(c)) return ""
+                let out = ""
+                for (const p of c) {
+                  const part = p as { text?: unknown }
+                  if (part && typeof part.text === "string") out += part.text + "\n"
                 }
+                return out
               }
               for (const nonce of pendingAdvisorCalls.keys()) {
-                if (haystack.includes(nonce)) {
-                  try {
-                    toolsSeen += Object.keys((event as { tools?: object }).tools ?? {}).length
-                  } catch {
-                    /* introspection failed — proceed to strip */
+                let matched = -1
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  if (textOf(messages[i]).includes(nonce)) {
+                    matched = i
+                    break
                   }
-                  event.tools = {}
-                  toolsStripped++
-                  log("debug", "stripped tools from advisor sub-call (recursion defense)")
-                  break
                 }
+                if (matched < 0) continue
+                const kept = messages[matched]
+                const dropped = messages.length - 1
+                const systemParts = Array.isArray(event?.system) ? event.system.length : 0
+                try {
+                  toolsSeen += Object.keys((event as { tools?: object }).tools ?? {}).length
+                } catch {
+                  /* introspection failed — proceed to strip */
+                }
+                event.tools = {}
+                event.messages = [kept]
+                event.system = []
+                toolsStripped++
+                messagesDropped += dropped
+                systemPartsStripped += systemParts
+                log(
+                  "debug",
+                  `isolated advisor sub-call: kept 1/${messages.length} messages, dropped ${dropped} history, stripped ${systemParts} system parts, tools empty`,
+                )
+                try {
+                  void ctx.storage
+                    .set("diag:generate", { kept: 1, dropped, systemStripped: systemParts, at: Date.now() })
+                    .catch(() => {})
+                } catch {
+                  /* diagnostics only */
+                }
+                break
               }
             } catch (err) {
               log("warn", "generate hook failed (ignored — request proceeds)", err)
@@ -1051,7 +1120,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         ])
         regs.push(regGen)
       } catch (err) {
-        log("warn", "generate hook unavailable (advisor sub-calls may see session tools)", err)
+        log("warn", "generate hook unavailable (advisor sub-calls may see session history/tools)", err)
       }
       // Records which request kinds reach the model layer, including for
       // transient calls. Race-guarded like all unproven hooks.

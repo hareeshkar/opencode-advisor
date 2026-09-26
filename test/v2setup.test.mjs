@@ -22,6 +22,9 @@ function makeCtx(overrides = {}) {
     storage: new Map(),
     rpcHandlers: new Map(),
     switchModelCalls: [],
+    generateHooks: [],
+    generateTextInputs: [],
+    generateEvents: [],
   }
   const ctx = {
     options: { advisor: { providerID: "p", id: "a" }, logLevel: "error" },
@@ -38,11 +41,29 @@ function makeCtx(overrides = {}) {
     },
     session: {
       context: async () => [{ type: "user", text: "do the thing" }],
-      generate: async () => ({ text: "GENERATED-ADVICE" }),
+      generate: async (args) => {
+        // Mirror the host: a session-scoped generate carries the session's
+        // conversation. Registered generate hooks (isolation) run on the
+        // event BEFORE the request is modeled — capture the post-hook event.
+        let event = {
+          sessionID: args.sessionID,
+          messages: [
+            { role: "user", content: "HISTORY-SECRET meta narration, no preamble, evidence tail" },
+            { role: "assistant", content: "executor draft tail" },
+            { role: "user", content: args.prompt },
+          ],
+          system: [{ type: "text", text: "AGENT-SYSTEM-PROMPT" }],
+          tools: { advisor: { description: "x", input: {} } },
+        }
+        for (const hook of captured.generateHooks) await hook(event)
+        captured.generateEvents.push(event)
+        return { text: "GENERATED-ADVICE" }
+      },
       hook: async (name, cb) => {
         if (name === "prompt") captured.promptHooks.push(cb)
         if (name === "context") captured.contextHooks.push(cb)
         if (name === "http.request") captured.httpHooks.push(cb)
+        if (name === "generate") captured.generateHooks.push(cb)
         return { dispose: async () => {} }
       },
       prompt: async (args) => {
@@ -84,7 +105,10 @@ function makeCtx(overrides = {}) {
       ],
     },
     generate: {
-      text: async () => ({ text: "UNUSED" }),
+      text: async (input) => {
+        captured.generateTextInputs.push(input)
+        return { text: "GENERATED-ADVICE" }
+      },
     },
     ...overrides,
   }
@@ -212,12 +236,14 @@ test("RPC set writes the config file, hot-swaps the model; reset restores the de
     advisor: { providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" },
   })
 
-  // next consult: the sandwich switches the session to the NEW model — no restart
+  // next consult: the DIRECT transport carries the NEW model — no restart,
+  // and the session model is never touched (the sandwich is fallback-only)
   await captured.tools[0].execute({}, { sessionID: "s9", signal: new AbortController().signal })
-  const switched = captured.switchModelCalls.find((c) => c.model.providerID === "zai-coding-plan")
-  assert.ok(switched, "new model used for the sub-call")
-  assert.equal(switched.model.id, "glm-5.3")
-  assert.equal(switched.model.variant, "high")
+  const direct = captured.generateTextInputs.find((i) => i.model?.providerID === "zai-coding-plan")
+  assert.ok(direct, "new model used for the direct sub-call")
+  assert.equal(direct.model.id, "glm-5.3")
+  assert.equal(direct.model.variant, "high")
+  assert.equal(captured.switchModelCalls.length, 0, "review consults never switch the session model")
 
   // reset clears the file keys → deployment default returns immediately
   const reset = await rpc.reset({})
@@ -421,4 +447,36 @@ test("GUARANTEE: the executor receives ONLY the framed advice — never transcri
   assert.ok(!result.content.includes(SECRET), "no transcript content in the tool result")
   assert.ok(result.content.startsWith("ADVISOR REVIEW by "), "only the framed advice")
   assert.ok(result.content.length < 600, `advice is small (${result.content.length} chars), not a transcript dump`)
+})
+
+test("review consults are history-less: the direct transport never touches the session", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  await captured.tools[0].execute({}, { sessionID: "s-direct", signal: new AbortController().signal })
+  assert.equal(captured.generateTextInputs.length, 1, "direct transport used")
+  assert.equal(captured.switchModelCalls.length, 0, "no session model switch")
+  assert.equal(captured.generateEvents.length, 0, "session.generate never ran — no history channel exists")
+})
+
+test("fallback sandwich is isolated too: history, system parts, and tools are stripped", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.generate.text = async () => {
+    throw new Error("routing unavailable")
+  }
+  await createV2Plugin().setup(ctx)
+  const result = await captured.tools[0].execute({}, { sessionID: "s-fb", signal: new AbortController().signal })
+  assert.ok(result.content.includes("GENERATED-ADVICE"), "sandwich delivered the advice")
+
+  const event = captured.generateEvents[0]
+  assert.ok(event, "generate hook saw the sandwich request")
+  assert.equal(event.messages.length, 1, "history stripped — only the advisor prompt remains")
+  assert.ok(String(event.messages[0].content).includes("<transcript-"), "the kept message is the advisor prompt")
+  assert.ok(!JSON.stringify(event.messages).includes("HISTORY-SECRET"), "no history leakage into the request")
+  assert.equal(event.system.length, 0, "agent/system prompt stripped")
+  assert.equal(Object.keys(event.tools).length, 0, "tools stripped (recursion defense)")
+  const diag = captured.storage.get("diag:generate")
+  assert.ok(diag, "isolation ledger written")
+  assert.equal(diag.kept, 1)
+  assert.equal(diag.dropped, 2)
+  assert.equal(diag.systemStripped, 1)
 })

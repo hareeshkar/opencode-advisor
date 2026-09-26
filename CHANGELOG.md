@@ -3,6 +3,31 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.7.1] — 2026-09-26
+
+### Fixed
+- **Advisor sub-calls are now truly history-less.** `session.generate` is
+  session-scoped — the host attaches the caller's conversation, so review-mode
+  consults could adopt the executor's identity in advisor-saturated sessions
+  (live-verified: role contamination, echo episodes). The generate hook now
+  ISOLATES the request for correlated sub-calls: history messages dropped,
+  system parts emptied, tools emptied. Verified at the wire level: the
+  outbound body carries exactly one message (the advisor prompt), zero system
+  parts, zero tools.
+- **Direct transport first**: review consults use `generate.text({ prompt,
+  model })` — history-less by construction, no model-switch/restore sandwich —
+  with the isolated session sandwich as automatic fallback (e.g. hosts where
+  the direct call lacks provider routing). `session.generate` no longer runs
+  on the common path.
+
+### Added
+- Transport + isolation diagnostics: `diag:body` (privacy-safe outbound
+  summary for advisor calls only — message/system/tool counts and
+  contamination needle flags), `diag:generate` (isolation ledger:
+  kept/dropped/systemStripped), `msgDrop`/`sysStrip`/`transport` in debug
+  output. Known platform gap documented: plugins cannot delete sessions, so
+  agent-mode "advisor consult" children may remain (read-only, tagged).
+
 ## [0.7.0] — 2026-09-26
 
 ### Added

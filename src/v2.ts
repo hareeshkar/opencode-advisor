@@ -766,18 +766,25 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                     ledger.markInjected(consultId)
                     log("info", `background consult ${consultId} completed — advice delivered to the session`)
                   } else {
-                    // Ceiling expiry gets the user-facing wording: the advisor
-                    // did not deliver within its lifetime.
+                    // Pre-dispatch policy rejections (cap reached, not
+                    // configured) never launched — the tool result already
+                    // carries the error synchronously, so no terminal notice
+                    // is injected and the ledger records the true reason.
+                    // Post-dispatch failures get the ceiling wording.
+                    const preDispatch = r.errorCode === "max_uses_exceeded" || r.errorCode === "not_configured"
                     const reason =
                       r.errorCode === "execution_time_exceeded"
                         ? `advisor_not_running — no response within ${Math.round(opts.maxConsultMs / 1000)}s`
                         : `${r.errorCode} — ${r.message}`
                     ledger.fail(consultId, reason)
-                    // Terminal-failure delivery symmetry: the executor already
-                    // heard RUNNING — it must also learn the consult died.
-                    queueSystemInjection(sessionID, [
-                      `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
-                    ])
+                    if (!preDispatch) {
+                      // Terminal-failure delivery symmetry: the executor
+                      // already heard RUNNING — it must also learn the
+                      // consult died.
+                      queueSystemInjection(sessionID, [
+                        `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
+                      ])
+                    }
                     log("warn", `background consult ${consultId} failed: ${reason}`)
                   }
                 })

@@ -264,3 +264,331 @@ The deployed bundle exports its internals, so the following were verified with *
 **Partial-run AN-2 is resolved as NOT APPLICABLE to scenario 9** (ceiling 1000 > wait 150, so no clamp). **AN-1 is closed** (A3-RETEST passes; fix located at `v2.ts:708-720`). **AN-5/AN-7 did not recur** on the reset usage limit. **AN-6 recurred** and was re-confirmed: a `LIKE '%ADVISOR REVIEW by%'` probe matched my own prompt text, not the injection.
 
 **End of continuation.**
+
+---
+---
+
+# v0.8.1 focused re-run
+
+**Date:** 2026-09-26 (12:45Z – ongoing)
+**Session:** `ses_f2240c122ffeMNppGDX1XciiMo` (advisor subagent of the v0.8.0 regression)
+**Build under test:** `dist/opencode-advisor.js` sha256 `0445abefb759848281a49b9a03a1a520ff6d39d324a960d63c59cb65fe50bb6f`, `PLUGIN_VERSION` **0.8.1**, `cmp` **IDENTICAL** to `~/.config/opencode/opencode-advisor/index.js`
+**Advisor model:** `zai-coding-plan/glm-5.3` (usage limit still reset — no limit-exhaustion failure recurred; AN-5/AN-7 did not reproduce)
+**Scope:** the two v0.8.1 fixes + re-verification of the touched paths. F4 is free (node, no consult).
+**Paid consult cap for this run:** ≤6. The v0.8.0 ledger `calls` is already 26, but the cap that binds is the per-session `st.calls` (CN-2), which starts at 0 in this fresh session.
+
+## 0. Headline: the v0.8.1 terminal-failure delivery fix is confirmed LIVE
+
+**F1 PASS. The `ADVISOR NOT RUNNING` notice was observed live, riding the injection channel into this agent's own context** — not inferred from a status row.
+
+Verbatim, as it appeared in-context (the plugin's injected text is the inner line; the harness wrapped it in a `<system-reminder><advisor-plugin:…>` envelope):
+
+```
+ADVISOR NOT RUNNING — consult cmuidveq6ejxl: model_not_found — Model unavailable: nonexistent/nope. The cap was not consumed — retry or continue the task.
+```
+
+Matching fields: the consult id `cmuidveq6ejxl` in the notice is the **same id** `advisor_status` reports for the FAILED row, and `model_not_found` / `Model unavailable: nonexistent/nope` is the **same string** the tool returned. The two channels agree exactly.
+
+| F1 assertion | Result |
+|---|---|
+| fast failure (not a 90 s timeout) | **16 ms** |
+| tool return | `advisor_tool_result_error: model_not_found — Model unavailable: nonexistent/nope` |
+| terminal notice on the **next model call** | **observed in context, verbatim above** |
+| notice id == `advisor_status` id | **yes** (`cmuidveq6ejxl`) |
+| `advisor_status` shows FAILED | `cmuidveq6ejxl · review · nonexistent/nope · FAILED · 1s · delivery pending` / `model_not_found — Model unavailable: nonexistent/nope` |
+| **cap NOT consumed** — ledger `calls` across the failure | **26 → 26 (+0)** |
+| **cap NOT consumed** — `diag:health` for this session | **`{"calls":1,"attempts":2,"steps":25,"advisorUsed":true}`** — 2 attempts, 1 success: the failure incremented `attempts` and not `calls`. This is the rigorous proof the earlier run lacked. |
+| follow-up consult with the restored advisor works | **yes** — dispatched (`RUNNING` at 90,014 ms) and later **delivered framed advice**; ledger `calls` 26→27, `adviceChars` +4,365 |
+| injection-channel trail | `diag:directive` gained `http-injected … steps:11 … blocks:1` (the notice) and `… steps:26 … blocks:1` (the follow-up advice) |
+
+The fix lives at `v2.ts:776-781`: the failure branch of the promise chain attached at spawn now calls `ledger.fail()` **and** `queueSystemInjection()` with the `ADVISOR NOT RUNNING` text, so the executor learns the consult died instead of being left with only a `RUNNING` banner. Verified against the deployed bundle.
+
+## 0b. New finding — the D1 `model-switched` invariant is violated on the failure path
+
+F1 is the first run to exercise a bogus advisor model (v0.8.0 C8 was never run), and it exposed a **pre-existing** defect that the v0.8.1 fix does not address.
+
+Baseline `model-switched` for this session was **0**. After the single F1 consult it was **2**:
+
+```
+msg_0ddc07154001StMwplXnifGoRb · seq 132 · {"model":{"id":"nope","providerID":"nonexistent"},"previous":{"id":"space-bunny-free","providerID":"opencode","variant":"default"}}
+msg_0ddc07159001zWc3oMT3sDzoMm · seq 133 · {"model":{"id":"space-bunny-free","providerID":"opencode","variant":"default"},"previous":{"id":"nope","providerID":"nonexistent"}}
+```
+
+The consult **transiently re-bound this live session's own model to the bogus advisor model** and then restored it.
+
+**Root cause (read in source).** The primary transport is session-less by design — `ctx.generate.text({ prompt, model: advisorRef })` at `v2.ts:282`, commented "PRIMARY — history-less direct generation … No session context, no model-switch sandwich". That is why the 7 successful v0.8.0 consults left `model-switched` at 0. When `generate.text` **throws**, the code falls through to the FALLBACK "session sandwich" (`v2.ts:290-297`), whose only two `ctx.session.switchModel` call sites are:
+
+- `v2.ts:330` — `await ctx.session.switchModel({ sessionID, model: advisorRef })` (switch **to** the advisor model)
+- `v2.ts:344` — `await ctx.session.switchModel({ sessionID, model: prev })` in the `finally` (switch **back**)
+
+A nonexistent provider/model guarantees `generate.text` throws, so **every** `model_not_found` / `unavailable` failure deterministically walks the sandwich and writes exactly this row pair. Confirmed by the plugin source containing **no** `setModel` / `model-switched` reference at all — the rows are written by OpenCode core in response to the plugin's `switchModel` calls.
+
+**Severity: medium.** The restore worked here (the session is healthy and still running on `opencode/space-bunny-free`), and the `finally` is correctly guarded. But:
+
+1. The D1 invariant ("zero new `model-switched` rows") does **not** hold for any consult that fails on the transport, so v0.8.0's D1 PASS was scoped to successful consults only.
+2. The two rows are **persisted into the session transcript**, so a failed consult permanently adds noise to the user's session history.
+3. The documented residual at `v2.ts:345-351` is a failed *restore*, which would leave the session pinned to the advisor model. That did not happen, but the window exists and is narrow.
+4. Arguably the sandwich fallback should be skipped entirely when the advisor model is unresolvable — a `model_not_found` classification is available *before* the fallback is entered.
+
+**This is not a v0.8.1 regression.** The sandwich fallback is pre-existing dispatch code; the v0.8.1 change is confined to `v2.ts:770-790` (delivery symmetry). It is newly *exercised*, not newly *introduced*.
+
+## 1. Scenario matrix (final)
+
+| ID | Expected | Observed | Verdict | Evidence |
+|----|----------|-----------|---------|----------|
+| F1 | bogus advisor → **fast** failure + `ADVISOR NOT RUNNING — consult <id>: …` injected on the next model call; status FAILED; **cap not consumed**; follow-up consult works | 16 ms failure; notice **observed live in this agent's own context**; id `cmuidveq6ejxl` identical in notice and status; ledger `calls` +0; `diag:health` `attempts:2, calls:1`; follow-up dispatched and later delivered framed advice | **PASS** | §0 |
+| F2 | invalid JSON `{ broken` → framed `advisor_config_error`, never a stale consult, never a raw stack | 5 ms; `advisor_tool_result_error: advisor_config_error — [advisor] config file … is invalid JSON: JSON Parse error: Expected '}'`; ledger +0; plugin still **loads** (no `failed to load plugin` WARN) | **PASS** | §2 |
+| F3 | baseline + `advisorResponseWaitMs:8000` → sync framed advice if <8 s, else RUNNING then delivered later | **RUNNING path.** `ADVISOR CONSULT RUNNING` at **8,012 ms** (id `cmuie69yat185`) → `COMPLETED · 188s · delivery injected`; advice observed arriving in-context | **PASS** | §3 |
+| F4 | all 4 presets → wait 90000 / ceiling 3600000; `timeoutMs` alias maps; wait > ceiling clamps | economy/balanced/thorough/exhaustive → 90000 / 3600000; `timeoutMs:5000`→5000, `:12345`→12345, new key wins over alias; wait 600000 + ceiling 300000 → ceiling raised to 600000 **with a loud log**; wait 150 + ceiling 1000 → untouched | **PASS** | §4 |
+| F5 | wait 8000 + `maxUsesPerTask:1` → delivered advice consumes the cap exactly once; 2nd consult → `max_uses_exceeded` | consult #1 `RUNNING` @8,009 ms → `COMPLETED · 69s · delivery injected`; ledger `calls` **+1 exactly**; consult #2 → `max_uses_exceeded — Advisor already consulted 1/1 successful times this task` in **9 ms** | **PASS** on the literal assertions — but it **exposed N3**, a false terminal notice, below | §5, §7 |
+| F6 | baseline byte-for-byte (`cmp` + sha256) → reload → final consult → framed advice | `cmp` **IDENTICAL**, sha256 `df9db5fa…`, 116 bytes, no trailing newline, no leaked test keys, 14 new `loading plugin` lines; consult dispatched (cap permitted it: `st.calls` 2 < 3) → `COMPLETED · 95s · delivery injected`; ledger `calls` 29→30 | **PASS** (advice delivered asynchronously — see V1-081-2) | §6 |
+
+### Totals
+
+| | PASS | FAIL | Defects found |
+|---|---|---|---|
+| v0.8.1 focused re-run (6) | **6** | **0** | 2 new (**N2**, **N3**) + 1 pre-existing newly-exercised (**N1**/§0b) + 1 recurrence (**CN-5**) |
+
+**Both v0.8.1 fixes are confirmed working.** Fix 1 (failure-delivery symmetry) is the headline and passed live. Fix 2 (dispatch-time config-error framing) passed. Neither fix introduced a regression in its own scenario — but fix 1 has a **scope defect (N3)** that fires on cap rejections.
+
+---
+
+## 2. F2 — config error at dispatch
+
+Config written as the literal bytes `{ broken` (sha256 `9ff0e9578c9d552b1b05b559fb60c457559ddb52484bc0532abba80266e28b89`), then a consult:
+
+```
+advisor_tool_result_error: advisor_config_error — [advisor] config file /Users/hareeshkarravi/.config/opencode/opencode-advisor.json is invalid JSON: JSON Parse error: Expected '}'
+```
+
+| Assertion | Result |
+|---|---|
+| framed `advisor_config_error` | yes |
+| fast (no 90 s wait) | **5 ms** |
+| never a stale consult | correct — returned before `ledger.start`, so no new status row was created |
+| never a raw stack | correct — one line, no `at …/chunk-…` frames |
+| names the offending file | yes |
+| ledger consumed | **+0** on every counter |
+| plugin still loads | **yes** — 14 `loading plugin` INFO lines, **zero** `failed to load plugin` WARNs |
+
+Notable: the v0.8.0 partial run's log contains `failed to load plugin … config file … is invalid JSON` WARNs (09:38Z). **v0.8.1 does not reproduce that** — the plugin loads and the error is surfaced at dispatch time by the freshness catch (`v2.ts:721-727`), with the last-valid-document behaviour in `config.ts:131`. This is an improvement over the older observed behaviour and is why the tool stayed reachable.
+
+---
+
+## 3. F3 — response-wait re-verification
+
+Config: baseline + `"advisorResponseWaitMs":8000` (sha256 `ff15aed603d07608818b0b804a7860c3dbb1165820bea0e8c0aa13e12d6e1bec`).
+
+| Assertion | Result |
+|---|---|
+| which path | **RUNNING (async)** — the advisor did **not** finish inside 8 s |
+| tool returned the banner at | **8,012 ms** (12 ms over the 8000 ms wait — timer granularity) |
+| banner text | `ADVISOR CONSULT RUNNING` / `id: cmuie69yat185` / `elapsed: 8s` / `You do not need to start another consultation.` / `Its advice will be delivered automatically when ready.` |
+| delivered later | **yes** — `cmuie69yat185 · review · zai-coding-plan/glm-5.3 · COMPLETED · 188s · delivery injected` |
+| advice observed in context | yes, on the following model call |
+| ledger | `calls` 27→28 (+1) |
+
+The sync branch is unreachable here for the same reason as v0.8.0's CN-1: `glm-5.3` latency today is 69–246 s, so an 8 s wait always backgrounds. Measured durations this run: **69, 95, 153, 188 s**.
+
+---
+
+## 4. F4 — preset-uniform patience (free, no consult)
+
+Run with `node` directly against `dist/opencode-advisor.js` (`PLUGIN_VERSION` = 0.8.1). **Zero consult spend.**
+
+| Preset | `advisorResponseWaitMs` | `maxConsultMs` | uses | ctx | advice |
+|---|---|---|---|---|---|
+| economy | 90000 | 3600000 | 1 | 8000 | 4000 |
+| balanced | 90000 | 3600000 | 3 | 16000 | 8000 |
+| thorough | 90000 | 3600000 | 5 | 32000 | 16000 |
+| exhaustive | 90000 | 3600000 | 8 | 64000 | 32000 |
+
+**All four → 90000 / 3600000.** Preset-uniform patience holds; only uses/budgets/advice differ. (Re-confirms v0.8.0 D8.)
+
+Deprecated `timeoutMs` alias:
+
+| Input | Resolved `advisorResponseWaitMs` |
+|---|---|
+| `{timeoutMs:5000}` | 5000 |
+| `{timeoutMs:12345}` | 12345 |
+| `{timeoutMs:60000, advisorResponseWaitMs:5000}` | **5000** — the new key wins |
+
+Ceiling clamp (wait > ceiling → ceiling raised **to** the wait):
+
+| Input | Resolved | Log |
+|---|---|---|
+| `wait 600000, ceiling 300000` | wait 600000 / **ceiling 600000** | `[advisor] maxConsultMs (300000) raised to advisorResponseWaitMs (600000) — the ceiling must cover the wait window` |
+| `wait 150, ceiling 1000` | wait 150 / ceiling 1000 | none — ceiling already exceeds the wait, untouched |
+
+This re-confirms v0.8.0 **AN-2 is not applicable** to the `ceiling 1000 + wait 150` case (ceiling > wait ⇒ no clamp), exactly as the v0.8.0 continuation concluded.
+
+Live-config resolution cross-check (the exact F3 bytes on disk) → `wait 8000 / ceiling 3600000 / uses 3 / mode review`, confirming the F3 timing came from the config and not a stale instance.
+
+---
+
+## 5. F5 — cap accounting (free + 1 paid)
+
+**Executed in a fresh child session** `ses_f22331031ffeePKV7wVsrCJhpa` — see **V1-081-1** for why. Config: baseline + `advisorResponseWaitMs:8000` + `maxUsesPerTask:1` (sha256 `fd9a0fdb3e9a14bf4e53c250782f585656ffa472450c1bcb1f909ae39cc50b86`).
+
+| Step | Result |
+|---|---|
+| consult #1 | `ADVISOR CONSULT RUNNING` / `id: cmuied0e5b1c6` / `elapsed: 8s`, at **8,009 ms** |
+| #1 outcome | `cmuied0e5b1c6 · review · zai-coding-plan/glm-5.3 · COMPLETED · 69s · delivery injected` |
+| consult #2 | `advisor_tool_result_error: max_uses_exceeded — Advisor already consulted 1/1 successful times this task. Continue without further advice.` at **9 ms** |
+| #2 ledger row | `cmuief1wafcot · review · zai-coding-plan/glm-5.3 · FAILED · 1s · delivery pending` / `max_uses_exceeded — …` |
+| **cap consumed exactly once** | **yes** — global ledger `calls` 28→29, exactly **+1** |
+| child `model-switched` | **0** (successful consults use the session-less `generate.text` transport) |
+| cap-rejected consult cost | **0** — 9 ms, no dispatch, `errors` unchanged at 5 |
+
+The child also correctly refused to act on two injected instruction-shaped payloads (the advisor's own advice, and the N3 notice below) — recorded here as evidence that the framing held under adversarial content, not as a scenario assertion.
+
+---
+
+## 6. F6 — final restore + sanity
+
+| Check | Result |
+|---|---|
+| `cmp` restore vs pre-run backup | **IDENTICAL** |
+| sha256 after restore | `df9db5fa96dd925952e6e553412844f06703a5b1f9c2825a44fb0c544728accc` (starts `df9db5fa` ✓, unchanged from run start) |
+| size / trailing byte | 116 bytes, ends `…3000}` with **no** trailing newline (`xxd` tail `3030 307d`) |
+| keys on disk | `advisor, maxToolOutputChars, transcriptBudgetTokens` — **no** leaked `advisorResponseWaitMs` / `maxUsesPerTask` |
+| new `loading plugin` lines | 14, latest `2026-09-26T13:02:16.595Z` |
+| bundle vs `dist` | **IDENTICAL**, `0445abefb759848281a49b9a03a1a520ff6d39d324a960d63c59cb65fe50bb6f` |
+| `~/.config/opencode/opencode.json` | never opened for writing; `c97f0424…`, mtime `Sep 24 00:04` (pre-run) |
+| OpenCode restarted | **no** |
+| final consult | dispatched → `ADVISOR CONSULT RUNNING` at **90,062 ms** (id `cmuiegd6j30z8`) → `COMPLETED · 95s · delivery injected` |
+| ledger | `calls` 29→30 |
+| `diag:health` (this session) | `{"calls":3,"attempts":4,"steps":46,"advisorUsed":true}` |
+
+`attempts:4 / calls:3` is exact: 4 attempts = F1 failure + F1 follow-up + F3 + F6; 3 successes = all but the F1 failure. Per-session cap accounting is sound across config reloads.
+
+---
+
+## 7. Additional findings
+
+### N2 — `estTokensIn` is charged on failures that never reach the provider (metrics only)
+
+F1's failed consult moved `estTokensIn` **+5,454** while `estTokensOut` and `adviceChars` stayed flat. Source: `engine.ts:306` computes `estTokensIn = Math.ceil(promptChars / 4)` from the packaged prompt **before** dispatch, and `engine.ts:316` passes it into `fail(errorCode, message, estTokensIn)`. So a consult that dies at model resolution — zero bytes sent — still books an input estimate.
+
+Not a billing defect against the provider, but it means **the ledger's `estTokensIn` over-reports metered input** and any $/token figure derived from it is high by the failed attempts' prompt size. `estTokensOut` / `adviceChars` are correctly flat.
+
+### N3 — the new terminal notice fires on cap rejections, claiming the opposite (v0.8.1 defect)
+
+**This is a defect in the fix under test.** The child surfaced it independently: after the F5 cap rejection, a third injection arrived telling it *"the cap was not consumed — retry or continue"*, contradicting the tool's own `1/1` message.
+
+Mechanism. The delivery-symmetry chain is attached at spawn (`v2.ts:753-791`) and its `else` branch fires for **any** non-ok result, including **pre-dispatch policy rejections** from `engine.ts:253-259` (`max_uses_exceeded`) and the attempt ceiling at `engine.ts:264-270`:
+
+```ts
+} else {
+  const reason = r.errorCode === "execution_time_exceeded" ? … : `${r.errorCode} — ${r.message}`
+  ledger.fail(consultId, reason)                                    // v2.ts:775
+  queueSystemInjection(sessionID, [
+    `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
+  ])                                                                // v2.ts:778-780
+}
+```
+
+Reconstructed notice for F5 (see provenance note below):
+
+```
+ADVISOR NOT RUNNING — consult cmuief1wafcot: max_uses_exceeded — Advisor already consulted 1/1 successful times this task. Continue without further advice.. The cap was not consumed — retry or continue the task.
+```
+
+Four separate problems:
+
+1. **False.** The cap *was* consumed and is exhausted — that is the entire reason for the rejection.
+2. **Wrong direction.** It instructs the model to *retry* a consult that can never succeed. Bounded only by the attempt ceiling (`maxUsesPerTask*3+2`), so not an infinite loop, but it burns the executor's turns and its own advice budget on a guaranteed failure.
+3. **Wrong lifecycle.** Nothing was ever `RUNNING` — the rejection happens before `ledger.start` is reached — so "`ADVISOR NOT RUNNING`" is itself untrue. The notice is only meaningful for a consult that actually started and then died, which is exactly the F1 case it was written for.
+4. **Cosmetic.** `${reason}` already ends in `.` and the template appends `. The cap…`, producing `advice..` (double period).
+
+Side effect: `ledger.fail` now runs for a consult that never dispatched, creating a phantom `FAILED` row (`cmuief1wafcot` above). v0.8.0's `11-restore` row recorded a cap-rejected consult as "zero ledger delta"; that phantom row is new in v0.8.1.
+
+**Provenance of the quoted text — RECONSTRUCTED, not a byte capture.** The template is verified byte-identical in **both** `dist/opencode-advisor.js` and the deployed `~/.config/opencode/opencode-advisor/index.js` (2 hits each):
+`ADVISOR NOT RUNNING \u2014 consult ${consultId}: ${reason}. The cap was not consumed \u2014 retry or continue the task.`
+and `${reason}` is the verbatim second line of the child's `advisor_status` FAILED row; the child independently reported the trailing clause verbatim. It is **not** a byte capture, because request-level injections are not persisted to the transcript — a first extraction attempt returned a JSON-escaping artifact, so this is labelled reconstructed rather than quoted. Contrast **F1's** notice in §0, which *was* read directly out of this agent's own context and is therefore a true verbatim observation.
+
+**Recommended v0.8.2 fix:** gate both `ledger.fail` and the notice on the consult having actually started (or on `errorCode` not being a policy rejection), and make the "cap was not consumed" suffix conditional on the failure being post-dispatch. A cheap extra win: pre-resolve the advisor model ref against the provider registry before dispatch, which would avoid the sandwich in N1 as well.
+
+### CN-5 recurrence — terminal-failure delivery latch never flips
+
+`cmuidveq6ejxl` (F1) **still** reads `delivery pending` in `advisor_status`, long after the notice was demonstrably injected (`http-injected` at `steps:11`). Same for `cmuief1wafcot`. Cause: the failure path calls `ledger.fail` (`v2.ts:775`) but never `ledger.markInjected`, which the success path does call (`v2.ts:766`). So `advisor_status` cannot distinguish "notice not yet delivered" from "notice delivered", and any future replay logic keyed on that latch will mishandle terminal failures. Cosmetic today (no stale advice is ever injected — `adviceChars` moves only on real deliveries), consistent with v0.8.0 CN-5.
+
+---
+
+## 8. Spend summary
+
+Ledger key `plugin:<utf16le-hex "opencode-advisor">:usage:2026-09-26`.
+
+| Point | calls | errors | estTokensIn | estTokensOut | adviceChars |
+|---|---|---|---|---|---|
+| Start of run | 26 | 4 | 455,963 | 20,478 | 81,875 |
+| End of run | 30 | 5 | 497,891 | 24,625 | 98,454 |
+| **Delta** | **+4** | **+1** | **+41,928** | **+4,147** | **+16,579** |
+
+**Paid consults: 4 of the ≤6 cap.**
+
+| Consult | Outcome | Paid? |
+|---|---|---|
+| F1 (bogus model) | `model_not_found` @16 ms | **no** — 0 provider calls |
+| F1 follow-up | delivered, `COMPLETED · 153s` | **yes** |
+| F2 (invalid JSON) | `advisor_config_error` @5 ms | **no** — no dispatch |
+| F3 (wait 8 s) | delivered, `COMPLETED · 188s` | **yes** |
+| F5 #1 (child) | delivered, `COMPLETED · 69s` | **yes** |
+| F5 #2 (child) | `max_uses_exceeded` @9 ms | **no** — no dispatch |
+| F6 | delivered, `COMPLETED · 95s` | **yes** |
+
+- **Spend ≈ $0.077** (41,928 × $1.40/M in = $0.0587; 4,147 × $4.40/M out = $0.0182).
+- Adjusted for N2 (the 5,454-token phantom estimate on the failed F1 consult): **≈ $0.069** of real provider traffic.
+- The F1 failure cost **$0** in actual provider calls; its ledger cost is an accounting artifact only.
+- Ledger is process-global; concurrent sessions on this box can contribute unrelated deltas. The `+4 calls` figure is corroborated per-consult: every paid consult moved it by exactly +1 and no consult moved it by +2.
+
+---
+
+## 9. Config checksum proof
+
+| Point | Config | sha256 |
+|---|---|---|
+| Run start (baseline) | 4-key baseline | `df9db5fa96dd925952e6e553412844f06703a5b1f9c2825a44fb0c544728accc` |
+| F1 | `advisor: nonexistent/nope` | `b5a03dd51bb7fd6e9e1e39a546dd67bff0f7340127282c7afa55ff0d836d63e3` |
+| F2 | `{ broken` | `9ff0e9578c9d552b1b05b559fb60c457559ddb52484bc0532abba80266e28b89` |
+| F3 | baseline + `advisorResponseWaitMs:8000` | `ff15aed603d07608818b0b804a7860c3dbb1165820bea0e8c0aa13e12d6e1bec` |
+| F5 | baseline + `advisorResponseWaitMs:8000` + `maxUsesPerTask:1` | `fd9a0fdb3e9a14bf4e53c250782f585656ffa472450c1bcb1f909ae39cc50b86` |
+| **Run end (restored)** | **4-key baseline** | **`df9db5fa96dd925952e6e553412844f06703a5b1f9c2825a44fb0c544728accc`** — identical to start |
+
+| Check | Result |
+|---|---|
+| `cmp` final vs pre-run backup | **IDENTICAL** |
+| Bundle vs `dist` | **IDENTICAL** (`0445abef…`) |
+| `PLUGIN_VERSION` in deployed bundle | **0.8.1** |
+| Reload proof per mutation | 13–14 new `loading plugin … id=…/opencode-advisor` lines each time; no `failed to load plugin` at any point in this run |
+| Files written in the repo | **only** `benchmarks/live-verify/REGRESSION-0.8.0.md` (`git status --porcelain` → ` M benchmarks/live-verify/REGRESSION-0.8.0.md`) |
+| Backup location | `/private/var/folders/…/T/opencode/f081/baseline.json` — **outside** the repo; no stray `baseline.json` in the repo |
+| `opencode.json` | untouched (`c97f0424…`, mtime `Sep 24 00:04`) |
+| OpenCode restart | none |
+
+Residual, correctly not restored: the usage-ledger counters and the per-session `st.calls` are cumulative by design.
+
+---
+
+## 10. Deviations and anomalies
+
+- **V1-081-1 — F5 ran in a fresh child session, not the parent.** The per-task cap (`st.calls`) is per **session** and survives `applyOptions` (v0.8.0 CN-2); the parent session already held 2 successful uses when F5 was reached, so the literal `maxUsesPerTask:1` would have been rejected on its *first* consult and the scenario would have mis-reported correct behaviour as a product failure. A fresh child session (`ses_f22331031ffeePKV7wVsrCJhpa`) preserves the scenario **exactly as written** — literal `maxUsesPerTask:1`, no relaxed cap — which is strictly more faithful than the alternative of raising the cap to `calls+1`. The child obeyed the mechanical script: 2 `advisor` calls, no files written. This is a test-design finding: **cap-sensitive scenarios cannot be run as a sequence inside one single-prompt session.**
+- **V1-081-2 — F6's advice was delivered asynchronously, not returned synchronously.** Byte-exact baseline implies the 90 s default wait, and today's `glm-5.3` latency is 69–246 s (CN-1 again), so the synchronous framed path is unreachable without deviating from the baseline bytes. F6 therefore proves restore + reload + dispatch + delivery rather than a synchronous return. Notably F6 completed in **95 s**, i.e. only 5 s past the wait — the sync path is *nearly* reachable and the margin is thin.
+- **AN-6 recurred.** `LIKE '%ADVISOR REVIEW by%'` against my own session returns inflated counts, because my own reasoning text and the advisor's own advice both quote that string. The trustworthy per-session injection count is the `diag:directive` `http-injected` entries — **4** for this session this run (F1 notice, F1 advice, F3 advice, F6 advice) plus 1 pre-existing entry queued at session start.
+- **A pre-existing injection was already queued in this session at start** (`trigger:"advice"`, `steps:0`). It was distinguishable from F1's notice by consult id, so it did not confound F1 — but any future run should expect one stray startup injection.
+- **AN-5 / AN-7 did not recur.** No `QuotaExceeded`, no `execution_time_exceeded`, no limit-exhaustion failure anywhere in this run; the reset `zai-coding-plan` limit held across 4 paid consults.
+- **A pre-existing session-start injection and `model-switched` 0-at-baseline** were both confirmed before the first mutation, which is what made the §0b delta attributable.
+- **Observation, not a defect:** the plugin logs `[advisor] …` lines that are not findable in `opencode.log` by content grep (the sandwich-fallback warning at `v2.ts:291-296` never appeared despite demonstrably executing). Diagnosability gap only; the plugin's own `log()` sink is not the shared OpenCode log for `warn`-level messages.
+
+---
+
+## 11. Verdict on the two v0.8.1 fixes
+
+| Fix | Location | Verdict |
+|---|---|---|
+| Terminal-failure delivery symmetry | `v2.ts:776-781` (and `:784-791` for the rejection path) | **Working as designed** for the case it was written for — F1 delivered the notice live, on the injection channel, with the consult id and reason matching `advisor_status` exactly, and with the cap correctly left unconsumed. **But over-broad:** it also fires for pre-dispatch policy rejections, producing a false "cap was not consumed — retry" notice (N3). |
+| Dispatch-time config-error framing | `v2.ts:721-727` | **Working as designed** — F2 returned a framed, file-naming `advisor_config_error` in 5 ms with no stale consult and no raw stack, and the plugin now survives an unparseable config instead of failing to load. |
+
+**Recommendation:** ship-blocking only if the N3 retry-misinstruction is considered harmful in practice. It is a small, well-localised fix (gate the notice on the consult having started; make the "cap was not consumed" clause conditional on `errorCode`). N1's sandwich-on-failure and the CN-5 delivery latch should go into the same v0.8.2.
+
+**End of v0.8.1 focused re-run.**

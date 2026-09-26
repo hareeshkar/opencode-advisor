@@ -520,6 +520,15 @@ test("async consults: long advisor work returns RUNNING, then delivers automatic
   // the delivered consult consumed the cap exactly once
   const second = await advisorTool.execute({}, { sessionID: "s-async", signal: new AbortController().signal })
   assert.ok(second.content.includes("max_uses_exceeded"), "delivered advice consumed the cap once")
+
+  // N3 regression: a pre-dispatch policy rejection gets NO terminal notice
+  // injected (the tool result already carried the error synchronously)
+  await captured.contextHooks[0]({ sessionID: "s-async", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+  const request2 = new Request("http://example.test/v1/messages", { method: "POST", body: JSON.stringify({ system: "s", messages: [] }) })
+  const ev2 = { sessionID: "s-async", kind: "primary", request: request2 }
+  await captured.httpHooks[0](ev2)
+  const body2 = await ev2.request.clone().text()
+  assert.ok(!body2.includes("ADVISOR NOT RUNNING"), "no phantom failure notice for a policy rejection")
 })
 
 test("async consults: concurrency guard rejects the third without consuming the cap", async () => {

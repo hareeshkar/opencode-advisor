@@ -11,6 +11,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   consult <id>: <reason>. The cap was not consumed.`) through the same native
   injection channel as successful advice — previously a failed background
   consult left the executor believing a consult was still in flight.
+  Pre-dispatch policy rejections (consult cap reached, not configured) are
+  excluded — they already return their error synchronously, and injecting a
+  "retry" notice for a permanent policy rejection would misinform the model.
 - **Broken config at dispatch** returns a framed `advisor_config_error`
   instead of ever consulting against unknown options (config freshness reads
   are checked at every consult dispatch).

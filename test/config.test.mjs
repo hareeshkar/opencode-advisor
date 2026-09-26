@@ -11,6 +11,7 @@ import {
   migrateStoredOverride,
   removeAdvisorConfigKeys,
   resolveOptions,
+  updateAdvisorConfig,
   writeAdvisorConfig,
 } from "../dist/opencode-advisor.js"
 
@@ -142,6 +143,22 @@ test("removeAdvisorConfigKeys clears known keys, preserves unknown ones, no-ops 
     assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { myCustom: true })
     await removeAdvisorConfigKeys(join(s.dir, "missing.json"), ["preset"])
     assert.deepEqual(await readdir(s.dir), ["cfg.json"])
+  } finally {
+    await s.cleanup()
+  }
+})
+
+test("updateAdvisorConfig applies set and remove in a single write", async () => {
+  const s = await scratch()
+  try {
+    const target = join(s.dir, "cfg.json")
+    await writeFile(target, JSON.stringify({ preset: "economy", advisor: { providerID: "z", id: "g" }, keep: 1 }))
+    await updateAdvisorConfig(target, { set: { advisorMode: "agent" }, remove: ["preset"] })
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), {
+      advisor: { providerID: "z", id: "g" },
+      keep: 1,
+      advisorMode: "agent",
+    })
   } finally {
     await s.cleanup()
   }

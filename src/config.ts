@@ -171,6 +171,22 @@ export async function removeAdvisorConfigKeys(path: string, keys: readonly strin
   await atomicWriteJson(path, base)
 }
 
+/**
+ * Single atomic read-modify-write: set the given keys and delete the others.
+ * Used by the settings UI's Save, where a draft mixes explicit values with
+ * "inherit" (null) removals — one write, never two.
+ */
+export async function updateAdvisorConfig(
+  path: string,
+  change: { set?: Record<string, unknown>; remove?: readonly string[] },
+): Promise<void> {
+  const existing = await readJsonFile(path)
+  const base = existing.exists ? asPlainObject(existing.doc, `config file ${path}`) : {}
+  const next = { ...base, ...(change.set ?? {}) }
+  for (const key of change.remove ?? []) delete next[key]
+  await atomicWriteJson(path, next)
+}
+
 /** Every key this plugin understands — reset clears these; unknown keys survive. */
 export const ADVISOR_CONFIG_KEYS = [
   "advisor",

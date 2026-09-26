@@ -15,11 +15,12 @@
  *     the host's model call
  */
 
-import { ADVISOR_CONFIG_KEYS, loadAdvisorConfig, migrateStoredOverride, removeAdvisorConfigKeys, writeAdvisorConfig } from "./config.js"
+import { ADVISOR_CONFIG_KEYS, loadAdvisorConfig, migrateStoredOverride, removeAdvisorConfigKeys, updateAdvisorConfig } from "./config.js"
 import type { AdvisorConfigSnapshot } from "./config.js"
 import { AdvisorEngine } from "./engine.js"
 import { extractToolNames, replaceSystemInBody } from "./inject.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
+import { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA } from "./settings.js"
 import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
@@ -175,75 +176,6 @@ export function extractLastAssistantText(messages: unknown): string {
 /* ------------------------------------------------------------------ */
 
 const EMPTY_INPUT = { type: "object", properties: {}, additionalProperties: false }
-
-/** Shared RPC output: effective config + provenance for the settings UI. */
-const CONFIG_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    config: {
-      type: "object",
-      properties: {
-        providerID: { type: "string" },
-        id: { type: "string" },
-        variant: { type: "string" },
-        source: { type: "string" },
-        preset: { type: "string" },
-        advisorMode: { type: "string" },
-        maxUsesPerTask: { type: "number" },
-        maxAttempts: { type: "number" },
-        timeoutMs: { type: "number" },
-        adviceWordBudget: { type: "number" },
-        transcriptBudgetChars: { type: "number" },
-        maxToolOutputChars: { type: "number" },
-        triggers: { type: "array", items: { type: "string" } },
-        logLevel: { type: "string" },
-      },
-      required: [
-        "providerID",
-        "id",
-        "variant",
-        "source",
-        "preset",
-        "advisorMode",
-        "maxUsesPerTask",
-        "maxAttempts",
-        "timeoutMs",
-        "adviceWordBudget",
-        "transcriptBudgetChars",
-        "maxToolOutputChars",
-        "triggers",
-        "logLevel",
-      ],
-      additionalProperties: false,
-    },
-    tiers: { type: "object", additionalProperties: { type: "string" } },
-    files: {
-      type: "object",
-      properties: {
-        global: { type: "string" },
-        project: { type: "string" },
-        used: { type: "array", items: { type: "string" } },
-      },
-      required: ["global", "project", "used"],
-      additionalProperties: false,
-    },
-  },
-  required: ["config", "tiers", "files"],
-  additionalProperties: false,
-} as const
-
-/** `set` accepts a full draft document (preferred) or the legacy pre-0.7 pick. */
-const CONFIG_SET_INPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    doc: { type: "object", additionalProperties: true },
-    scope: { type: "string" },
-    providerID: { type: "string" },
-    id: { type: "string" },
-    variant: { type: "string" },
-  },
-  additionalProperties: false,
-} as const
 
 export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise<() => void> } {
   return {
@@ -640,11 +572,19 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               } else {
                 throw new Error('advisor.set: provide a "doc" object (or legacy providerID/id)')
               }
+              // null values mean "remove this key from the file" — the UI's
+              // "Inherit" choice. Everything else is an explicit value.
+              const set: Record<string, unknown> = {}
+              const remove: string[] = []
+              for (const [key, value] of Object.entries(draft)) {
+                if (value === null) remove.push(key)
+                else set[key] = value
+              }
               // Validate BEFORE touching disk: resolveOptions throws precise
               // errors naming the key and bounds.
-              resolveOptions({ ...draft })
+              resolveOptions(set)
               const target = pickConfigTarget(input?.scope)
-              await writeAdvisorConfig(target, draft)
+              await updateAdvisorConfig(target, { set, remove })
               const { resolved, snapshot: snap } = await reloadConfig()
               log(
                 "info",

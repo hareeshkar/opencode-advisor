@@ -1,13 +1,25 @@
 /**
- * opencode-advisor — CLI/TUI plugin (native settings picker).
+ * opencode-advisor — CLI/TUI plugin (native /advisor-settings menu).
  *
  * Registered as a sibling `tui.js` next to the server bundle; the CLI
  * resolves it by filename convention from the plugin directory. Provides:
  *
- *   /advisor-settings  → native dialog.select picker (like /models):
- *                        advisor model from the live catalog (current first),
- *                        then variant/thinking effort, saved via the server
- *                        plugin's RPC (immediate, no restart, no tokens).
+ *   /advisor-settings → native settings menu, built on the proven sequential
+ *   dialog primitives (select / alert / confirm / prompt):
+ *
+ *     Advisor Settings
+ *     ─────────────────────────────
+ *     Advisor model — glm-5.3 · high
+ *     Preset — Balanced (recommended)
+ *     Mode — Review
+ *     Limits — 3 consults/task · 90s
+ *     ─────────────────────────────
+ *     Save changes / Reset all settings… / Cancel
+ *
+ *   The menu is an EDITOR for the config files (the source of truth): it
+ *   loads through the server RPC on open (never stale), accumulates changes
+ *   in a draft, and writes atomically on Save. Cancel discards. `Inherit`
+ *   removes a key instead of freezing a value.
  *
  * The server plugin suppresses its executor-based settings flow once this
  * plugin claims the UI (storage key tui:claimed), so there is exactly one
@@ -18,45 +30,22 @@
  */
 
 import { Plugin } from "@opencode/plugin/tui"
-
-/** Same portable definition the server registered — identical schemas so the
- *  typed client serializes calls into the server's {input: ...} envelope. */
-const refOut = {
-  type: "object",
-  properties: { providerID: { type: "string" }, id: { type: "string" }, variant: { type: "string" } },
-  required: ["providerID", "id"],
-  additionalProperties: false,
-} as const
+import { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA, runSettingsFlow } from "./settings.js"
+import type { AdvisorSettingsView, SettingsModelInfo, SettingsPorts } from "./settings.js"
 
 const emptyIn = { type: "object", properties: {}, additionalProperties: false } as const
 
+/** Identical schemas to the server's registration so the typed client
+ *  serializes calls into the server's {input: …} envelope. */
 const AdvisorRpc = {
   id: "opencode-advisor",
   methods: {
-    get: {
-      input: emptyIn,
-      output: {
-        type: "object",
-        properties: {
-          providerID: { type: "string" },
-          id: { type: "string" },
-          variant: { type: "string" },
-          source: { type: "string" },
-        },
-        required: ["providerID", "id", "source"],
-        additionalProperties: false,
-      },
+    get: { input: emptyIn, output: CONFIG_OUTPUT_SCHEMA },
+    set: { input: CONFIG_SET_INPUT_SCHEMA, output: CONFIG_OUTPUT_SCHEMA },
+    reset: {
+      input: { type: "object", properties: { scope: { type: "string" } }, additionalProperties: false },
+      output: CONFIG_OUTPUT_SCHEMA,
     },
-    set: {
-      input: {
-        type: "object",
-        properties: { providerID: { type: "string" }, id: { type: "string" }, variant: { type: "string" } },
-        required: ["providerID", "id"],
-        additionalProperties: false,
-      },
-      output: refOut,
-    },
-    reset: { input: emptyIn, output: refOut },
     "claim": {
       input: emptyIn,
       output: { type: "object", properties: { ok: { type: "boolean" } }, required: ["ok"], additionalProperties: false },
@@ -77,107 +66,56 @@ export default Plugin.define({
   async setup(context: any) {
     const rpc = context.client.rpc(AdvisorRpc)
 
-    // Claim the settings UI (single slash entry) — best effort.
-    try {
-      await rpc.claim({})
-    } catch {
-      /* older server or RPC unavailable — the server flow still works */
+    /** RPC responses arrive wrapped as { output } — unwrap defensively. */
+    const unwrap = <T,>(res: unknown): T => {
+      const out = (res as { output?: unknown })?.output
+      return (out ?? res) as T
     }
 
     const location = context.location ?? context.data.location.default()
 
-    const loadModels = async (): Promise<ModelLike[]> => {
+    /** The live OpenCode model catalog — same source the model picker uses. */
+    const models = async (): Promise<SettingsModelInfo[]> => {
       try {
         await context.data.location.model.sync(location)
       } catch {
         /* cached list may still be usable */
       }
-      const models = context.data.location.model.list(location) ?? []
-      return (models as ModelLike[]).filter((m) => m.providerID !== "" && m.modelID !== "")
+      const list = context.data.location.model.list(location) ?? []
+      return (list as ModelLike[])
+        .filter((m) => m.providerID !== "" && m.modelID !== "")
+        .map((m) => ({
+          providerID: m.providerID,
+          id: m.modelID,
+          ...(m.name ? { name: m.name } : {}),
+          variants: Array.isArray(m.variants) ? m.variants.map((v) => v.id).filter((id) => id !== "") : [],
+        }))
     }
 
-    const currentRef = async (): Promise<{ providerID: string; id: string; variant?: string } | null> => {
-      try {
-        const res = await rpc.get({})
-        const ref = (res as { output?: { providerID?: string; id?: string; variant?: string } })?.output ?? (res as any)
-        if (ref && typeof ref.providerID === "string" && typeof ref.id === "string" && ref.providerID !== "") {
-          return { providerID: ref.providerID, id: ref.id, ...(typeof ref.variant === "string" ? { variant: ref.variant } : {}) }
-        }
-      } catch {
-        /* unconfigured or older server */
-      }
-      return null
+    const ports: SettingsPorts = {
+      load: async () => unwrap<AdvisorSettingsView>(await rpc.get({})),
+      save: async (doc) => unwrap<AdvisorSettingsView>(await rpc.set({ doc })),
+      select: (request) => context.ui.dialog.select(request),
+      alert: (options) => context.ui.dialog.alert(options),
+      confirm: (options) =>
+        context.ui.dialog.confirm({
+          title: options.title,
+          message: options.message,
+          label: { confirm: options.confirmLabel, cancel: options.cancelLabel },
+        }),
+      prompt: (options) => context.ui.dialog.prompt(options),
+      toast: (message, variant) => context.ui.toast.show({ message, variant }),
+      models,
     }
 
     const runSettings = async (): Promise<void> => {
-      const models = await loadModels()
-      if (models.length === 0) {
-        context.ui.toast.show({ message: "No models available to choose from.", variant: "error" })
-        return
-      }
-      const current = await currentRef()
-      const currentKey = current ? `${current.providerID}/${current.id}` : ""
-      const byKey = new Map(models.map((m) => [`${m.providerID}/${m.modelID}`, m]))
-
-      const options = models.map((m) => ({
-        title: `${m.providerID}/${m.modelID}`,
-        value: `${m.providerID}/${m.modelID}`,
-        description: m.name ?? "",
-        category: currentKey === `${m.providerID}/${m.modelID}` ? "Current" : "Models",
-      }))
-      options.unshift({
-        title: "Reset to opencode.json default",
-        value: "__reset__",
-        description: "Clears the saved pick and returns to the declarative advisor option",
-        category: "Actions",
-      })
-
-      const chosen = await context.ui.dialog.select({
-        title: "Advisor model",
-        current: currentKey,
-        options,
-      })
-      if (chosen === undefined || chosen === null) return
-
-      if (chosen === "__reset__") {
-        try {
-          await rpc.reset({})
-          context.ui.toast.show({ message: "Advisor override cleared (using opencode.json default).", variant: "success" })
-        } catch {
-          context.ui.toast.show({ message: "Could not clear the advisor override.", variant: "error" })
-        }
-        return
-      }
-
-      const model = byKey.get(chosen)
-      if (!model) return
-      const variants = Array.isArray(model.variants) ? model.variants.map((v) => v.id).filter((v) => v !== "") : []
-      let variant: string | undefined
-      if (variants.length > 0) {
-        const variantOptions = [
-          { title: "default", value: "", description: "Model default thinking effort" },
-          ...variants.map((v) => ({ title: v, value: v })),
-        ]
-        const picked = await context.ui.dialog.select({
-          title: `Variant for ${chosen}`,
-          current: current && `${current.providerID}/${current.id}` === chosen ? current.variant ?? "" : "",
-          options: variantOptions,
-        })
-        if (picked === undefined || picked === null) return
-        variant = picked === "" ? undefined : picked
-      }
-
       try {
-        const res = await rpc.set({
-          providerID: model.providerID,
-          id: model.modelID,
-          ...(variant ? { variant } : {}),
+        await runSettingsFlow(ports)
+      } catch (err) {
+        context.ui.toast.show({
+          message: `Advisor settings failed: ${err instanceof Error ? err.message : String(err)}`,
+          variant: "error",
         })
-        const out = (res as { output?: { providerID?: string; id?: string; variant?: string } })?.output ?? (res as any)
-        const label = `${out?.providerID ?? model.providerID}/${out?.id ?? model.modelID}${out?.variant ? `#${out.variant}` : ""}`
-        context.ui.toast.show({ message: `Advisor set to ${label} — applies to the next consultation.`, variant: "success" })
-      } catch {
-        context.ui.toast.show({ message: "Failed to save the advisor choice.", variant: "error" })
       }
     }
 

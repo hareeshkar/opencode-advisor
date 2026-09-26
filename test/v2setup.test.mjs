@@ -261,6 +261,12 @@ test("settings RPC: a draft saves to the project file; reset clears known keys o
   assert.equal(out.config.maxUsesPerTask, 1, "economy preset applied immediately")
   assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { preset: "economy", myOwnNote: "keep me" })
 
+  // "Inherit" support: null removes a key from the file in the same write.
+  const inherited = await rpc.set({ doc: { preset: null, advisorMode: "agent" }, scope: "project" })
+  assert.equal(inherited.config.preset, "", "preset key removed")
+  assert.equal(inherited.config.advisorMode, "agent", "explicit value written in the same pass")
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { myOwnNote: "keep me", advisorMode: "agent" })
+
   const reset = await rpc.reset({ scope: "project" })
   assert.equal(reset.config.maxUsesPerTask, 3, "back to defaults")
   assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { myOwnNote: "keep me" }, "unknown keys survive reset")

@@ -7,7 +7,7 @@
  */
 
 export const PLUGIN_ID = "opencode-advisor"
-export const PLUGIN_VERSION = "0.5.0"
+export const PLUGIN_VERSION = "0.8.1"
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -45,29 +45,49 @@ export interface AdvisorOptions {
   source?: AdvisorSource
   /** Max advisor calls per user task. Default 3 (matches Anthropic evals). */
   maxUsesPerTask: number
-  /** Target advisor response length in words (prompt-enforced + hard cap). */
-  adviceWordBudget: number
-  /** Sub-call timeout in ms. Default 90_000. */
-  timeoutMs: number
-  /** Transcript pruning knobs. */
-  prune: PruneOptions
+  /** Dispatch-attempt ceiling per task (default derived: maxUsesPerTask*3+2). */
+  maxAttempts: number
   /**
-   * Nudge behavior for executors that under-call the advisor:
-   * "auto" (small-tier executors only — Anthropic measured +7pp on Haiku,
-   * neutral on Sonnet, NEGATIVE on Opus-tier), "on", "off".
+   * Target advisor RESPONSE budget in tokens (the native unit models think
+   * in): instructed in the prompt and enforced with a ≈4-chars/token cap.
    */
-  nudge: "auto" | "on" | "off"
+  adviceTokenBudget: number
+  /**
+   * Transcript CONTEXT budget in tokens. Converted to chars (≈4/token) for
+   * the pruner — the pruner measures exactly, the user budgets natively.
+   */
+  transcriptBudgetTokens: number
+  /**
+   * How long the executor's tool call waits for the advisor response before
+   * returning control (the consult keeps running in the background and the
+   * advice is delivered automatically). This is a UX wait window — NOT a kill
+   * switch, and NOT the mechanism for detecting launch failures (those surface
+   * immediately from the provider response). Default 90_000. Range 100–600,000.
+   * Renamed from `timeoutMs` (accepted as a deprecated alias).
+   */
+  advisorResponseWaitMs: number
+  /**
+   * Maximum lifetime of a consultation. Expiry marks it failed
+   * ("advisor not running") WITHOUT consuming the consult cap. Default
+   * 3_600_000 (1h) — reasoning models may think for a long time. Range
+   * 1,000–86,400,000; accepts a number or a 1000-based size string
+   * ("3600000", "3.6m"). Expiry is wait-abandonment: the consult is marked
+   * failed but the underlying provider request is not aborted (the provider's
+   * own timeout bounds it).
+   */
+  maxConsultMs: number
+  /** Transcript pruning knobs (chars: derived from tokens; exact for the pruner). */
+  prune: PruneOptions
   /**
    * Advisor operating mode:
    *  - "review" (default): tool-less single-shot advice over the pruned
    *    transcript — native parity with Anthropic's advisor, cheapest.
-   *  - "agent": the advisor runs as a read-only child session (plan agent,
-   *    advisor model) that can read/grep/glob and make multiple tool calls
-   *    to VERIFY claims before advising — grounded guidance, higher cost.
+   *  - "agent" (UI: "Review + Agent"): the advisor receives the pruned
+   *    transcript as its MAP and runs as a read-only child session (plan
+   *    agent) that verifies the implicated files with read/grep/glob before
+   *    advising. "review-agent" is accepted as a config alias.
    */
   advisorMode: "review" | "agent"
-  /** Inject the executor timing prompt (once per task, transient). */
-  injectTimingPrompt: boolean
   /**
    * Trigger words routing user messages to the advisor flow
    * (case-insensitive substring; empty list disables the flow).
@@ -151,12 +171,6 @@ export interface Host {
   log(level: LogLevel, message: string, data?: unknown): void
 }
 
-/** Decision returned per model-call step for system injection. */
-export interface StepDecision {
-  injectTiming: boolean
-  injectNudge: boolean
-}
-
 export interface TaskState {
   /** Task generation: bumped by resetTask; guards straggler accounting. */
   generation: number
@@ -167,12 +181,8 @@ export interface TaskState {
   /** Dispatched but not yet settled (bounds parallel-round overshoot). */
   inFlight: number
   steps: number
-  timingInjected: boolean
   advisorUsed: boolean
-  nudged: boolean
   /** First-user-slice prefix; detects task changes the prompt hook missed. */
   taskFingerprint: string | undefined
-  /** One-shot host-hook-delivery warning flag. */
-  hookWarned: boolean
   lastSeen: number
 }

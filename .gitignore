@@ -26,3 +26,6 @@ logs/sessions/bench/*
 *.swp
 .idea/
 .vscode/
+
+# working documents (local only, by design)
+plans/

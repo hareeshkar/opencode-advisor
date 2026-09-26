@@ -18,9 +18,10 @@ import { readFile, mkdir, writeFile, rename } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { AdvisorEngine } from "./engine.js"
-import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, triggerDirective } from "./prompts.js"
-import { frameAdvice } from "./sanitize.js"
+import { resolveOptions } from "./options.js"
+import { loadAdvisorConfig } from "./config.js"
+import { ADVISOR_TOOL_DESCRIPTION, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, triggerDirective } from "./prompts.js"
+import { frameAdvice, isAdvisorOutputFrame } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, Slice, UsageEntry } from "./types.js"
 import { callAdvisorProvider } from "./providers.js"
@@ -96,10 +97,15 @@ export function normalizeV1Messages(messages: unknown): Slice[] {
             (typeof part.output === "string" && part.output) ||
             ""
         }
-        if (payload) out.push({ role: "tool", name: typeof part.tool === "string" ? part.tool : "unknown", text: payload })
+        if (payload && !isAdvisorOutputFrame(payload)) {
+          out.push({ role: "tool", name: typeof part.tool === "string" ? part.tool : "unknown", text: payload })
+        }
       }
     }
   }
+  // Evidence hygiene (mirrors V2): the in-flight assistant text of the
+  // CURRENT turn is a draft, not evidence — never let it anchor the advisor.
+  while (out.length > 1 && out[out.length - 1]!.role === "assistant") out.pop()
   return out
 }
 
@@ -128,7 +134,9 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
 
   let opts: AdvisorOptions
   try {
-    opts = resolveOptions(options ?? {})
+    // Same config files as V2 (project directory = cwd, the best V1 can do).
+    const snapshot = await loadAdvisorConfig({ directory: process.cwd(), options })
+    opts = resolveOptions(snapshot.merged)
   } catch (err) {
     console.error(`[${PLUGIN_ID}] CONFIG ERROR (v1 adapter): ${err instanceof Error ? err.message : String(err)}`)
     throw err
@@ -160,7 +168,7 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
             "(or ADVISOR_SOURCE_KIND/URL/KEY_ENV/MODEL env vars)",
         )
       }
-      return callAdvisorProvider(opts.source, prompt, opts.timeoutMs, signal, {
+      return callAdvisorProvider(opts.source, prompt, opts.maxConsultMs, signal, {
         "x-opencode-session": sessionID,
       })
     },
@@ -228,17 +236,12 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
       try {
         const sid = (typeof inp?.sessionID === "string" && inp.sessionID) || currentSession
         currentSession = sid
-        const m = inp?.model
-        const modelId = m ? `${String(m.providerID ?? m.provider ?? "")}/${String(m.id ?? m.modelID ?? "")}` : undefined
-        const canInject = Array.isArray(output?.system)
-        const d = isAdvisorConfigured(engine.advisor())
-          ? engine.noteStep(sid, () => shouldNudgeExecutor(modelId, opts.nudge), canInject)
-          : { injectTiming: false, injectNudge: false }
-        if (canInject) {
+        engine.noteStep(sid)
+        // Only user-requested directives are ever delivered — no timing
+        // guidance, no nudge, no autonomous steering.
+        if (Array.isArray(output?.system)) {
           const directive = takeDirective(sid)
           if (directive) output.system.push(directive)
-          if (d.injectTiming) output.system.push(EXECUTOR_TIMING_PROMPT)
-          if (d.injectNudge) output.system.push(NUDGE_TEXT)
         }
       } catch (err) {
         log(`system transform failed (ignored): ${err instanceof Error ? err.message : String(err)}`)

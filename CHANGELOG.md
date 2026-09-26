@@ -3,6 +3,114 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.8.1] — 2026-09-26
+
+### Fixed
+- **Terminal-failure delivery symmetry**: when a backgrounded consult fails,
+  the executor now receives a framed one-line notice (`ADVISOR NOT RUNNING —
+  consult <id>: <reason>. The cap was not consumed.`) through the same native
+  injection channel as successful advice — previously a failed background
+  consult left the executor believing a consult was still in flight.
+  Pre-dispatch policy rejections (consult cap reached, not configured) are
+  excluded — they already return their error synchronously, and injecting a
+  "retry" notice for a permanent policy rejection would misinform the model.
+- **Broken config at dispatch** returns a framed `advisor_config_error`
+  instead of ever consulting against unknown options (config freshness reads
+  are checked at every consult dispatch).
+
+### Changed
+- Config-freshness failures at dispatch fail the consult loudly rather than
+  continuing on last-known-good options.
+
+## [0.8.0] — 2026-09-26
+
+### Added
+- **Async advisor consults**: the 90-second window is now a *response wait*,
+  not a kill switch. Launch failures fail fast (`advisor_not_running —
+  <reason>`); consults that need longer keep running in the background and the
+  tool returns `ADVISOR CONSULT RUNNING` (id + elapsed + "You do not need to
+  start another consultation"). New **`advisor_status`** tool lists this
+  session's consults (running/completed/failed + elapsed + delivery state) and
+  replays delivered advice. Completed background consults are auto-delivered
+  through the native injection channel on the executor's next model call, and
+  recorded in a consult ledger (last 100) with a setup-time reaper for entries
+  that outlive the ceiling.
+- `advisorResponseWaitMs` (default 90s — **uniform across presets**: presets
+  scale budget, never patience) and `maxConsultMs` (default 1h ceiling; expiry
+  fails the consult WITHOUT consuming the consult cap). Concurrency guard: ≤2
+  running consults; rejections never consume the cap. Consults own their
+  AbortController — executor interruption cancels waiting, never thinking.
+
+### Changed
+- Review-mode transport is now history-less direct generation first
+  (`generate.text`), isolated session sandwich as fallback; the calling
+  session's model is never switched on the common path.
+- `timeoutMs` accepted as a deprecated alias for `advisorResponseWaitMs`
+  (the new key wins when both are set; the wait is clamped to ≤ `maxConsultMs`).
+
+## [0.7.1] — 2026-09-26
+
+### Fixed
+- **Advisor sub-calls are now truly history-less.** `session.generate` is
+  session-scoped — the host attaches the caller's conversation, so review-mode
+  consults could adopt the executor's identity in advisor-saturated sessions
+  (live-verified: role contamination, echo episodes). The generate hook now
+  ISOLATES the request for correlated sub-calls: history messages dropped,
+  system parts emptied, tools emptied. Verified at the wire level: the
+  outbound body carries exactly one message (the advisor prompt), zero system
+  parts, zero tools.
+- **Direct transport first**: review consults use `generate.text({ prompt,
+  model })` — history-less by construction, no model-switch/restore sandwich —
+  with the isolated session sandwich as automatic fallback (e.g. hosts where
+  the direct call lacks provider routing). `session.generate` no longer runs
+  on the common path.
+
+### Added
+- Transport + isolation diagnostics: `diag:body` (privacy-safe outbound
+  summary for advisor calls only — message/system/tool counts and
+  contamination needle flags), `diag:generate` (isolation ledger:
+  kept/dropped/systemStripped), `msgDrop`/`sysStrip`/`transport` in debug
+  output. Known platform gap documented: plugins cannot delete sessions, so
+  agent-mode "advisor consult" children may remain (read-only, tagged).
+
+## [0.7.0] — 2026-09-26
+
+### Added
+- **File-as-truth configuration**: `opencode-advisor.json` (global + project;
+  project wins) with per-key provenance, atomic tmp+fsync+rename writes, and
+  a one-time migration of the pre-0.7 stored pick. Manual JSON edits and the
+  settings UI edit the same file; **Inherit** removes a key instead of
+  freezing today's value.
+- **Token-native budgets**: `adviceTokenBudget` = advisor OUTPUT tokens
+  (presets 4K/8K/16K/32K; range 500–64K — model max-output caps are typically
+  8K–65K) and `transcriptBudgetTokens` = INPUT context (presets
+  8K/16K/32K/64K; range 2K–1M; chars derived ×4 for the pruner). A preset
+  whose exact quantities no longer match displays as **Custom** (computed,
+  never persisted).
+- **Full settings menu**: `/advisor-settings` edits Model (live catalog,
+  variants, custom, Inherit), Preset (with consequences), Mode
+  (Review / Review + Agent), and Limits (consults, timeout, context tokens,
+  advice tokens, per-tool cap, retry ceiling, log level). Draft → Save (one
+  atomic write) or Cancel; nothing writes until Save.
+- **Evidence hygiene (fixes a live degeneration)**: prior advisor replies and
+  trailing in-flight assistant drafts are excluded from consult evidence, and
+  the advisor prompt forbids continuing/narrating consultation machinery.
+
+### Changed
+- **Manual-only by design**: removed the nudge, the executor timing prompt,
+  and all grant/"stuck" semantics — no explicit user request (trigger words,
+  `/advisor`, or a direct ask), no consultation, no spend. Unconfigured
+  installs answer with setup steps (model is the only required choice;
+  Balanced preset and all limits are pre-tuned) and cost nothing.
+- **Review + Agent** naming: the read-only child session gets the pruned
+  conversation as its MAP and verifies implicated files as the TERRITORY
+  (`review-agent` accepted as a config alias).
+- Retry ceiling documented as transport attempts — never extra paid consults.
+
+### Removed
+- Storage override (`advisor:override`), timing/nudge prompt assets and tier
+  heuristics, and word-based budget knobs in favor of token budgets.
+
 ## [0.5.0] — 2026-09-26
 
 ### Added

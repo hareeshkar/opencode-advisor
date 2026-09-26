@@ -4,7 +4,7 @@
  * Mapping of our architecture onto V2 primitives:
  *   advisor tool        → ctx.tool.transform (zero-arg JSON-Schema tool)
  *   task reset          → ctx.session.hook("prompt")
- *   timing/nudge inject → ctx.session.hook("context")  (transient — never persisted)
+ *   directive delivery  → ctx.session.hook("context")  (transient — never persisted)
  *   advisor sub-call    → ctx.generate.text (no session, no tools, no history)
  *   usage ledger        → ctx.storage (durable, plugin-scoped)
  *
@@ -15,13 +15,17 @@
  *     the host's model call
  */
 
+import { ADVISOR_CONFIG_KEYS, loadAdvisorConfig, migrateStoredOverride, removeAdvisorConfigKeys, updateAdvisorConfig } from "./config.js"
+import type { AdvisorConfigSnapshot } from "./config.js"
+import { CONSULT_CONCURRENCY, ConsultLedger, runningMessage } from "./consults.js"
 import { AdvisorEngine } from "./engine.js"
 import { extractToolNames, replaceSystemInBody } from "./inject.js"
-import { resolveOptions, shouldNudgeExecutor } from "./options.js"
-import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
-import { frameAdvice } from "./sanitize.js"
+import { resolveOptions } from "./options.js"
+import { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA } from "./settings.js"
+import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
+import { frameAdvice, isAdvisorOutputFrame, redactError } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
-import type { AdvisorOptions, Host, LogLevel, Slice, UsageEntry } from "./types.js"
+import type { AdvisorOptions, ConsultResult, Host, LogLevel, Slice, UsageEntry } from "./types.js"
 
 /* ------------------------------------------------------------------ */
 /* transcript normalization                                            */
@@ -132,7 +136,9 @@ export function normalizeV2Transcript(messages: unknown): Slice[] {
             out.push({ role: "assistant", text: p.text })
           } else if (p?.type === "tool") {
             const s = toolSlice(p.name, p)
-            if (s) out.push(s)
+            // Evidence hygiene: prior advisor replies are the model's own
+            // voice — never feed them back (self-imitation channel).
+            if (s && !isAdvisorOutputFrame(s.text)) out.push(s)
           }
           // reasoning parts are intentionally skipped: verbose, low advisor value
         }
@@ -141,11 +147,16 @@ export function normalizeV2Transcript(messages: unknown): Slice[] {
     }
     if (type === "shell") {
       const text = typeof msg.text === "string" ? msg.text : toText(msg.output)
-      if (text) out.push({ role: "tool", name: "shell", text })
+      if (text && !isAdvisorOutputFrame(text)) out.push({ role: "tool", name: "shell", text })
       continue
     }
     // system / compaction / idle / skill / *Selected → no advisor signal
   }
+  // Evidence hygiene: the in-flight assistant text of the CURRENT turn is a
+  // draft, not evidence — GLM-5.3 was observed continuing the executor's own
+  // sentence (live regression 2026-09-26, attempt 1). Completed prior turns
+  // remain; at least one slice is always kept.
+  while (out.length > 1 && out[out.length - 1]!.role === "assistant") out.pop()
   return out
 }
 
@@ -179,22 +190,19 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
     id: PLUGIN_ID,
     async setup(ctxUnknown: unknown): Promise<() => void> {
       const ctx = ctxUnknown as any
+      const directory =
+        typeof ctx?.location?.directory === "string" && ctx.location.directory !== "" ? ctx.location.directory : undefined
+      let snapshot: AdvisorConfigSnapshot
       let opts: AdvisorOptions
       try {
-        opts = resolveOptions(ctx?.options)
+        // Priority: defaults < env < opencode.json options < global file <
+        // project file. The files are the persistent source of truth.
+        snapshot = await loadAdvisorConfig({ directory, options: ctx?.options })
+        opts = resolveOptions(snapshot.merged)
       } catch (err) {
         // loud + rethrow: a misconfigured plugin must not load silently
         console.error(`[${PLUGIN_ID}] CONFIG ERROR: ${err instanceof Error ? err.message : String(err)}`)
         throw err
-      }
-
-      if (!isAdvisorConfigured(opts.advisor)) {
-        // Safe-by-default: fresh installs load UNCONFIGURED (zero spend).
-        // The advisor tool stays registered and answers with setup steps;
-        // /advisor-settings or the opencode.json option configures it.
-        console.warn(
-          `[${PLUGIN_ID}] no advisor model configured yet — the advisor tool will return setup steps until one is set (via /advisor-settings or the plugin's "advisor" option).`,
-        )
       }
 
       const RANK = { debug: 0, info: 1, warn: 2, error: 3 } as const
@@ -257,87 +265,137 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             id: model.id,
           }
           if (model.variant) advisorRef.variant = model.variant
+          transportUsed = "none"
           if (nonce && sessionID) {
+            // Correlation lives for the WHOLE consult lifetime (the ceiling) —
+            // a backgrounded direct call still needs routing headers until it
+            // settles. Cleanup happens in this function's finally.
             pendingAdvisorCalls.set(nonce, sessionID)
-            const timer = setTimeout(() => pendingAdvisorCalls.delete(nonce), opts.timeoutMs + 30_000)
-            if (typeof timer === "object" && timer !== null && "unref" in timer) {
-              (timer as { unref(): void }).unref()
-            }
-          }
-          let prev = sessionModel.get(sessionID)
-          if (!prev) {
-            try {
-              const info = (await ctx.session.get({ sessionID })) as {
-                model?: { providerID?: string; id?: string; variant?: string }
-              }
-              if (info?.model?.providerID && info?.model?.id) {
-                prev = {
-                  providerID: info.model.providerID,
-                  id: info.model.id,
-                  ...(info.model.variant ? { variant: info.model.variant } : {}),
-                }
-                sessionModel.set(sessionID, prev)
-              }
-            } catch {
-              /* fall through to the guard below */
-            }
-          }
-          if (!prev) {
-            throw new Error(
-              "refusing unsafe model sandwich: no tracked executor model for this session and session.get failed",
-            )
-          }
-          const sameModel =
-            prev.providerID === advisorRef.providerID &&
-            prev.id === advisorRef.id &&
-            (prev.variant ?? undefined) === (advisorRef.variant ?? undefined)
-          if (!sameModel) {
-            await ctx.session.switchModel({ sessionID, model: advisorRef })
-          }
-          let before = -1
-          if (opts.logLevel === "debug") {
-            try {
-              before = ((await ctx.session.context({ sessionID })) as unknown[]).length
-            } catch {
-              before = -1
-            }
           }
           try {
-            const res = (await ctx.session.generate({ sessionID, prompt })) as { text?: unknown } | undefined
-            const text = res?.text
-            if (typeof text !== "string" || text.trim() === "") {
-              const shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
-              throw new Error(`advisor sub-call returned no text (response shape: ${shape})`)
+            // PRIMARY — history-less direct generation: the native transport
+            // for a session-less job. No session context, no model-switch
+            // sandwich, no mutation fidelity required. The nonce lets the http
+            // hook attach provider routing (x-opencode-session), exactly as it
+            // did for the sandwich.
+            try {
+              const res = (await ctx.generate.text({ prompt, model: advisorRef })) as { text?: unknown } | undefined
+              const text = res?.text
+              if (typeof text !== "string" || text.trim() === "") {
+                const shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
+                throw new Error(`generate.text returned no text (response shape: ${shape})`)
+              }
+              transportUsed = "direct"
+              return text
+            } catch (err) {
+              log(
+                "warn",
+                `direct (generate.text) transport failed — falling back to the session sandwich: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              )
             }
-            if (opts.logLevel === "debug" && before >= 0) {
+            // FALLBACK — session sandwich (session-scoped generate). The host
+            // attaches its own conversation; the generate hook isolates it away
+            // (messages/system/tools). Kept for hosts where generate.text lacks
+            // provider routing or credentials.
+            let prev = sessionModel.get(sessionID)
+            if (!prev) {
               try {
-                const after = ((await ctx.session.context({ sessionID })) as unknown[]).length
-                lastHistoryDelta = `${before}→${after}`
-                if (after !== before) {
-                  log("warn", `HISTORY CANARY: session.generate changed persisted history (${before} → ${after} messages)`)
+                const info = (await ctx.session.get({ sessionID })) as {
+                  model?: { providerID?: string; id?: string; variant?: string }
+                }
+                if (info?.model?.providerID && info?.model?.id) {
+                  prev = {
+                    providerID: info.model.providerID,
+                    id: info.model.id,
+                    ...(info.model.variant ? { variant: info.model.variant } : {}),
+                  }
+                  sessionModel.set(sessionID, prev)
                 }
               } catch {
-                lastHistoryDelta = "census-failed"
+                /* fall through to the guard below */
               }
             }
-            return text
+            if (!prev) {
+              throw new Error(
+                "refusing unsafe model sandwich: no tracked executor model for this session and session.get failed",
+              )
+            }
+            const sameModel =
+              prev.providerID === advisorRef.providerID &&
+              prev.id === advisorRef.id &&
+              (prev.variant ?? undefined) === (advisorRef.variant ?? undefined)
+            if (!sameModel) {
+              await ctx.session.switchModel({ sessionID, model: advisorRef })
+            }
+            try {
+              const res = (await ctx.session.generate({ sessionID, prompt })) as { text?: unknown } | undefined
+              const text = res?.text
+              if (typeof text !== "string" || text.trim() === "") {
+                const shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
+                throw new Error(`advisor sub-call returned no text (response shape: ${shape})`)
+              }
+              transportUsed = "sandwich"
+              return text
+            } finally {
+              if (!sameModel) {
+                try {
+                  await ctx.session.switchModel({ sessionID, model: prev })
+                } catch (err) {
+                  log(
+                    "error",
+                    `FAILED to restore executor model ${prev.providerID}/${prev.id} — session left on advisor model; the next consult will repair it`,
+                    err,
+                  )
+                }
+              }
+            }
           } finally {
             if (nonce) pendingAdvisorCalls.delete(nonce)
-            if (!sameModel) {
-              try {
-                await ctx.session.switchModel({ sessionID, model: prev })
-              } catch (err) {
-                log(
-                  "error",
-                  `FAILED to restore executor model ${prev.providerID}/${prev.id} — session left on advisor model; the next consult will repair it`,
-                  err,
-                )
-              }
-            }
           }
         },
         persistUsage,
         log,
+      }
+      // §6 migration: a pick stored by the pre-0.7 settings UI has no file to
+      // land in. Move it to the GLOBAL config file once, then retire the
+      // storage key. Runs before the engine exists so the resolved options
+      // already include the migrated pick. On failure the key is kept.
+      try {
+        if (ctx.storage && typeof ctx.storage.get === "function") {
+          const result = await migrateStoredOverride({
+            storage: ctx.storage,
+            globalPath: snapshot.files.global,
+            fileSetsAdvisor: snapshot.tiers.advisor === "global" || snapshot.tiers.advisor === "project",
+            log: (message) => log("info", message),
+          })
+          if (result === "migrated") {
+            snapshot = await loadAdvisorConfig({ directory, options: ctx?.options })
+            opts = resolveOptions(snapshot.merged)
+          }
+        }
+      } catch (err) {
+        log("warn", "config migration failed (will retry on next load)", err)
+      }
+      if (!isAdvisorConfigured(opts.advisor)) {
+        // Safe-by-default: fresh installs load UNCONFIGURED (zero spend).
+        // The advisor tool stays registered and answers with setup steps;
+        // /advisor-settings or a config file configures it.
+        console.warn(
+          `[${PLUGIN_ID}] no advisor model configured yet — the advisor tool will return setup steps until one is set (via /advisor-settings or ${snapshot.files.global}).`,
+        )
+      }
+      // Async consult lifecycle (v0.8.0): ledger + lifecycle sweep. The
+      // ledger keeps the last 100 consults (in memory — never prompts).
+      // Lifecycle sweep: every `running` entry is stale by definition at
+      // setup (this process owns no detached promises from a previous
+      // instance) — fail them all so hot-reload orphans cannot permanently
+      // occupy concurrency slots. Idempotent.
+      const ledger = new ConsultLedger()
+      const interrupted = ledger.failAllRunning("advisor_not_running — interrupted by plugin reload")
+      if (interrupted.length > 0) {
+        log("warn", `consult lifecycle sweep failed ${interrupted.length} orphaned consult(s): ${interrupted.join(", ")}`)
       }
       const engine = new AdvisorEngine(opts, host)
       // Child sessions spawned by AGENT-MODE advisor consults. Used as a
@@ -365,10 +423,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         try {
           await ctx.session.prompt({ sessionID: childID, text: `${AGENT_MODE_PREFIX}${prompt}` })
           // Poll to completion (idle message marks the end of the run).
-          const deadline = Date.now() + opts.timeoutMs
+          const deadline = Date.now() + opts.maxConsultMs
           let lastText = ""
           for (;;) {
-            if (Date.now() > deadline) throw new Error(`agent-mode advisor timed out after ${opts.timeoutMs}ms`)
+            if (Date.now() > deadline) throw new Error(`advisor_not_running — no response within ${Math.round(opts.maxConsultMs / 1000)}s`)
             await new Promise((r) => setTimeout(r, 1_500))
             let messages: unknown[] = []
             try {
@@ -451,87 +509,63 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         pendingDirectives.delete(sessionID)
         return Date.now() - d.at > DIRECTIVE_TTL_MS ? undefined : d.text
       }
-      // Runtime advisor override (set via /advisor-settings). Persisted in
-      // plugin storage; wins over the opencode.json option until reset.
-      let overrideActive = false
-      try {
-        const saved = (await ctx.storage.get("advisor:override")) as
-          | { providerID?: unknown; id?: unknown; variant?: unknown }
-          | undefined
-        if (saved && typeof saved.providerID === "string" && typeof saved.id === "string" && saved.providerID !== "") {
-          engine.setAdvisor({
-            providerID: saved.providerID,
-            id: saved.id,
-            ...(typeof saved.variant === "string" ? { variant: saved.variant } : {}),
-          })
-          overrideActive = true
-          log("info", `advisor override active: ${advisorLabel(engine.advisor())}`)
-        }
-      } catch {
-        /* storage unavailable — stay on config default */
+      // ---- configuration: files are the single source of truth ----------
+      // get/set/reset operate on the JSON config files; set/reset also apply
+      // the resolved result to this running instance immediately (no
+      // restart). Manual file edits are picked up on the next get/set/reset,
+      // so the settings UI reads before displaying and never lies.
+      const reloadConfig = async (): Promise<{ resolved: AdvisorOptions; snapshot: AdvisorConfigSnapshot }> => {
+        const fresh = await loadAdvisorConfig({ directory, options: ctx?.options })
+        const resolved = resolveOptions(fresh.merged)
+        snapshot = fresh
+        opts = resolved
+        engine.applyOptions(resolved)
+        engine.setAdvisor(resolved.advisor)
+        return { resolved, snapshot: fresh }
       }
-      const persistAdvisorOverride = async (
-        ref: { providerID: string; id: string; variant?: string } | null,
-      ): Promise<void> => {
-        if (ref === null) {
-          overrideActive = false
-          engine.setAdvisor(opts.advisor)
-          await ctx.storage.remove("advisor:override").catch(() => {})
-          log("info", `advisor override cleared — back to ${advisorLabel(engine.advisor())}`)
-          return
+      const configOutput = (resolved: AdvisorOptions, snap: AdvisorConfigSnapshot): Record<string, unknown> => ({
+        config: {
+          providerID: resolved.advisor.providerID,
+          id: resolved.advisor.id,
+          variant: resolved.advisor.variant ?? "",
+          source: snap.tiers.advisor ?? "default",
+          preset: typeof snap.merged.preset === "string" ? snap.merged.preset : "",
+          advisorMode: resolved.advisorMode,
+          maxUsesPerTask: resolved.maxUsesPerTask,
+          maxAttempts: resolved.maxAttempts,
+          advisorResponseWaitMs: resolved.advisorResponseWaitMs,
+          maxConsultMs: resolved.maxConsultMs,
+          adviceTokenBudget: resolved.adviceTokenBudget,
+          transcriptBudgetTokens: resolved.transcriptBudgetTokens,
+          maxToolOutputChars: resolved.prune.maxToolOutputChars,
+          triggers: resolved.triggers,
+          logLevel: resolved.logLevel,
+        },
+        tiers: snap.tiers,
+        files: { global: snap.files.global, project: snap.files.project, used: snap.files.used },
+      })
+      /** Phase-1 rule: an existing project file wins, otherwise global. */
+      const pickConfigTarget = (scope: unknown): string => {
+        if (scope === "global") return snapshot.files.global
+        if (scope === "project") {
+          return snapshot.files.project !== "" ? snapshot.files.project : snapshot.files.projectDotOpencode
         }
-        engine.setAdvisor(ref)
-        overrideActive = true
-        await ctx.storage.set("advisor:override", engine.advisor()).catch(() => {})
-        log("info", `advisor set to ${advisorLabel(engine.advisor())} (override persisted)`)
+        return snapshot.files.project !== "" ? snapshot.files.project : snapshot.files.global
       }
-      // RPC surface for the TUI settings picker (and any client). Plain
-      // portable definition — no runtime dependency on @opencode/plugin/rpc.
+      // RPC surface for the TUI settings UI (and any client). Plain portable
+      // definition — no runtime dependency on @opencode/plugin/rpc. The
+      // handler output is the effective config + provenance (tier per key and
+      // the files actually read), which is exactly what the editor displays.
       try {
         const regRpc = await ctx.rpc.register(
           {
             id: "opencode-advisor",
             methods: {
-              get: {
-                input: { type: "object", properties: {}, additionalProperties: false },
-                output: {
-                  type: "object",
-                  properties: {
-                    providerID: { type: "string" },
-                    id: { type: "string" },
-                    variant: { type: "string" },
-                    source: { type: "string" },
-                  },
-                  required: ["providerID", "id", "source"],
-                  additionalProperties: false,
-                },
-              },
-              set: {
-                input: {
-                  type: "object",
-                  properties: {
-                    providerID: { type: "string" },
-                    id: { type: "string" },
-                    variant: { type: "string" },
-                  },
-                  required: ["providerID", "id"],
-                  additionalProperties: false,
-                },
-                output: {
-                  type: "object",
-                  properties: { providerID: { type: "string" }, id: { type: "string" }, variant: { type: "string" } },
-                  required: ["providerID", "id"],
-                  additionalProperties: false,
-                },
-              },
+              get: { input: EMPTY_INPUT, output: CONFIG_OUTPUT_SCHEMA },
+              set: { input: CONFIG_SET_INPUT_SCHEMA, output: CONFIG_OUTPUT_SCHEMA },
               reset: {
-                input: { type: "object", properties: {}, additionalProperties: false },
-                output: {
-                  type: "object",
-                  properties: { providerID: { type: "string" }, id: { type: "string" }, variant: { type: "string" } },
-                  required: ["providerID", "id"],
-                  additionalProperties: false,
-                },
+                input: { type: "object", properties: { scope: { type: "string" } }, additionalProperties: false },
+                output: CONFIG_OUTPUT_SCHEMA,
               },
               "claim": {
                 input: { type: "object", properties: {}, additionalProperties: false },
@@ -542,27 +576,59 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           },
           {
             get: async () => {
-              const ref = engine.advisor()
-              return {
-                providerID: ref.providerID,
-                id: ref.id,
-                ...(ref.variant ? { variant: ref.variant } : {}),
-                source: overrideActive ? "override" : "config",
-              }
+              const { resolved, snapshot: snap } = await reloadConfig()
+              return configOutput(resolved, snap)
             },
             set: async (input: any) => {
-              const providerID = String(input?.providerID ?? "")
-              const id = String(input?.id ?? "")
-              const variant = typeof input?.variant === "string" && input.variant !== "" ? String(input.variant) : undefined
-              if (providerID === "" || id === "") throw new Error("advisor.set requires providerID and id")
-              await persistAdvisorOverride({ providerID, id, ...(variant ? { variant } : {}) })
-              const ref = engine.advisor()
-              return { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) }
+              let draft: Record<string, unknown>
+              if (input?.doc !== undefined) {
+                if (input.doc === null || typeof input.doc !== "object" || Array.isArray(input.doc)) {
+                  throw new Error('advisor.set: "doc" must be a JSON object')
+                }
+                draft = input.doc as Record<string, unknown>
+              } else if (
+                typeof input?.providerID === "string" &&
+                input.providerID !== "" &&
+                typeof input?.id === "string" &&
+                input.id !== ""
+              ) {
+                // Legacy pre-0.7 picker payload → { advisor: … }.
+                draft = {
+                  advisor: {
+                    providerID: input.providerID,
+                    id: input.id,
+                    ...(typeof input.variant === "string" && input.variant !== "" ? { variant: input.variant } : {}),
+                  },
+                }
+              } else {
+                throw new Error('advisor.set: provide a "doc" object (or legacy providerID/id)')
+              }
+              // null values mean "remove this key from the file" — the UI's
+              // "Inherit" choice. Everything else is an explicit value.
+              const set: Record<string, unknown> = {}
+              const remove: string[] = []
+              for (const [key, value] of Object.entries(draft)) {
+                if (value === null) remove.push(key)
+                else set[key] = value
+              }
+              // Validate BEFORE touching disk: resolveOptions throws precise
+              // errors naming the key and bounds.
+              resolveOptions(set)
+              const target = pickConfigTarget(input?.scope)
+              await updateAdvisorConfig(target, { set, remove })
+              const { resolved, snapshot: snap } = await reloadConfig()
+              log(
+                "info",
+                `config written → ${target} (advisor: ${isAdvisorConfigured(resolved.advisor) ? advisorLabel(resolved.advisor) : "unconfigured"})`,
+              )
+              return configOutput(resolved, snap)
             },
-            reset: async () => {
-              await persistAdvisorOverride(null)
-              const ref = engine.advisor()
-              return { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) }
+            reset: async (input: any) => {
+              const target = pickConfigTarget(input?.scope)
+              await removeAdvisorConfigKeys(target, ADVISOR_CONFIG_KEYS)
+              const { resolved, snapshot: snap } = await reloadConfig()
+              log("info", `config reset → ${target}`)
+              return configOutput(resolved, snap)
             },
             "claim": async () => {
               try {
@@ -585,7 +651,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         )
         regs.push(regRpc)
       } catch (err) {
-        log("warn", "RPC registration failed (TUI settings picker will be unavailable; executor settings flow still works)", err)
+        log("warn", "RPC registration failed (settings UI will be unavailable; file editing still works)", err)
       }
       // Hook/tool registrations must be disposed on unload — otherwise a
       // plugin reload leaks callbacks and injections fire repeatedly.
@@ -605,6 +671,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       let nonceMatches = 0
       let toolsStripped = 0
       let toolsSeen = 0
+      let messagesDropped = 0
+      let systemPartsStripped = 0
+      let transportUsed = "none"
+      let waitExpired = false
       let lastHistoryDelta = "n/a"
       // Executor model per session, tracked from primary context-hook
       // events. Lets runAdvisor restore the exact model after the advisor
@@ -636,13 +706,138 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                     "advisor_tool_result_error: unavailable — nested advisor sessions are not supported. You ARE the advisor: answer with your guidance.",
                 }
               }
-              const signal: AbortSignal = tctx?.signal ?? new AbortController().signal
-              const r = await engine.consult(sessionID, signal)
+              // Config freshness: apply on-disk config changes instantly, with
+              // or without a plugin reload. Live finding A3 (2026-09-26): a
+              // just-changed config was still served by the stale previous
+              // instance — an unconfigured install dispatched a paid consult.
+              try {
+                const fresh = await loadAdvisorConfig({ directory, options: ctx?.options })
+                const freshOpts = resolveOptions(fresh.merged)
+                if (JSON.stringify(freshOpts) !== JSON.stringify(opts)) {
+                  opts = freshOpts
+                  engine.applyOptions(freshOpts)
+                  engine.setAdvisor(freshOpts.advisor)
+                  log("info", "config changed on disk — applied to the running instance")
+                }
+              } catch (err) {
+                // A broken config must never produce a consult against unknown
+                // options: fail the consult with a framed config error (the
+                // load/reload path already surfaced the same problem loudly).
+                const reason = err instanceof Error ? err.message : String(err)
+                return { content: `advisor_tool_result_error: advisor_config_error — ${reason}` }
+              }
+              if (ledger.runningCount() >= CONSULT_CONCURRENCY) {
+                // Nothing started — the consult cap is not consumed.
+                return {
+                  content:
+                    "advisor_tool_result_error: advisor_not_running — maximum 2 consultations already running. Check advisor_status; do not start another consultation.",
+                }
+              }
+              // Lifecycle: the consult gets its OWN controller — the tool's
+              // signal gates only the synchronous wait (executor interruption
+              // cancels WAITING, never THINKING). Once launched, a consult
+              // lives until completion or maxConsultMs.
+              const consultController = new AbortController()
+              const startedAt = ledger.now()
+              const consultId = `c${startedAt.toString(36)}${Math.random().toString(36).slice(2, 6)}`
+              ledger.start({
+                id: consultId,
+                sessionID,
+                mode: opts.advisorMode,
+                model: advisorLabel(engine.advisor()),
+              })
+              const consultPromise = engine.consult(sessionID, consultController.signal)
+              // Delivery + terminal ownership, attached AT SPAWN: a rejection
+              // after this tool returned must never become an unhandled
+              // rejection, and completed advice must be delivered through the
+              // native injection channel and recorded for advisor_status.
+              consultPromise
+                .then((r) => {
+                  try {
+                    void ctx.storage
+                      .set("diag:health", { sessionID, time: Date.now(), ...engine.health(sessionID) })
+                      .catch(() => {})
+                  } catch {
+                    /* diagnostics only */
+                  }
+                  if (r.ok) {
+                    const framed = frameAdvice(r.advice, advisorLabel(engine.advisor()))
+                    ledger.complete(consultId, framed)
+                    if (waitExpired) {
+                      // Settled after the wait window: deliver through the
+                      // injection channel (the executor never saw it).
+                      queueSystemInjection(sessionID, [framed])
+                      ledger.markInjected(consultId)
+                    } else {
+                      // Settled inside the window: the tool result already
+                      // carried it — record inline delivery, inject nothing.
+                      ledger.markInline(consultId)
+                    }
+                    log("info", `background consult ${consultId} completed (${waitExpired ? "delivered via injection" : "delivered inline"})`)
+                  } else {
+                    // Pre-dispatch policy rejections (cap reached, not
+                    // configured) never launched — the tool result already
+                    // carries the error synchronously, so no terminal notice
+                    // is injected and the ledger records the true reason.
+                    // Post-dispatch failures get the ceiling wording.
+                    const preDispatch = r.errorCode === "max_uses_exceeded" || r.errorCode === "not_configured"
+                    const reason =
+                      r.errorCode === "execution_time_exceeded"
+                        ? `advisor_not_running — no response within ${Math.round(opts.maxConsultMs / 1000)}s`
+                        : `${r.errorCode} — ${r.message}`
+                    ledger.fail(consultId, reason)
+                    if (!preDispatch) {
+                      // Terminal-failure delivery symmetry: the executor
+                      // already heard RUNNING — it must also learn the
+                      // consult died.
+                      queueSystemInjection(sessionID, [
+                        `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
+                      ])
+                    }
+                    log("warn", `background consult ${consultId} failed: ${reason}`)
+                  }
+                })
+                .catch((err: unknown) => {
+                  const reason = `advisor_not_running — ${redactError(err instanceof Error ? err.message : String(err))}`
+                  ledger.fail(consultId, reason)
+                  queueSystemInjection(sessionID, [
+                    `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
+                  ])
+                  log("warn", `background consult ${consultId} failed`, err)
+                })
+              // Synchronous wait window: block the executor for a normal
+              // answer; on expiry return RUNNING and let the consult finish
+              // in the background. Launch failures inside the window fail
+              // fast — they are never awaited out.
+              const settled = consultPromise.then((r) => ({ kind: "done" as const, r }))
+              settled.catch(() => {}) // failure ownership belongs to the chain above
+              const syncWait = new Promise<"wait">((resolve) => {
+                const timer = setTimeout(() => {
+                  waitExpired = true
+                  resolve("wait")
+                }, opts.advisorResponseWaitMs)
+                if (typeof timer === "object" && timer !== null && "unref" in timer) {
+                  (timer as { unref(): void }).unref()
+                }
+              })
+              let raced: { kind: "done"; r: ConsultResult } | "wait"
+              try {
+                raced = await Promise.race([settled, syncWait])
+              } catch (err) {
+                const reason = err instanceof Error ? err.message : String(err)
+                ledger.fail(consultId, `advisor_not_running — ${reason}`)
+                log("warn", `consult launch failed: ${reason}`)
+                return { content: `advisor_tool_result_error: advisor_not_running — ${reason}` }
+              }
+              if (raced === "wait") {
+                return { content: runningMessage(consultId, ledger.now() - startedAt) }
+              }
+              const r = raced.r
               // Observable hook-delivery signal: last-write-wins health per
               // consult (bounded: 1 small write per consult, not per call).
               // Lets post-hoc analysis distinguish "hooks never delivered"
-              // (timingInjected=false, steps high) from "model chose not to
-              // call" — the key ambiguity of the pilot benchmark.
+              // (steps high) from "model chose not to call" — the key
+              // ambiguity of the pilot benchmark.
               try {
                 void ctx.storage
                   .set("diag:health", { sessionID, time: Date.now(), ...engine.health(sessionID) })
@@ -651,14 +846,40 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 /* storage unavailable — diagnostics only */
               }
               if (!r.ok) {
+                ledger.fail(consultId, `${r.errorCode} — ${r.message}`)
                 log("warn", `consult failed: ${r.errorCode} — ${r.message}`)
                 let content = `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
                 if (opts.logLevel === "debug") {
-                  content += ` [diag: httpHookLive=${httpHookLive} kinds=[${[...observedKinds].join(",")}] mrKinds=[${[...modelRequestKinds].join(",")}] genKinds=[${[...generateKinds].join(",")}] nonceMatches=${nonceMatches} stripped=${toolsStripped} seen=${toolsSeen} hist=${lastHistoryDelta} pending=${pendingAdvisorCalls.size}]`
+                  content += ` [diag: httpHookLive=${httpHookLive} kinds=[${[...observedKinds].join(",")}] mrKinds=[${[...modelRequestKinds].join(",")}] genKinds=[${[...generateKinds].join(",")}] nonceMatches=${nonceMatches} stripped=${toolsStripped} seen=${toolsSeen} msgDrop=${messagesDropped} sysStrip=${systemPartsStripped} hist=${lastHistoryDelta} pending=${pendingAdvisorCalls.size}]`
                 }
                 return { content }
               }
-              return { content: frameAdvice(r.advice, advisorLabel(engine.advisor())) }
+              const framedSync = frameAdvice(r.advice, advisorLabel(engine.advisor()))
+              ledger.complete(consultId, framedSync)
+              ledger.markInline(consultId)
+              return { content: framedSync }
+            },
+          })
+          editor.add({
+            name: "advisor_status",
+            description:
+              "Check advisor consultation status for this session (running/completed/failed) and replay delivered advice. Zero parameters.",
+            input: EMPTY_INPUT,
+            execute: async (_input: unknown, tctx: any) => {
+              const sessionID = String(tctx?.sessionID ?? "")
+              const records = ledger.list(sessionID)
+              if (records.length === 0) {
+                return { content: "No advisor consultations recorded in this session yet." }
+              }
+              const now = ledger.now()
+              const blocks = records.map((r) => {
+                const elapsed = Math.max(1, Math.round((r.elapsedMs ?? now - r.startedAt) / 1000))
+                const head = `${r.id} · ${r.mode} · ${r.model} · ${r.state.toUpperCase()} · ${elapsed}s · delivery ${r.delivery}`
+                if (r.state === "completed" && r.advice) return `${head}\n${r.advice}`
+                if (r.state === "failed") return `${head}\n${r.error ?? "failed"}`
+                return head
+              })
+              return { content: blocks.join("\n\n") }
             },
           })
           try {
@@ -798,18 +1019,19 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         }
       }
 
-      // --- 3) transient system injection (timing + nudge) -----------------
+      // --- 3) transient consult-directive delivery ------------------------
+      // The ONLY system text queued here: a user-requested consult directive
+      // (trigger words / /advisor). There is no timing guidance, no nudge,
+      // no autonomous steering: no request ⇒ nothing is ever injected.
       try {
         const reg3 = await ctx.session.hook("context", (event: any) => {
           try {
             const sid = String(event?.sessionID ?? "")
             // Skip auxiliary / non-primary requests (compaction, title,
-            // hidden generations share the hook identity) and malformed
-            // events — they must never consume injection slots or steps.
+            // hidden generations share the hook identity) and malformed events.
             if (!sid) return
             if (event?.kind !== undefined && event.kind !== "primary") return
             const modelRef = event?.model
-            const modelId = modelRef ? `${String(modelRef.providerID ?? "")}/${String(modelRef.id ?? "")}` : undefined
             // Track the executor model for the sandwich restore.
             if (modelRef && typeof modelRef.id === "string" && typeof modelRef.providerID === "string") {
               sessionModel.set(sid, {
@@ -818,22 +1040,13 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 ...(typeof modelRef.variant === "string" ? { variant: modelRef.variant } : {}),
               })
             }
-            // canInject: flags latch only when the system array is actually writable,
-            // so a non-array event.system retries next call instead of losing the
-            // injection for the whole task. Eligibility is lazy so tier regexes
-            // run only when a nudge is actually on the table.
-            const canInject = Array.isArray(event?.system)
-            // Unconfigured installs inject nothing: no timing guidance for a
-            // tool that would only return setup steps (token discipline).
-            const d = isAdvisorConfigured(engine.advisor())
-              ? engine.noteStep(sid, () => shouldNudgeExecutor(modelId, opts.nudge), canInject)
-              : { injectTiming: false, injectNudge: false }
+            engine.noteStep(sid)
             // Permanent hook-delivery census: one tiny write on each session's
             // first model call (last-write-wins single key — bounded). Lets
             // post-hoc analysis prove hooks fire in any session type
             // (one-shot `run`, subagents, TUI) without per-call amplification.
             // The richer `diag:ctx` write additionally records the SHAPE of
-            // the context event (canInject depends on system being an array).
+            // the context event.
             if (engine.health(sid).steps === 1) {
               try {
                 void ctx.storage.set("diag:hookcheck", { sessionID: sid, time: Date.now() }).catch(() => {})
@@ -851,27 +1064,15 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 /* diagnostics only */
               }
             }
-            // Transient guidance is QUEUED here, not pushed into
-            // event.system: v2.0.16 does not deliver context-hook system
+            // A pending user-requested directive is QUEUED here, not pushed
+            // into event.system: v2.0.16 does not deliver context-hook system
             // mutations to the provider (verified with an in-band canary).
             // Delivery happens in the http.request hook by rewriting the
             // outgoing body (native, request-level).
-            {
-              const directive = takeDirective(sid)
-              const injections: string[] = []
-              if (directive) injections.push(directive)
-              if (d.injectTiming) injections.push(EXECUTOR_TIMING_PROMPT)
-              if (d.injectNudge) injections.push(NUDGE_TEXT)
-              if (injections.length > 0) {
-                queueSystemInjection(sid, injections)
-              }
-              diagDirective("context", sid, {
-                queued: injections.length,
-                directive: directive !== undefined,
-                timing: d.injectTiming,
-                nudge: d.injectNudge,
-                kind: String(event?.kind ?? "(none)"),
-              })
+            const directive = takeDirective(sid)
+            if (directive) {
+              queueSystemInjection(sid, [directive])
+              diagDirective("context", sid, { queued: 1, directive: true, kind: String(event?.kind ?? "(none)") })
             }
           } catch (err) {
             log("warn", "context hook body failed (ignored — model call proceeds)", err)
@@ -879,7 +1080,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         })
         regs.push(reg3)
       } catch (err) {
-        log("warn", "context hook registration failed (timing prompt will not be injected)", err)
+        log("warn", "context hook registration failed (consult directives will not be delivered)", err)
       }
 
       // --- 4) native request rewrite: session header + transient system ----
@@ -956,7 +1157,13 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 }
               }
 
-              // (a) advisor sub-call routing header via nonce correlation
+              // (a) advisor sub-call routing header + ISOLATION PROOF
+              // Correlate by evidence nonce and attach the routing header.
+              // Also capture a privacy-safe summary of the outgoing body for
+              // this sub-call only: does it carry exactly our prompt message
+              // (history stripped, as the generate hook intends), or did the
+              // host ignore the mutation? Counts + needle flags only — never
+              // content. diag:body is last-write-wins (bounded).
               if (pendingAdvisorCalls.size > 0) {
                 const body = await req.clone().text().catch(() => "")
                 if (body) {
@@ -965,6 +1172,29 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                       req.headers.set("x-opencode-session", advisorSid)
                       nonceMatches++
                       log("debug", `attached x-opencode-session for advisor sub-call (kind=${kind})`)
+                      try {
+                        const parsed = JSON.parse(body) as { messages?: unknown; system?: unknown; tools?: unknown }
+                        const messages = Array.isArray(parsed.messages) ? parsed.messages : []
+                        const system =
+                          typeof parsed.system === "string" ? [parsed.system] : Array.isArray(parsed.system) ? parsed.system : []
+                        const tools = parsed.tools && typeof parsed.tools === "object" ? Object.keys(parsed.tools as object).length : 0
+                        const NEEDLES = ["ADVISOR REVIEW by ", "no preamble", "evidence tail", "Retrying once", "role switch declined"]
+                        const needles = NEEDLES.filter((n) => body.includes(n))
+                        void ctx.storage
+                          .set("diag:body", {
+                            kind,
+                            transport: transportUsed,
+                            messages: messages.length,
+                            systemParts: system.length,
+                            tools,
+                            needles,
+                            chars: body.length,
+                            at: Date.now(),
+                          })
+                          .catch(() => {})
+                      } catch {
+                        /* body not JSON — skip the proof capture */
+                      }
                       break
                     }
                   }
@@ -981,13 +1211,15 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         log("warn", "http.request hook unavailable (session-routed providers may refuse advisor calls)", err)
       }
 
-      // --- 4c) generate-kind tool stripping (recursion defense) ---------
-      // session.generate assembles the session's tool catalog unless told
-      // otherwise — including our own `advisor` tool. Correlate EXACTLY via
-      // the evidence nonce in the transient messages (the generate hook
-      // carries full messages, unlike http.request which needs body reads),
-      // and strip tools only for our own sub-calls. All other generate-kind
-      // requests pass through untouched.
+      // --- 4c) generate-kind request isolation (history + recursion) ------
+      // session.generate assembles the session's conversation AND tool
+      // catalog. Left alone, the advisor sub-call receives the caller's
+      // entire transcript on top of our prompt — observed live as role
+      // contamination (the consulted model adopting the executor's identity
+      // and narrating the consultation instead of advising, 2026-09-26).
+      // Correlate EXACTLY via the evidence nonce in the transient messages,
+      // then ISOLATE the request to our prompt: drop history, system parts,
+      // and tools. All other generate-kind requests pass through untouched.
       try {
         const regGen = await Promise.race([
           ctx.session.hook("generate", (event: any) => {
@@ -997,29 +1229,52 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               }
               if (pendingAdvisorCalls.size === 0) return
               const messages = Array.isArray(event?.messages) ? event.messages : []
-              let haystack = ""
-              for (const m of messages) {
+              const textOf = (m: unknown): string => {
                 const c = (m as { content?: unknown })?.content
-                if (typeof c === "string") haystack += c + "\n"
-                else if (Array.isArray(c)) {
-                  for (const p of c) {
-                    const part = p as { text?: unknown }
-                    if (part && typeof part.text === "string") haystack += part.text + "\n"
-                  }
+                if (typeof c === "string") return c
+                if (!Array.isArray(c)) return ""
+                let out = ""
+                for (const p of c) {
+                  const part = p as { text?: unknown }
+                  if (part && typeof part.text === "string") out += part.text + "\n"
                 }
+                return out
               }
               for (const nonce of pendingAdvisorCalls.keys()) {
-                if (haystack.includes(nonce)) {
-                  try {
-                    toolsSeen += Object.keys((event as { tools?: object }).tools ?? {}).length
-                  } catch {
-                    /* introspection failed — proceed to strip */
+                let matched = -1
+                for (let i = messages.length - 1; i >= 0; i--) {
+                  if (textOf(messages[i]).includes(nonce)) {
+                    matched = i
+                    break
                   }
-                  event.tools = {}
-                  toolsStripped++
-                  log("debug", "stripped tools from advisor sub-call (recursion defense)")
-                  break
                 }
+                if (matched < 0) continue
+                const kept = messages[matched]
+                const dropped = messages.length - 1
+                const systemParts = Array.isArray(event?.system) ? event.system.length : 0
+                try {
+                  toolsSeen += Object.keys((event as { tools?: object }).tools ?? {}).length
+                } catch {
+                  /* introspection failed — proceed to strip */
+                }
+                event.tools = {}
+                event.messages = [kept]
+                event.system = []
+                toolsStripped++
+                messagesDropped += dropped
+                systemPartsStripped += systemParts
+                log(
+                  "debug",
+                  `isolated advisor sub-call: kept 1/${messages.length} messages, dropped ${dropped} history, stripped ${systemParts} system parts, tools empty`,
+                )
+                try {
+                  void ctx.storage
+                    .set("diag:generate", { kept: 1, dropped, systemStripped: systemParts, at: Date.now() })
+                    .catch(() => {})
+                } catch {
+                  /* diagnostics only */
+                }
+                break
               }
             } catch (err) {
               log("warn", "generate hook failed (ignored — request proceeds)", err)
@@ -1029,7 +1284,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         ])
         regs.push(regGen)
       } catch (err) {
-        log("warn", "generate hook unavailable (advisor sub-calls may see session tools)", err)
+        log("warn", "generate hook unavailable (advisor sub-calls may see session history/tools)", err)
       }
       // Records which request kinds reach the model layer, including for
       // transient calls. Race-guarded like all unproven hooks.
@@ -1059,7 +1314,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         const tools = await ctx.tool.list()
         const listed = Array.isArray(tools) && tools.some((t: any) => String(t?.id ?? t?.name ?? "") === "advisor")
         if (editorSawAdvisor && listed) {
-          log("info", `ready v${PLUGIN_VERSION} — tool=✓ advisor=${opts.advisor.providerID}/${opts.advisor.id} maxUses/task=${opts.maxUsesPerTask} budget=${opts.adviceWordBudget}w`)
+          log("info", `ready v${PLUGIN_VERSION} — tool=✓ advisor=${opts.advisor.providerID}/${opts.advisor.id} maxUses/task=${opts.maxUsesPerTask} advice=${opts.adviceTokenBudget}t context=${opts.transcriptBudgetTokens}t`)
         } else {
           log("error", `SELF-PROBE WEAK: editorSaw=${editorSawAdvisor} listed=${listed} — the tool may register without dispatching (host issue class #44788). Consults will warn if hooks never deliver.`)
         }

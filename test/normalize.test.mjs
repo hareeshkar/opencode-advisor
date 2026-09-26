@@ -1,6 +1,6 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { normalizeV1Messages, normalizeV2Transcript, createV1Hooks } from "../dist/opencode-advisor.js"
+import { createV1Hooks, frameAdvice, isAdvisorOutputFrame, normalizeV1Messages, normalizeV2Transcript } from "../dist/opencode-advisor.js"
 
 /* ---------------- V2 ---------------- */
 
@@ -127,7 +127,58 @@ test("V1 messages normalize text and completed tool output, skip partials", () =
   assert.ok(!slices.some((s) => s.text === "half"))
 })
 
-test("V1 two sequential sessions each receive the timing prompt", async () => {
+/* ---------------- evidence hygiene ---------------- */
+
+test("V2 evidence hygiene: in-flight trailing assistant draft is dropped", () => {
+  const slices = normalizeV2Transcript([
+    { type: "user", text: "fix the bug" },
+    { type: "assistant", content: [{ type: "text", text: "Completed prior turn." }] },
+    { type: "user", text: "now also the parser" },
+    { type: "assistant", content: [{ type: "text", text: "I'm halfway through a senten" }] },
+  ])
+  assert.equal(slices.length, 3)
+  assert.ok(!slices.some((s) => s.text.startsWith("I'm halfway")), "current-turn draft is not evidence")
+  assert.ok(slices.some((s) => s.text === "Completed prior turn."), "completed prior turns survive")
+})
+
+test("V2 evidence hygiene: framed advisor replies never re-enter the evidence", () => {
+  const framed = frameAdvice("1. Do X.", "zai-coding-plan/glm-5.3")
+  const slices = normalizeV2Transcript([
+    { type: "user", text: "fix the bug" },
+    {
+      type: "assistant",
+      content: [
+        { type: "tool", name: "advisor", state: { status: "completed", content: [{ type: "text", text: framed }] } },
+      ],
+    },
+    { type: "shell", text: framed },
+  ])
+  assert.equal(slices.length, 1, "only the user slice remains")
+  assert.equal(slices[0].role, "user")
+  assert.equal(slices[0].text, "fix the bug")
+  assert.ok(!slices.some((s) => s.text.includes("ADVISOR REVIEW")), "advisor frames never re-enter evidence")
+  assert.equal(isAdvisorOutputFrame(framed), true)
+  assert.equal(isAdvisorOutputFrame("ordinary guidance"), false)
+})
+
+test("V2 evidence hygiene never empties the transcript (single-slice guard)", () => {
+  const slices = normalizeV2Transcript([{ type: "assistant", content: [{ type: "text", text: "only slice" }] }])
+  assert.equal(slices.length, 1, "at least one slice is always kept")
+})
+
+test("V1 evidence hygiene: trailing draft and framed advisor output are dropped too", () => {
+  const framed = frameAdvice("OLD ADVICE BODY", "p/a")
+  const slices = normalizeV1Messages([
+    { info: { role: "user" }, parts: [{ type: "text", text: "V1_TASK" }] },
+    { info: { role: "assistant" }, parts: [{ type: "tool", tool: "advisor", state: { status: "completed", output: framed } }] },
+    { info: { role: "assistant" }, parts: [{ type: "text", text: "half-finished senten" }] },
+  ])
+  assert.deepEqual(slices, [{ role: "user", text: "V1_TASK" }])
+})
+
+/* ---------------- V1 hooks ---------------- */
+
+test("V1 is manual-only: no system injection without a request; directives deliver once", async () => {
   const hooks = await createV1Hooks(
     {},
     {
@@ -137,12 +188,24 @@ test("V1 two sequential sessions each receive the timing prompt", async () => {
   )
   const chat = hooks["chat.message"]
   const sys = hooks["experimental.chat.system.transform"]
-  await chat({ sessionID: "A" })
+
+  // Plain messages in two sequential sessions: no timing prompt, no nudge, nothing.
+  await chat({ sessionID: "A" }, { parts: [{ type: "text", text: "fix the bug" }] })
   const outA = { system: [] }
   await sys({ sessionID: "A", model: { providerID: "p", id: "flash-x" } }, outA)
-  assert.ok(outA.system.some((s) => s.includes("Advisor usage")), "session A gets timing")
-  await chat({ sessionID: "B" })
+  assert.deepEqual(outA.system, [], "session A: nothing is injected without a request")
+
+  await chat({ sessionID: "B" }, { parts: [{ type: "text", text: "write the docs" }] })
   const outB = { system: [] }
   await sys({ sessionID: "B", model: { providerID: "p", id: "flash-x" } }, outB)
-  assert.ok(outB.system.some((s) => s.includes("Advisor usage")), "session B still gets timing (no * bucket staleness)")
+  assert.deepEqual(outB.system, [], "session B: manual-only (no cross-session timing leakage)")
+
+  // A trigger-word request still queues a transient, one-shot directive.
+  await chat({ sessionID: "A" }, { parts: [{ type: "text", text: "I need advice on the deploy" }] })
+  const outA2 = { system: [] }
+  await sys({ sessionID: "A", model: { providerID: "p", id: "flash-x" } }, outA2)
+  assert.ok(outA2.system.some((s) => s.includes("[advisor requested")), "requested directive delivered")
+  const outA3 = { system: [] }
+  await sys({ sessionID: "A", model: { providerID: "p", id: "flash-x" } }, outA3)
+  assert.deepEqual(outA3.system, [], "delivered once, then consumed")
 })

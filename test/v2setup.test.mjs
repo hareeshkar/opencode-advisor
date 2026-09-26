@@ -1,9 +1,17 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
+import { mkdtempSync } from "node:fs"
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { createV2Plugin } from "../dist/opencode-advisor.js"
 
 /** Minimal fake V2 plugin context — exercises setup wiring end to end. */
 function makeCtx(overrides = {}) {
+  // Isolate config files per test: a fresh XDG home + a fresh project dir, so
+  // no test can see another test's (or the developer's) advisor config.
+  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "advisor-home-"))
+  const projectDir = mkdtempSync(join(tmpdir(), "advisor-project-"))
   const captured = {
     tools: [],
     promptHooks: [],
@@ -14,9 +22,13 @@ function makeCtx(overrides = {}) {
     storage: new Map(),
     rpcHandlers: new Map(),
     switchModelCalls: [],
+    generateHooks: [],
+    generateTextInputs: [],
+    generateEvents: [],
   }
   const ctx = {
     options: { advisor: { providerID: "p", id: "a" }, logLevel: "error" },
+    location: { directory: projectDir },
     storage: {
       get: async (k) => captured.storage.get(k),
       set: async (k, v) => {
@@ -29,11 +41,29 @@ function makeCtx(overrides = {}) {
     },
     session: {
       context: async () => [{ type: "user", text: "do the thing" }],
-      generate: async () => ({ text: "GENERATED-ADVICE" }),
+      generate: async (args) => {
+        // Mirror the host: a session-scoped generate carries the session's
+        // conversation. Registered generate hooks (isolation) run on the
+        // event BEFORE the request is modeled — capture the post-hook event.
+        let event = {
+          sessionID: args.sessionID,
+          messages: [
+            { role: "user", content: "HISTORY-SECRET meta narration, no preamble, evidence tail" },
+            { role: "assistant", content: "executor draft tail" },
+            { role: "user", content: args.prompt },
+          ],
+          system: [{ type: "text", text: "AGENT-SYSTEM-PROMPT" }],
+          tools: { advisor: { description: "x", input: {} } },
+        }
+        for (const hook of captured.generateHooks) await hook(event)
+        captured.generateEvents.push(event)
+        return { text: "GENERATED-ADVICE" }
+      },
       hook: async (name, cb) => {
         if (name === "prompt") captured.promptHooks.push(cb)
         if (name === "context") captured.contextHooks.push(cb)
         if (name === "http.request") captured.httpHooks.push(cb)
+        if (name === "generate") captured.generateHooks.push(cb)
         return { dispose: async () => {} }
       },
       prompt: async (args) => {
@@ -75,7 +105,10 @@ function makeCtx(overrides = {}) {
       ],
     },
     generate: {
-      text: async () => ({ text: "UNUSED" }),
+      text: async (input) => {
+        captured.generateTextInputs.push(input)
+        return { text: "GENERATED-ADVICE" }
+      },
     },
     ...overrides,
   }
@@ -86,8 +119,9 @@ test("setup registers the advisor tool and both commands", async () => {
   const { ctx, captured } = makeCtx()
   const plugin = createV2Plugin()
   const cleanup = await plugin.setup(ctx)
-  assert.equal(captured.tools.length, 1)
+  assert.equal(captured.tools.length, 2)
   assert.equal(captured.tools[0].name, "advisor")
+  assert.equal(captured.tools[1].name, "advisor_status")
   assert.ok(captured.tools[0].description.length > 20)
   assert.deepEqual(
     captured.commands.map((c) => c.name).sort(),
@@ -184,32 +218,97 @@ test("/advisor with no focus uses one short line", async () => {
   assert.equal(captured.prompts[0].text, "Review the current task with the advisor.")
 })
 
-test("RPC set hot-swaps the advisor model and persists an override", async () => {
+test("RPC set writes the config file, hot-swaps the model; reset restores the deployment default", async () => {
   const { ctx, captured } = makeCtx()
   await createV2Plugin().setup(ctx)
   const rpc = captured.rpcHandlers.get("opencode-advisor")
   assert.ok(rpc, "rpc registered")
 
-  const before = await rpc.get()
-  assert.equal(before.source, "config")
-  assert.equal(before.providerID, "p")
+  const before = await rpc.get({})
+  assert.equal(before.config.source, "deployment")
+  assert.equal(before.config.providerID, "p")
 
+  // Legacy pre-0.7 picker payload → written to the GLOBAL config file.
   const updated = await rpc.set({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
-  assert.deepEqual(updated, { providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
-  const after = await rpc.get()
-  assert.equal(after.source, "override")
-  assert.equal(captured.storage.get("advisor:override").providerID, "zai-coding-plan")
+  assert.equal(updated.config.providerID, "zai-coding-plan")
+  assert.equal(updated.config.source, "global")
+  const globalFile = join(process.env.XDG_CONFIG_HOME, "opencode", "opencode-advisor.json")
+  assert.deepEqual(JSON.parse(await readFile(globalFile, "utf8")), {
+    advisor: { providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" },
+  })
 
-  // next consult: the sandwich switches the session to the OVERRIDE model
+  // next consult: the DIRECT transport carries the NEW model — no restart,
+  // and the session model is never touched (the sandwich is fallback-only)
   await captured.tools[0].execute({}, { sessionID: "s9", signal: new AbortController().signal })
-  const switched = captured.switchModelCalls.find((c) => c.model.providerID === "zai-coding-plan")
-  assert.ok(switched, "override model used for the sub-call")
-  assert.equal(switched.model.id, "glm-5.3")
-  assert.equal(switched.model.variant, "high")
+  const direct = captured.generateTextInputs.find((i) => i.model?.providerID === "zai-coding-plan")
+  assert.ok(direct, "new model used for the direct sub-call")
+  assert.equal(direct.model.id, "glm-5.3")
+  assert.equal(direct.model.variant, "high")
+  assert.equal(captured.switchModelCalls.length, 0, "review consults never switch the session model")
 
-  const reset = await rpc.reset()
-  assert.equal(reset.providerID, "p")
-  assert.equal(captured.storage.get("advisor:override"), undefined)
+  // reset clears the file keys → deployment default returns immediately
+  const reset = await rpc.reset({})
+  assert.equal(reset.config.providerID, "p")
+  assert.equal(reset.config.source, "deployment")
+  assert.deepEqual(JSON.parse(await readFile(globalFile, "utf8")), {})
+  assert.equal(captured.storage.get("advisor:override"), undefined, "the storage override is retired")
+})
+
+test("manual config file edits are picked up by the settings RPC without restart", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  const target = join(ctx.location.directory, ".opencode", "opencode-advisor.json")
+  await mkdir(join(ctx.location.directory, ".opencode"), { recursive: true })
+  await writeFile(target, JSON.stringify({ preset: "thorough" }))
+
+  const out = await rpc.get({})
+  assert.equal(out.config.preset, "thorough")
+  assert.equal(out.config.maxUsesPerTask, 5, "preset expansion applied from the file")
+  assert.equal(out.tiers.preset, "project")
+  assert.equal(out.files.project, target, "provenance points at the project file")
+})
+
+test("settings RPC validates drafts before touching disk", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  await assert.rejects(() => rpc.set({ doc: { maxUsesPerTask: 999 }, scope: "project" }), /maxUsesPerTask/)
+  const entries = await readdir(join(ctx.location.directory, ".opencode")).catch(() => [])
+  assert.deepEqual(entries, [], "no file was created for an invalid draft")
+})
+
+test("settings RPC: a draft saves to the project file; reset clears known keys only", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  const target = join(ctx.location.directory, ".opencode", "opencode-advisor.json")
+
+  const out = await rpc.set({ doc: { preset: "economy", myOwnNote: "keep me" }, scope: "project" })
+  assert.equal(out.config.maxUsesPerTask, 1, "economy preset applied immediately")
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { preset: "economy", myOwnNote: "keep me" })
+
+  // "Inherit" support: null removes a key from the file in the same write.
+  const inherited = await rpc.set({ doc: { preset: null, advisorMode: "agent" }, scope: "project" })
+  assert.equal(inherited.config.preset, "", "preset key removed")
+  assert.equal(inherited.config.advisorMode, "agent", "explicit value written in the same pass")
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { myOwnNote: "keep me", advisorMode: "agent" })
+
+  const reset = await rpc.reset({ scope: "project" })
+  assert.equal(reset.config.maxUsesPerTask, 3, "back to defaults")
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { myOwnNote: "keep me" }, "unknown keys survive reset")
+})
+
+test("setup migrates a pre-0.7 stored pick into the global file once", async () => {
+  const { ctx, captured } = makeCtx()
+  captured.storage.set("advisor:override", { providerID: "z", id: "glm-9", variant: "max" })
+  await createV2Plugin().setup(ctx)
+  assert.equal(captured.storage.get("advisor:override"), undefined, "storage key retired")
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  const out = await rpc.get({})
+  assert.equal(out.config.providerID, "z")
+  assert.equal(out.config.variant, "max")
+  assert.equal(out.config.source, "global", "migrated pick lives in the global file")
 })
 
 test("/advisor-settings composes a lean shortlist and config-edit instruction", async () => {
@@ -232,8 +331,9 @@ test("/advisor-settings composes a lean shortlist and config-edit instruction", 
 test("unconfigured install loads safely and the tool teaches setup", async () => {
   const { ctx, captured } = makeCtx({ options: { logLevel: "error" } })
   await createV2Plugin().setup(ctx)
-  assert.equal(captured.tools.length, 1, "tool still registers so errors can teach")
-  const result = await captured.tools[0].execute({}, { sessionID: "s-nc", signal: new AbortController().signal })
+  assert.equal(captured.tools.length, 2, "tool still registers so errors can teach")
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const result = await advisorTool.execute({}, { sessionID: "s-nc", signal: new AbortController().signal })
   assert.ok(result.content.includes("not_configured"), "error code surfaced")
   assert.ok(result.content.includes("/advisor-settings"), "settings step present")
   assert.ok(result.content.includes("opencode.json"), "declarative step present")
@@ -248,11 +348,36 @@ test("unconfigured install injects no timing guidance (token discipline)", async
   assert.equal(sys.system.length, 0, "nothing injected while unconfigured")
 })
 
+test("GUARANTEE: no explicit request ⇒ nothing injected and no advisor sub-call", async () => {
+  const { ctx, captured } = makeCtx()
+  let generateCalls = 0
+  ctx.session.generate = async () => {
+    generateCalls++
+    return { text: "SHOULD-NOT-RUN" }
+  }
+  await createV2Plugin().setup(ctx)
+
+  // An ordinary prompt (no trigger word, no /advisor): nothing is queued.
+  await captured.promptHooks[0]({ sessionID: "s-quiet", prompt: { text: "deploy the cache" } })
+  const ctxEvent = { sessionID: "s-quiet", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
+  await captured.contextHooks[0](ctxEvent)
+  assert.equal(ctxEvent.system.length, 0, "context hook pushes nothing")
+
+  const raw = JSON.stringify({ model: "m", system: "base", messages: [{ role: "user", content: "deploy" }] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: raw })
+  const httpEvent = { sessionID: "s-quiet", kind: "primary", request }
+  await captured.httpHooks[0](httpEvent)
+  assert.equal(httpEvent.request, request, "request object untouched")
+  assert.equal(await httpEvent.request.clone().text(), raw, "request body byte-identical")
+  assert.equal(generateCalls, 0, "no advisor sub-call was made")
+  assert.equal(captured.prompts.length, 0, "no synthetic prompt was submitted")
+})
+
 test("agent mode spawns a read-only child session, polls to idle, returns its advice", async () => {
   const adviceText = "AGENT-GROUNDED-ADVICE: verified in engine.ts line 42."
   let childID = ""
   const { ctx, captured } = makeCtx()
-  ctx.options = { advisor: { providerID: "zai-coding-plan", id: "glm-5.3" }, logLevel: "error", advisorMode: "agent", timeoutMs: 20_000 }
+  ctx.options = { advisor: { providerID: "zai-coding-plan", id: "glm-5.3" }, logLevel: "error", advisorMode: "agent", maxConsultMs: 30_000 }
   ctx.session.create = async (input) => {
     captured.createInput = input
     childID = "ses_child_agent"
@@ -284,14 +409,19 @@ test("agent mode spawns a read-only child session, polls to idle, returns its ad
 
   const childPrompt = captured.prompts.find((p) => p.sessionID === "ses_child_agent")
   assert.ok(childPrompt, "child prompted")
-  assert.ok(childPrompt.text.startsWith("You are the ADVISOR operating in AGENT MODE"), "agent prefix present")
+  assert.ok(
+    childPrompt.text.startsWith("You are the ADVISOR operating in REVIEW + AGENT mode"),
+    "agent prefix names the MAP/TERRITORY mechanism",
+  )
+  assert.ok(childPrompt.text.includes("MAP"), "conversation framed as the map")
+  assert.ok(childPrompt.text.includes("TERRITORY"), "tools framed as the territory")
   assert.ok(childPrompt.text.includes("<transcript-"), "transcript forwarded for grounding")
 })
 
 test("nested advisor sessions are refused (recursion guard)", async () => {
   let childID = "ses_child_nested"
   const { ctx, captured } = makeCtx()
-  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorMode: "agent", timeoutMs: 20_000 }
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorMode: "agent", maxConsultMs: 30_000 }
   ctx.session.create = async () => ({ id: childID })
   ctx.session.remove = async () => {}
   ctx.session.prompt = async (args) => {
@@ -320,3 +450,232 @@ test("GUARANTEE: the executor receives ONLY the framed advice — never transcri
   assert.ok(result.content.startsWith("ADVISOR REVIEW by "), "only the framed advice")
   assert.ok(result.content.length < 600, `advice is small (${result.content.length} chars), not a transcript dump`)
 })
+
+test("review consults are history-less: the direct transport never touches the session", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  await captured.tools[0].execute({}, { sessionID: "s-direct", signal: new AbortController().signal })
+  assert.equal(captured.generateTextInputs.length, 1, "direct transport used")
+  assert.equal(captured.switchModelCalls.length, 0, "no session model switch")
+  assert.equal(captured.generateEvents.length, 0, "session.generate never ran — no history channel exists")
+})
+
+test("fallback sandwich is isolated too: history, system parts, and tools are stripped", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.generate.text = async () => {
+    throw new Error("routing unavailable")
+  }
+  await createV2Plugin().setup(ctx)
+  const result = await captured.tools[0].execute({}, { sessionID: "s-fb", signal: new AbortController().signal })
+  assert.ok(result.content.includes("GENERATED-ADVICE"), "sandwich delivered the advice")
+
+  const event = captured.generateEvents[0]
+  assert.ok(event, "generate hook saw the sandwich request")
+  assert.equal(event.messages.length, 1, "history stripped — only the advisor prompt remains")
+  assert.ok(String(event.messages[0].content).includes("<transcript-"), "the kept message is the advisor prompt")
+  assert.ok(!JSON.stringify(event.messages).includes("HISTORY-SECRET"), "no history leakage into the request")
+  assert.equal(event.system.length, 0, "agent/system prompt stripped")
+  assert.equal(Object.keys(event.tools).length, 0, "tools stripped (recursion defense)")
+  const diag = captured.storage.get("diag:generate")
+  assert.ok(diag, "isolation ledger written")
+  assert.equal(diag.kept, 1)
+  assert.equal(diag.dropped, 2)
+  assert.equal(diag.systemStripped, 1)
+})
+
+test("async consults: long advisor work returns RUNNING, then delivers automatically", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000, maxUsesPerTask: 1 }
+  let release
+  ctx.generate.text = async () => {
+    await new Promise((r) => { release = r })
+    return { text: "LATE-ARRIVING ADVICE" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const statusTool = captured.tools.find((t) => t.name === "advisor_status")
+
+  const running = await advisorTool.execute({}, { sessionID: "s-async", signal: new AbortController().signal })
+  assert.ok(running.content.includes("ADVISOR CONSULT RUNNING"), "sync wait expiry returns RUNNING")
+  assert.ok(running.content.includes("You do not need to start another consultation."), "explicit promise present")
+  assert.ok(running.content.includes("id: "), "consult id present")
+
+  const statusRunning = await statusTool.execute({}, { sessionID: "s-async", signal: new AbortController().signal })
+  assert.ok(statusRunning.content.includes("RUNNING"), "status shows the running consult")
+
+  release()
+  await new Promise((r) => setTimeout(r, 40))
+  const statusDone = await statusTool.execute({}, { sessionID: "s-async", signal: new AbortController().signal })
+  assert.ok(statusDone.content.includes("COMPLETED"), "status shows completed")
+  assert.ok(statusDone.content.includes("LATE-ARRIVING ADVICE"), "status replays the advice")
+
+  // auto-delivery: the advice rides the native injection channel on the next model call
+  await captured.contextHooks[0]({ sessionID: "s-async", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: JSON.stringify({ system: "s", messages: [] }) })
+  const ev = { sessionID: "s-async", kind: "primary", request }
+  await captured.httpHooks[0](ev)
+  const body = await ev.request.clone().text()
+  assert.ok(body.includes("LATE-ARRIVING ADVICE"), "advice auto-delivered on the next model call")
+
+  // the delivered consult consumed the cap exactly once
+  const second = await advisorTool.execute({}, { sessionID: "s-async", signal: new AbortController().signal })
+  assert.ok(second.content.includes("max_uses_exceeded"), "delivered advice consumed the cap once")
+
+  // N3 regression: a pre-dispatch policy rejection gets NO terminal notice
+  // injected (the tool result already carried the error synchronously)
+  await captured.contextHooks[0]({ sessionID: "s-async", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+  const request2 = new Request("http://example.test/v1/messages", { method: "POST", body: JSON.stringify({ system: "s", messages: [] }) })
+  const ev2 = { sessionID: "s-async", kind: "primary", request: request2 }
+  await captured.httpHooks[0](ev2)
+  const body2 = await ev2.request.clone().text()
+  assert.ok(!body2.includes("ADVISOR NOT RUNNING"), "no phantom failure notice for a policy rejection")
+})
+
+test("async consults: concurrency guard rejects the third without consuming the cap", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
+  const resolvers = []
+  let gCalls = 0
+  ctx.generate.text = async () => {
+    gCalls++
+    if (gCalls <= 2) {
+      await new Promise((r) => resolvers.push(r))
+      return { text: "LATE" }
+    }
+    return { text: "LATE" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const first = await advisorTool.execute({}, { sessionID: "s-a1", signal: new AbortController().signal })
+  const second = await advisorTool.execute({}, { sessionID: "s-a2", signal: new AbortController().signal })
+  const third = await advisorTool.execute({}, { sessionID: "s-a3", signal: new AbortController().signal })
+  assert.ok(first.content.includes("ADVISOR CONSULT RUNNING"), "first backgrounded")
+  assert.ok(second.content.includes("ADVISOR CONSULT RUNNING"), "second backgrounded")
+  assert.ok(third.content.includes("maximum 2 consultations already running"), "third rejected explicitly")
+  resolvers.forEach((r) => r()) // release both held consults
+  await new Promise((r) => setTimeout(r, 30))
+  const followup = await advisorTool.execute({}, { sessionID: "s-a4", signal: new AbortController().signal })
+  assert.ok(followup.content.includes("LATE"), "the rejected consult consumed nothing — a fresh consult works")
+  await new Promise((r) => setTimeout(r, 20))
+  const after = captured.tools.find((t) => t.name === "advisor_status")
+  void after
+  // releasing lets both finish; the ledger holds two completed consults
+  const health = captured.storage.get("diag:health")
+  void health
+})
+
+test("tool-signal abort does not kill a backgrounded consult (lifecycle independence)", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
+  let release
+  ctx.generate.text = async () => {
+    await new Promise((r) => { release = r })
+    return { text: "LATE" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const statusTool = captured.tools.find((t) => t.name === "advisor_status")
+  const controller = new AbortController()
+  const running = await advisorTool.execute({}, { sessionID: "s-sig", signal: controller.signal })
+  assert.ok(running.content.includes("ADVISOR CONSULT RUNNING"), "sync wait expiry returns RUNNING")
+  controller.abort() // the executor's turn "ends" — must NOT kill the consult
+  release()
+  await new Promise((r) => setTimeout(r, 40))
+  const status = await statusTool.execute({}, { sessionID: "s-sig", signal: new AbortController().signal })
+  assert.ok(status.content.includes("COMPLETED"), "consult survived the tool-signal abort")
+  assert.ok(status.content.includes("LATE"), "advice recorded")
+})
+
+test("ceiling expiry fails the consult without consuming the cap", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 1_000 }
+  let calls = 0
+  ctx.generate.text = async () => {
+    calls++
+    if (calls === 1) await new Promise(() => {}) // hang past the ceiling
+    return { text: "NEVER-SEEN" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const statusTool = captured.tools.find((t) => t.name === "advisor_status")
+  await advisorTool.execute({}, { sessionID: "s-ceiling", signal: new AbortController().signal })
+  await new Promise((r) => setTimeout(r, 1_300)) // ceiling (1s) passes → engine timeout → failed
+  const status = await statusTool.execute({}, { sessionID: "s-ceiling", signal: new AbortController().signal })
+  assert.ok(status.content.includes("FAILED"), "ceiling expiry marked failed")
+  assert.ok(status.content.includes("advisor_not_running"), "advisor_not_running wording")
+  const ok = await advisorTool.execute({}, { sessionID: "s-ceiling2", signal: new AbortController().signal })
+  assert.ok(ok.content.includes("NEVER-SEEN"), "cap NOT consumed by the expired consult")
+})
+
+test("backgrounded failures are delivered too — the executor learns the consult died", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
+  let directCalls = 0
+  let sandwichCalls = 0
+  ctx.generate.text = async () => {
+    directCalls++
+    if (directCalls === 1) {
+      await new Promise((r) => setTimeout(r, 400))
+      throw new Error("provider connection reset")
+    }
+    return { text: "RECOVERED" }
+  }
+  ctx.session.generate = async () => {
+    sandwichCalls++
+    if (sandwichCalls === 1) {
+      await new Promise((r) => setTimeout(r, 400))
+      throw new Error("provider connection reset")
+    }
+    return { text: "RECOVERED" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+
+  const running = await advisorTool.execute({}, { sessionID: "s-fail", signal: new AbortController().signal })
+  assert.ok(running.content.includes("ADVISOR CONSULT RUNNING"), "backgrounded")
+  await new Promise((r) => setTimeout(r, 900)) // primary fails at ~400ms → fallback fails at ~800ms → failure injected
+
+  await captured.contextHooks[0]({ sessionID: "s-fail", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: JSON.stringify({ system: "s", messages: [] }) })
+  const ev = { sessionID: "s-fail", kind: "primary", request }
+  await captured.httpHooks[0](ev)
+  const body = await ev.request.clone().text()
+  assert.ok(body.includes("ADVISOR NOT RUNNING"), "terminal failure delivered to the executor")
+  assert.ok(body.includes("provider connection reset"), "reason named")
+  assert.ok(body.includes("cap was not consumed"), "no-cap-consumption promise kept")
+
+  // recovery: the next consult succeeds and consumes the cap once
+  const ok = await advisorTool.execute({}, { sessionID: "s-fail2", signal: new AbortController().signal })
+  assert.ok(ok.content.includes("RECOVERED"), "recovered after the failure")
+})
+
+test("broken config at dispatch returns a framed config error — never a stale consult", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const dir = join(ctx.location.directory, ".opencode")
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, "opencode-advisor.json"), "{ broken json")
+  const result = await advisorTool.execute({}, { sessionID: "s-cfg", signal: new AbortController().signal })
+  assert.ok(result.content.includes("advisor_config_error"), "framed config error")
+  assert.ok(result.content.includes("invalid JSON"), "config problem named")
+  assert.ok(!result.content.includes("ADVISOR REVIEW"), "no consult ran against unknown config")
+})
+
+test("fast consults deliver inline — no double injection (reviewer finding 1)", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const ok = await advisorTool.execute({}, { sessionID: "s-fast", signal: new AbortController().signal })
+  assert.ok(ok.content.includes("GENERATED-ADVICE"), "sync framed advice delivered in the tool result")
+  await captured.contextHooks[0]({ sessionID: "s-fast", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: JSON.stringify({ system: "s", messages: [] }) })
+  const ev = { sessionID: "s-fast", kind: "primary", request }
+  await captured.httpHooks[0](ev)
+  const body = await ev.request.clone().text()
+  assert.ok(!body.includes("GENERATED-ADVICE"), "no double delivery via the injection channel")
+  const statusTool = captured.tools.find((t) => t.name === "advisor_status")
+  const status = await statusTool.execute({}, { sessionID: "s-fast", signal: new AbortController().signal })
+  assert.ok(status.content.includes("delivery inline"), "ledger records inline delivery")
+})
+

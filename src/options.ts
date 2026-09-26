@@ -11,19 +11,47 @@ import type { AdvisorModelRef, AdvisorOptions, AdvisorSource, LogLevel } from ".
 
 const ENV = process.env as Record<string, string | undefined>
 
+/** Dedicated config file names, lowest → highest precedence. */
+export const CONFIG_FILE_RELATIVE = "opencode-advisor.json"
+
+/** Shallow-merge config layers (later layers win per top-level key). Set
+ *  whole nested objects (advisor/source) in one place to stay predictable. */
+export function mergeAdvisorConfigLayers(layers: Array<unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const layer of layers) {
+    if (layer === null || typeof layer !== "object" || Array.isArray(layer)) continue
+    for (const [k, v] of Object.entries(layer as Record<string, unknown>)) {
+      if (v !== undefined) out[k] = v
+    }
+  }
+  return out
+}
+
+/** Non-technical presets: a single word tunes the whole cost/quality curve.
+ *  Tokens are the native unit: context tokens = what the advisor receives
+ *  (converted to chars for the pruner at ~4 chars/token); advice tokens =
+ *  the response budget instructed in the prompt and hard-capped at ~4
+ *  chars/token. Numbers are deliberately generous — advice output is the
+ *  cheapest part of a consult. */
+export const PRESETS: Record<string, Partial<Record<string, unknown>>> = {
+  economy: { maxUsesPerTask: 1, transcriptBudgetTokens: "8k", adviceTokenBudget: 4_000 },
+  balanced: { maxUsesPerTask: 3, transcriptBudgetTokens: "16k", adviceTokenBudget: 8_000 },
+  thorough: { maxUsesPerTask: 5, transcriptBudgetTokens: "32k", adviceTokenBudget: 16_000 },
+  exhaustive: { maxUsesPerTask: 8, transcriptBudgetTokens: "64k", adviceTokenBudget: 32_000 },
+}
+
 export const DEFAULTS = {
   advisor: { providerID: "", id: "" } as AdvisorModelRef,
   maxUsesPerTask: 3,
-  adviceWordBudget: 120,
-  timeoutMs: 90_000,
+  adviceTokenBudget: 8_000,
+  advisorResponseWaitMs: 90_000,
+  maxConsultMs: 3_600_000,
   maxToolOutputChars: 1_500,
-  // 32k chars ≈ 8k tokens: balanced default — the recency-weighted excerpt
-  // plus original-task pinning preserves signal at roughly ⅔ the cost of 48k
-  // (efficiency review F-ledger; tune per workload).
-  transcriptBudgetChars: 32_000,
-  nudge: "off" as const,
+  // 16k tokens ≈ 64k chars: balanced default — the recency-weighted excerpt
+  // plus original-task pinning preserves signal at roughly ⅔ the cost of a
+  // larger window (efficiency review F-ledger; tune per workload).
+  transcriptBudgetTokens: 16_000,
   advisorMode: "review" as const,
-  injectTimingPrompt: true,
   logLevel: "info" as const,
 }
 
@@ -44,6 +72,23 @@ function readInt(rec: Record<string, unknown>, key: string, min: number, max: nu
     throw new Error(`[advisor] option "${key}" must be between ${min} and ${max}, got ${v}`)
   }
   return i
+}
+
+/** Human-friendly sizes: 32000 | "32k" | "1.5k" | "2m" (1000-based; chars). */
+function readSize(rec: Record<string, unknown>, key: string, min: number, max: number): number | undefined {
+  const v = rec[key]
+  if (v === undefined) return undefined
+  let n: number | undefined
+  if (typeof v === "number" && Number.isFinite(v)) n = Math.floor(v)
+  else if (typeof v === "string") {
+    const m = /^(\d+(?:\.\d+)?)\s*([kKmM])?$/.exec(v.trim())
+    if (m) n = Math.floor(Number.parseFloat(m[1]!) * (m[2] ? (m[2].toLowerCase() === "k" ? 1_000 : 1_000_000) : 1))
+  }
+  if (n === undefined) {
+    throw new Error(`[advisor] option "${key}" must be a number or size like "64k"/"1.5m", got ${JSON.stringify(v)}`)
+  }
+  if (n < min || n > max) throw new Error(`[advisor] option "${key}" must be between ${min} and ${max}, got ${v}`)
+  return n
 }
 
 function readModelRef(v: unknown, label: string): AdvisorModelRef {
@@ -82,6 +127,14 @@ function readLogLevel(v: unknown): LogLevel | undefined {
   return v === "debug" || v === "info" || v === "warn" || v === "error" ? v : undefined
 }
 
+/** Config-level mode ids. "agent" is the Review + Agent mechanism; the
+ *  explicit "review-agent" alias keeps the JSON self-documenting. */
+export function normalizeAdvisorMode(value: string): "review" | "agent" | undefined {
+  if (value === "review") return "review"
+  if (value === "agent" || value === "review-agent" || value === "review+agent") return "agent"
+  return undefined
+}
+
 /** Resolve the full option set. Throws with a precise message on invalid input. */
 export function resolveOptions(raw: unknown): AdvisorOptions {
   if (Array.isArray(raw)) {
@@ -92,13 +145,12 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   // 1. defaults
   let advisor = DEFAULTS.advisor
   let maxUsesPerTask = DEFAULTS.maxUsesPerTask
-  let adviceWordBudget = DEFAULTS.adviceWordBudget
-  let timeoutMs = DEFAULTS.timeoutMs
+  let adviceTokenBudget = DEFAULTS.adviceTokenBudget
+  let advisorResponseWaitMs = DEFAULTS.advisorResponseWaitMs
+  let maxConsultMs = DEFAULTS.maxConsultMs
   let maxToolOutputChars = DEFAULTS.maxToolOutputChars
-  let transcriptBudgetChars = DEFAULTS.transcriptBudgetChars
-  let nudge: AdvisorOptions["nudge"] = DEFAULTS.nudge
+  let transcriptBudgetTokens = DEFAULTS.transcriptBudgetTokens
   let advisorMode: AdvisorOptions["advisorMode"] = DEFAULTS.advisorMode
-  let injectTimingPrompt = DEFAULTS.injectTimingPrompt
   let logLevel: LogLevel = DEFAULTS.logLevel
   let source: AdvisorSource | undefined
 
@@ -117,10 +169,9 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     logLevel = lv
   }
   if (ENV.ADVISOR_MODE) {
-    if (ENV.ADVISOR_MODE !== "review" && ENV.ADVISOR_MODE !== "agent") {
-      throw new Error(`[advisor] ADVISOR_MODE must be review|agent, got "${ENV.ADVISOR_MODE}"`)
-    }
-    advisorMode = ENV.ADVISOR_MODE
+    const mode = normalizeAdvisorMode(ENV.ADVISOR_MODE)
+    if (!mode) throw new Error(`[advisor] ADVISOR_MODE must be review|agent|review-agent, got "${ENV.ADVISOR_MODE}"`)
+    advisorMode = mode
   }
   if (ENV.ADVISOR_SOURCE_KIND) {
     source = readSource({
@@ -137,19 +188,38 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   const optSource = readSource(opts.source)
   if (optSource !== undefined) source = optSource
 
-  maxUsesPerTask = readInt(opts, "maxUsesPerTask", 1, 50) ?? maxUsesPerTask
-  adviceWordBudget = readInt(opts, "adviceWordBudget", 20, 1000) ?? adviceWordBudget
-  timeoutMs = readInt(opts, "timeoutMs", 1_000, 600_000) ?? timeoutMs
-  maxToolOutputChars = readInt(opts, "maxToolOutputChars", 100, 200_000) ?? maxToolOutputChars
-  transcriptBudgetChars = readInt(opts, "transcriptBudgetChars", 2_000, 2_000_000) ?? transcriptBudgetChars
-  const optNudge = readString(opts, "nudge")
-  if (optNudge !== undefined) {
-    if (optNudge !== "auto" && optNudge !== "on" && optNudge !== "off") {
-      throw new Error(`[advisor] option "nudge" must be auto|on|off, got "${optNudge}"`)
+  // Preset first (non-technical), then explicit options override it.
+  const presetName = readString(opts, "preset")
+  if (presetName !== undefined) {
+    const preset = PRESETS[presetName]
+    if (!preset) {
+      throw new Error(`[advisor] option "preset" must be one of: ${Object.keys(PRESETS).join(", ")} — got "${presetName}"`)
     }
-    nudge = optNudge
+    if (preset.maxUsesPerTask !== undefined) maxUsesPerTask = preset.maxUsesPerTask as number
+    if (preset.transcriptBudgetTokens !== undefined) {
+      transcriptBudgetTokens = readSize({ v: preset.transcriptBudgetTokens as string }, "v", 2_000, 1_000_000) ?? transcriptBudgetTokens
+    }
+    if (preset.adviceTokenBudget !== undefined) adviceTokenBudget = preset.adviceTokenBudget as number
   }
-  if (typeof opts.injectTimingPrompt === "boolean") injectTimingPrompt = opts.injectTimingPrompt
+
+  maxUsesPerTask = readInt(opts, "maxUsesPerTask", 1, 50) ?? maxUsesPerTask
+  let maxAttempts = readInt(opts, "maxAttempts", 1, 100) ?? 0 // 0 = derive from cap
+  adviceTokenBudget = readInt(opts, "adviceTokenBudget", 500, 64_000) ?? adviceTokenBudget
+  const waitExplicit = readInt(opts, "advisorResponseWaitMs", 100, 600_000)
+  const waitLegacy = readInt(opts, "timeoutMs", 1_000, 600_000)
+  advisorResponseWaitMs = waitExplicit ?? waitLegacy ?? advisorResponseWaitMs
+  if (waitExplicit === undefined && waitLegacy !== undefined) {
+    console.warn("[advisor] timeoutMs is deprecated — rename it to advisorResponseWaitMs")
+  }
+  maxConsultMs = readSize(opts, "maxConsultMs", 1_000, 86_400_000) ?? maxConsultMs
+  if (maxConsultMs < advisorResponseWaitMs) {
+    console.warn(
+      `[advisor] maxConsultMs (${maxConsultMs}) raised to advisorResponseWaitMs (${advisorResponseWaitMs}) — the ceiling must cover the wait window`,
+    )
+    maxConsultMs = advisorResponseWaitMs
+  }
+  maxToolOutputChars = readSize(opts, "maxToolOutputChars", 100, 200_000) ?? maxToolOutputChars
+  transcriptBudgetTokens = readSize(opts, "transcriptBudgetTokens", 2_000, 1_000_000) ?? transcriptBudgetTokens
   let triggers: string[] = [...DEFAULT_TRIGGERS]
   if (opts.triggers !== undefined) {
     if (!Array.isArray(opts.triggers)) {
@@ -167,10 +237,9 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   if (optLevel !== undefined) logLevel = optLevel
   const optMode = readString(opts, "advisorMode")
   if (optMode !== undefined) {
-    if (optMode !== "review" && optMode !== "agent") {
-      throw new Error(`[advisor] option "advisorMode" must be review|agent, got "${optMode}"`)
-    }
-    advisorMode = optMode
+    const mode = normalizeAdvisorMode(optMode)
+    if (!mode) throw new Error(`[advisor] option "advisorMode" must be review|agent|review-agent, got "${optMode}"`)
+    advisorMode = mode
   }
 
   if (!advisor.providerID || !advisor.id) {
@@ -182,47 +251,32 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     advisor = { providerID: "", id: "" }
   }
 
-  // sanity: transcript budget must accommodate several slices
-  if (transcriptBudgetChars < maxToolOutputChars * 4) {
+  // sanity: the context budget must accommodate several tool slices
+  if (transcriptBudgetTokens < maxToolOutputChars) {
     console.warn(
-      `[advisor] transcriptBudgetChars (${transcriptBudgetChars}) raised to maxToolOutputChars*4 ` +
-        `(${maxToolOutputChars * 4}) — a smaller budget cannot hold a meaningful excerpt`,
+      `[advisor] transcriptBudgetTokens (${transcriptBudgetTokens}) raised to maxToolOutputChars ` +
+        `(${maxToolOutputChars}) — a smaller budget cannot hold a meaningful excerpt`,
     )
-    transcriptBudgetChars = maxToolOutputChars * 4
+    transcriptBudgetTokens = maxToolOutputChars
   }
 
   return {
     advisor,
     source,
     maxUsesPerTask,
-    adviceWordBudget,
-    timeoutMs,
-    prune: { maxToolOutputChars, transcriptBudgetChars },
-    nudge,
+    maxAttempts: maxAttempts > 0 ? maxAttempts : maxUsesPerTask * 3 + 2,
+    adviceTokenBudget,
+    transcriptBudgetTokens,
+    advisorResponseWaitMs,
+    maxConsultMs,
+    prune: { maxToolOutputChars, transcriptBudgetChars: transcriptBudgetTokens * 4 },
     advisorMode,
-    injectTimingPrompt,
     triggers,
     logLevel,
   }
 }
 
 /**
- * Heuristic: executors in the "small/fast" tier benefit from a nudge
- * (Anthropic: +7pp on Haiku-class, neutral on mid-tier, NEGATIVE on
- * frontier-tier). Explicit small-tier markers win over frontier markers
- * (e.g. glm-5.3-flash is small despite the glm-5 prefix); unknown models
- * default to no nudge (conservative — the timing prompt still guides).
+ * Note: there is deliberately NO nudge/tier heuristic here anymore. The
+ * advisor is manual-only: no explicit user request ⇒ no injection, no spend.
  */
-const FRONTIER =
-  /(opus|fable|mythos|ultra|(^|[^a-z0-9])pro([^a-z0-9]|$)|-max([^a-z0-9]|$)|(^|[^a-z0-9])o\d+([^a-z0-9]|$)|gpt-[56]|grok|glm-5(\.\d+)?([^a-z0-9]|$)|deepseek-v4-pro|qwen\d\S*-max|claude-(sonnet|opus|haiku)-[45])/i
-const SMALL = /(haiku|flash|nano|lite|turbo|small|instant|swift|(^|[^a-z0-9])mini([^a-z0-9]|$)|air\b|3\.3|8b|9b|14b)/i
-
-export function shouldNudgeExecutor(modelId: string | undefined, mode: AdvisorOptions["nudge"]): boolean {
-  if (mode === "off") return false
-  if (mode === "on") return true
-  if (!modelId) return false
-  const id = modelId.toLowerCase()
-  if (SMALL.test(id)) return true
-  if (FRONTIER.test(id)) return false
-  return false
-}

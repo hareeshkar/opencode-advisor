@@ -662,3 +662,20 @@ test("broken config at dispatch returns a framed config error — never a stale 
   assert.ok(!result.content.includes("ADVISOR REVIEW"), "no consult ran against unknown config")
 })
 
+test("fast consults deliver inline — no double injection (reviewer finding 1)", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const ok = await advisorTool.execute({}, { sessionID: "s-fast", signal: new AbortController().signal })
+  assert.ok(ok.content.includes("GENERATED-ADVICE"), "sync framed advice delivered in the tool result")
+  await captured.contextHooks[0]({ sessionID: "s-fast", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: JSON.stringify({ system: "s", messages: [] }) })
+  const ev = { sessionID: "s-fast", kind: "primary", request }
+  await captured.httpHooks[0](ev)
+  const body = await ev.request.clone().text()
+  assert.ok(!body.includes("GENERATED-ADVICE"), "no double delivery via the injection channel")
+  const statusTool = captured.tools.find((t) => t.name === "advisor_status")
+  const status = await statusTool.execute({}, { sessionID: "s-fast", signal: new AbortController().signal })
+  assert.ok(status.content.includes("delivery inline"), "ledger records inline delivery")
+})
+

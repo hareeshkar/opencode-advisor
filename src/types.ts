@@ -62,15 +62,18 @@ export interface AdvisorOptions {
    * returning control (the consult keeps running in the background and the
    * advice is delivered automatically). This is a UX wait window — NOT a kill
    * switch, and NOT the mechanism for detecting launch failures (those surface
-   * immediately from the provider response). Default 90_000. Renamed from
-   * `timeoutMs` (accepted as a deprecated alias).
+   * immediately from the provider response). Default 90_000. Range 100–600,000.
+   * Renamed from `timeoutMs` (accepted as a deprecated alias).
    */
   advisorResponseWaitMs: number
   /**
    * Maximum lifetime of a consultation. Expiry marks it failed
    * ("advisor not running") WITHOUT consuming the consult cap. Default
    * 3_600_000 (1h) — reasoning models may think for a long time. Range
-   * 30_000–86_400_000.
+   * 1,000–86,400,000; accepts a number or a 1000-based size string
+   * ("3600000", "3.6m"). Expiry is wait-abandonment: the consult is marked
+   * failed but the underlying provider request is not aborted (the provider's
+   * own timeout bounds it).
    */
   maxConsultMs: number
   /** Transcript pruning knobs (chars: derived from tokens; exact for the pruner). */

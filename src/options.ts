@@ -205,8 +205,13 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   maxUsesPerTask = readInt(opts, "maxUsesPerTask", 1, 50) ?? maxUsesPerTask
   let maxAttempts = readInt(opts, "maxAttempts", 1, 100) ?? 0 // 0 = derive from cap
   adviceTokenBudget = readInt(opts, "adviceTokenBudget", 500, 64_000) ?? adviceTokenBudget
-  advisorResponseWaitMs = readInt(opts, "advisorResponseWaitMs", 100, 600_000) ?? readInt(opts, "timeoutMs", 100, 600_000) ?? advisorResponseWaitMs
-  maxConsultMs = readInt(opts, "maxConsultMs", 1_000, 86_400_000) ?? maxConsultMs
+  const waitExplicit = readInt(opts, "advisorResponseWaitMs", 100, 600_000)
+  const waitLegacy = readInt(opts, "timeoutMs", 1_000, 600_000)
+  advisorResponseWaitMs = waitExplicit ?? waitLegacy ?? advisorResponseWaitMs
+  if (waitExplicit === undefined && waitLegacy !== undefined) {
+    console.warn("[advisor] timeoutMs is deprecated — rename it to advisorResponseWaitMs")
+  }
+  maxConsultMs = readSize(opts, "maxConsultMs", 1_000, 86_400_000) ?? maxConsultMs
   if (maxConsultMs < advisorResponseWaitMs) {
     console.warn(
       `[advisor] maxConsultMs (${maxConsultMs}) raised to advisorResponseWaitMs (${advisorResponseWaitMs}) — the ceiling must cover the wait window`,

@@ -65,3 +65,17 @@ test("ledger trims to 100 entries, dropping the oldest", () => {
   assert.equal(ledger.get("c0"), undefined, "oldest dropped")
   assert.ok(ledger.get("c104"), "newest kept")
 })
+
+test("trim prefers evicting terminal records over running ones", () => {
+  const ledger = new ConsultLedger(fakeClock())
+  ledger.start({ id: "running-keep", ...REC })
+  for (let i = 0; i < 100; i++) {
+    ledger.start({ id: `t${i}`, ...REC })
+    ledger.complete(`t${i}`, "x")
+  }
+  ledger.start({ id: "new-guy", ...REC }) // trim fires here (101 entries)
+  assert.ok(ledger.get("running-keep"), "running record never evicted")
+  assert.ok(ledger.get("new-guy"), "newest kept")
+  assert.equal(ledger.get("t0"), undefined, "oldest terminal evicted instead")
+})
+

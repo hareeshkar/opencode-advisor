@@ -23,7 +23,7 @@ import { extractToolNames, replaceSystemInBody } from "./inject.js"
 import { resolveOptions } from "./options.js"
 import { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA } from "./settings.js"
 import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
-import { frameAdvice, isAdvisorOutputFrame } from "./sanitize.js"
+import { frameAdvice, isAdvisorOutputFrame, redactError } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, ConsultResult, Host, LogLevel, Slice, UsageEntry } from "./types.js"
 
@@ -674,6 +674,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       let messagesDropped = 0
       let systemPartsStripped = 0
       let transportUsed = "none"
+      let waitExpired = false
       let lastHistoryDelta = "n/a"
       // Executor model per session, tracked from primary context-hook
       // events. Lets runAdvisor restore the exact model after the advisor
@@ -762,9 +763,17 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                   if (r.ok) {
                     const framed = frameAdvice(r.advice, advisorLabel(engine.advisor()))
                     ledger.complete(consultId, framed)
-                    queueSystemInjection(sessionID, [framed])
-                    ledger.markInjected(consultId)
-                    log("info", `background consult ${consultId} completed — advice delivered to the session`)
+                    if (waitExpired) {
+                      // Settled after the wait window: deliver through the
+                      // injection channel (the executor never saw it).
+                      queueSystemInjection(sessionID, [framed])
+                      ledger.markInjected(consultId)
+                    } else {
+                      // Settled inside the window: the tool result already
+                      // carried it — record inline delivery, inject nothing.
+                      ledger.markInline(consultId)
+                    }
+                    log("info", `background consult ${consultId} completed (${waitExpired ? "delivered via injection" : "delivered inline"})`)
                   } else {
                     // Pre-dispatch policy rejections (cap reached, not
                     // configured) never launched — the tool result already
@@ -789,7 +798,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                   }
                 })
                 .catch((err: unknown) => {
-                  const reason = `advisor_not_running — ${err instanceof Error ? err.message : String(err)}`
+                  const reason = `advisor_not_running — ${redactError(err instanceof Error ? err.message : String(err))}`
                   ledger.fail(consultId, reason)
                   queueSystemInjection(sessionID, [
                     `ADVISOR NOT RUNNING — consult ${consultId}: ${reason}. The cap was not consumed — retry or continue the task.`,
@@ -803,7 +812,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               const settled = consultPromise.then((r) => ({ kind: "done" as const, r }))
               settled.catch(() => {}) // failure ownership belongs to the chain above
               const syncWait = new Promise<"wait">((resolve) => {
-                const timer = setTimeout(() => resolve("wait"), opts.advisorResponseWaitMs)
+                const timer = setTimeout(() => {
+                  waitExpired = true
+                  resolve("wait")
+                }, opts.advisorResponseWaitMs)
                 if (typeof timer === "object" && timer !== null && "unref" in timer) {
                   (timer as { unref(): void }).unref()
                 }
@@ -842,8 +854,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 }
                 return { content }
               }
-              ledger.complete(consultId, frameAdvice(r.advice, advisorLabel(engine.advisor())))
-              return { content: frameAdvice(r.advice, advisorLabel(engine.advisor())) }
+              const framedSync = frameAdvice(r.advice, advisorLabel(engine.advisor()))
+              ledger.complete(consultId, framedSync)
+              ledger.markInline(consultId)
+              return { content: framedSync }
             },
           })
           editor.add({

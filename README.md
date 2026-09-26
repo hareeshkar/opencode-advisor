@@ -172,8 +172,8 @@ The `/advisor-settings` menu reads the file when it opens and writes it atomical
 | `advisorMode` | enum | `review` | `review`, `agent` (`review-agent` and `review+agent` accepted) | Review = advice from the pruned conversation; agent = the advisor also verifies implicated files read-only |
 | `maxUsesPerTask` | number | preset (3) | 1–50 | Successful consults per user task; a safety cap |
 | `maxAttempts` | number | 3 × consults + 2 (11) | 1–100 | Transport attempts per task — never extra paid consults |
-| `advisorResponseWaitMs` | ms (number) | `90000` | 1,000–600,000 | How long the tool call waits for advice before continuing in the background (the advisor keeps running). `timeoutMs` accepted as a deprecated alias |
-| `maxConsultMs` | ms (number or size) | `3600000` | 30,000–86,400,000 | Maximum advisor lifetime; expiry fails the consult without consuming the cap |
+| `advisorResponseWaitMs` | ms (number) | `90000` | 100–600,000 | How long the tool call waits for advice before continuing in the background (the advisor keeps running). `timeoutMs` accepted as a deprecated alias |
+| `maxConsultMs` | ms (number or size) | `3600000` | 1,000–86,400,000 | Maximum advisor lifetime; expiry fails the consult without consuming the cap |
 | `adviceTokenBudget` | tokens (number) | preset (8,000) | 500–64,000 | Advisor **output** tokens — the reply length cap |
 | `transcriptBudgetTokens` | tokens (number or size) | preset (16,000) | 2,000–1,000,000 | **Input** context tokens sent to the advisor (≈4 chars/token for the pruner) |
 | `maxToolOutputChars` | chars (number or size) | `1500` | 100–200,000 | Characters kept from a single tool output |

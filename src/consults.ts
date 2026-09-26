@@ -15,12 +15,13 @@
  * and can fail independently (the ledger replays advice regardless).
  *
  * Ownership: the OpenCode server process owns running consults — it outlives
- * tool calls. The kv-backed ledger survives plugin reloads; a setup-time
- * reaper fails ledger entries stuck past the ceiling.
+ * tool calls. The ledger is IN-MEMORY by design: it never persists prompts,
+ * a fresh instance starts clean (no hot-reload orphans), and history beyond
+ * the process lifetime is intentionally out of scope.
  */
 
 export type ConsultState = "starting" | "running" | "completed" | "failed"
-export type ConsultDelivery = "pending" | "injected"
+export type ConsultDelivery = "pending" | "injected" | "inline"
 
 export interface ConsultRecord {
   id: string
@@ -96,6 +97,12 @@ export class ConsultLedger {
     if (r && r.state === "completed") r.delivery = "injected"
   }
 
+  /** Advice was returned in the tool result itself (sync path) — no injection. */
+  markInline(id: string): void {
+    const r = this.entries.get(id)
+    if (r && r.state === "completed") r.delivery = "inline"
+  }
+
   /** Idempotent — a reload mid-consult must not double-fail an entry. */
   fail(id: string, error: string): void {
     const r = this.entries.get(id)
@@ -141,8 +148,14 @@ export class ConsultLedger {
 
   private trim(): void {
     if (this.entries.size <= MAX_RECORDS) return
-    let oldest: ConsultRecord | undefined
-    for (const r of this.entries.values()) if (!oldest || r.startedAt < oldest.startedAt) oldest = r
-    if (oldest) this.entries.delete(oldest.id)
+    // Prefer evicting terminal records: a running record holds a concurrency
+    // slot and its advice may still land. Insertion order breaks ties.
+    const terminal = [...this.entries.values()].filter((r) => r.state === "completed" || r.state === "failed")
+    if (terminal.length > 0) {
+      this.entries.delete(terminal[0]!.id)
+      return
+    }
+    const oldest = this.entries.keys().next().value
+    if (oldest !== undefined) this.entries.delete(oldest)
   }
 }

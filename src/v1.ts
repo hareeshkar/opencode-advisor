@@ -124,7 +124,7 @@ async function makeV1Tool(engine: AdvisorEngine, log: (msg: string) => void, opt
       const sessionID = String(tctx?.sessionID ?? "")
       const signal = tctx?.abort ?? new AbortController().signal
       const r = await engine.consult(sessionID, signal)
-      return r.ok ? frameAdvice(r.advice, advisorLabel(engine.advisor())) : `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
+      return r.ok ? frameAdvice(r.advice, advisorLabel(engine.advisor()), opts.advisorMode) : `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
     },
   }
 }

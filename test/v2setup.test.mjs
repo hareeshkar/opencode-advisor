@@ -398,14 +398,14 @@ test("agent mode spawns a read-only child session, polls to idle, returns its ad
 
   const result = await captured.tools[0].execute({}, { sessionID: "s-agent", signal: new AbortController().signal })
   assert.ok(result.content.includes("AGENT-GROUNDED-ADVICE"), "child advice returned")
-  assert.ok(result.content.startsWith("ADVISOR REVIEW by zai-coding-plan/glm-5.3"), "framed with attribution")
+  assert.ok(result.content.startsWith("ADVISOR REVIEW + AGENT · zai-coding-plan/glm-5.3"), "framed with attribution + mode")
 
   const create = captured.createInput
-  assert.equal(create.agent, "plan", "read-only plan agent")
+  assert.equal(create.agent, "plan", "read-only agent; writes denied via permissions")
   assert.equal(create.model.providerID, "zai-coding-plan")
   assert.equal(create.model.id, "glm-5.3")
   const denied = (create.permissions ?? []).filter((p) => p.effect === "deny").map((p) => p.action)
-  assert.deepEqual(denied.sort(), ["edit", "shell", "subagent"], "write/shell/subagent denied")
+  assert.deepEqual(denied.sort(), ["edit", "shell", "subagent", "webfetch", "websearch"], "read-only discipline: writes, shell, subagents, and network denied")
 
   const childPrompt = captured.prompts.find((p) => p.sessionID === "ses_child_agent")
   assert.ok(childPrompt, "child prompted")
@@ -447,7 +447,7 @@ test("GUARANTEE: the executor receives ONLY the framed advice — never transcri
   await createV2Plugin().setup(ctx)
   const result = await captured.tools[0].execute({}, { sessionID: "s-leak", signal: new AbortController().signal })
   assert.ok(!result.content.includes(SECRET), "no transcript content in the tool result")
-  assert.ok(result.content.startsWith("ADVISOR REVIEW by "), "only the framed advice")
+  assert.ok(result.content.startsWith("ADVISOR REVIEW"), "only the framed advice")
   assert.ok(result.content.length < 600, `advice is small (${result.content.length} chars), not a transcript dump`)
 })
 

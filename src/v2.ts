@@ -415,6 +415,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             { action: "edit", resource: "*", effect: "deny" },
             { action: "shell", resource: "*", effect: "deny" },
             { action: "subagent", resource: "*", effect: "deny" },
+            { action: "webfetch", resource: "*", effect: "deny" },
+            { action: "websearch", resource: "*", effect: "deny" },
           ],
         })) as { id?: unknown } | undefined
         const childID = String((created as { id?: unknown })?.id ?? "")
@@ -438,7 +440,24 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             const text = extractLastAssistantText(messages)
             if (text !== "") lastText = text
             const last = messages[messages.length - 1] as { type?: unknown } | undefined
-            if (last && String(last.type ?? "") === "idle") return lastText
+            if (last && String(last.type ?? "") === "idle") {
+              // Provenance honesty: did the child actually inspect anything?
+              // If it made no tool calls, the agent-mode "files verified"
+              // claim would be false — append the real evidence basis.
+              let toolCalls = 0
+              for (const m of messages) {
+                const parts = (m as { content?: unknown })?.content
+                if (!Array.isArray(parts)) continue
+                for (const part of parts) {
+                  const p = part as { type?: unknown }
+                  if (p?.type === "tool") toolCalls++
+                }
+              }
+              if (toolCalls === 0) {
+                return `${lastText}\n\n[NOTE: no files were examined in this consult — advice is based solely on the supplied conversation.]`
+              }
+              return `${lastText}\n\n[Verified against the repository: ${toolCalls} tool inspection(s) performed.]`
+            }
           }
         } finally {
           advisorChildSessions.delete(childID)
@@ -761,7 +780,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                     /* diagnostics only */
                   }
                   if (r.ok) {
-                    const framed = frameAdvice(r.advice, advisorLabel(engine.advisor()))
+                    const framed = frameAdvice(r.advice, advisorLabel(engine.advisor()), opts.advisorMode)
                     ledger.complete(consultId, framed)
                     if (waitExpired) {
                       // Settled after the wait window: deliver through the
@@ -854,7 +873,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 }
                 return { content }
               }
-              const framedSync = frameAdvice(r.advice, advisorLabel(engine.advisor()))
+              const framedSync = frameAdvice(r.advice, advisorLabel(engine.advisor()), opts.advisorMode)
               ledger.complete(consultId, framedSync)
               ledger.markInline(consultId)
               return { content: framedSync }

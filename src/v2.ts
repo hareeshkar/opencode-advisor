@@ -705,6 +705,25 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                     "advisor_tool_result_error: unavailable — nested advisor sessions are not supported. You ARE the advisor: answer with your guidance.",
                 }
               }
+              // Config freshness: apply on-disk config changes instantly, with
+              // or without a plugin reload. Live finding A3 (2026-09-26): a
+              // just-changed config was still served by the stale previous
+              // instance — an unconfigured install dispatched a paid consult.
+              try {
+                const fresh = await loadAdvisorConfig({ directory, options: ctx?.options })
+                const freshOpts = resolveOptions(fresh.merged)
+                if (JSON.stringify(freshOpts) !== JSON.stringify(opts)) {
+                  opts = freshOpts
+                  engine.applyOptions(freshOpts)
+                  engine.setAdvisor(freshOpts.advisor)
+                  log("info", "config changed on disk — applied to the running instance")
+                }
+              } catch (err) {
+                // A broken config surfaces loudly at load/reload; here we keep
+                // serving with the last-known-good options rather than failing
+                // a consult on a transient read.
+                log("warn", "config freshness check failed (continuing with current options)", err)
+              }
               if (ledger.runningCount() >= CONSULT_CONCURRENCY) {
                 // Nothing started — the consult cap is not consumed.
                 return {

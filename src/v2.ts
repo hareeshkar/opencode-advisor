@@ -18,6 +18,7 @@
 import { ADVISOR_CONFIG_KEYS, loadAdvisorConfig, migrateStoredOverride, removeAdvisorConfigKeys, updateAdvisorConfig } from "./config.js"
 import type { AdvisorConfigSnapshot } from "./config.js"
 import { CONSULT_CONCURRENCY, ConsultLedger, runningMessage } from "./consults.js"
+import type { ConsultRecord } from "./consults.js"
 import { AdvisorEngine } from "./engine.js"
 import { extractToolNames, replaceSystemInBody } from "./inject.js"
 import { resolveOptions } from "./options.js"
@@ -423,7 +424,18 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
       // setup (this process owns no detached promises from a previous
       // instance) — fail them all so hot-reload orphans cannot permanently
       // occupy concurrency slots. Idempotent.
-      const ledger = new ConsultLedger()
+      // Durable consult ledger: records survive reloads (advisor_status keeps
+      // its history across config-write reload bursts) and per-consult spend
+      // becomes attributable — the global usage ledger is a date aggregate
+      // that concurrent sessions pollute (live finding AN-2). Records only —
+      // never prompts.
+      const ledger = new ConsultLedger(undefined, {
+        load: async () => (await ctx.storage.get("consult:ledger")) as ConsultRecord[] | undefined,
+        save: async (records) => {
+          await ctx.storage.set("consult:ledger", records)
+        },
+      })
+      await ledger.hydrate()
       const interrupted = ledger.failAllRunning("advisor_not_running — interrupted by plugin reload")
       if (interrupted.length > 0) {
         log("warn", `consult lifecycle sweep failed ${interrupted.length} orphaned consult(s): ${interrupted.join(", ")}`)

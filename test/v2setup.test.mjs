@@ -767,3 +767,26 @@ test("config changes apply at consult dispatch without reload (freshness at disp
   )
 })
 
+test("durable consult ledger: records survive reloads, orphans fail at setup sweep", async () => {
+  const { ctx, captured } = makeCtx()
+  // A previous instance saved a RUNNING consult record, then the plugin
+  // reloaded (hot-reload mid-consult, live scenario D4).
+  const record = {
+    id: "c-prev",
+    sessionID: "s-prev",
+    mode: "review",
+    model: "p/a",
+    startedAt: Date.now() - 60_000,
+    state: "running",
+    delivery: "pending",
+  }
+  await ctx.storage.set("consult:ledger", [record])
+  await createV2Plugin().setup(ctx)
+  const statusTool = captured.tools.find((t) => t.name === "advisor_status")
+  const status = await statusTool.execute({}, { sessionID: "s-prev", signal: new AbortController().signal })
+  assert.ok(status.content.includes("FAILED"), "orphaned running entry failed by the sweep")
+  assert.ok(status.content.includes("interrupted by plugin reload"), "interruption reason recorded")
+  const ledgerNow = captured.storage.get("consult:ledger")
+  assert.ok(ledgerNow.some((r) => r.id === "c-prev" && r.state === "failed"), "ledger persisted the sweep")
+})
+

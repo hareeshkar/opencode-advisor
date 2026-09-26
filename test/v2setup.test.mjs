@@ -1,9 +1,17 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
+import { mkdtempSync } from "node:fs"
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import { createV2Plugin } from "../dist/opencode-advisor.js"
 
 /** Minimal fake V2 plugin context — exercises setup wiring end to end. */
 function makeCtx(overrides = {}) {
+  // Isolate config files per test: a fresh XDG home + a fresh project dir, so
+  // no test can see another test's (or the developer's) advisor config.
+  process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), "advisor-home-"))
+  const projectDir = mkdtempSync(join(tmpdir(), "advisor-project-"))
   const captured = {
     tools: [],
     promptHooks: [],
@@ -17,6 +25,7 @@ function makeCtx(overrides = {}) {
   }
   const ctx = {
     options: { advisor: { providerID: "p", id: "a" }, logLevel: "error" },
+    location: { directory: projectDir },
     storage: {
       get: async (k) => captured.storage.get(k),
       set: async (k, v) => {
@@ -184,32 +193,89 @@ test("/advisor with no focus uses one short line", async () => {
   assert.equal(captured.prompts[0].text, "Review the current task with the advisor.")
 })
 
-test("RPC set hot-swaps the advisor model and persists an override", async () => {
+test("RPC set writes the config file, hot-swaps the model; reset restores the deployment default", async () => {
   const { ctx, captured } = makeCtx()
   await createV2Plugin().setup(ctx)
   const rpc = captured.rpcHandlers.get("opencode-advisor")
   assert.ok(rpc, "rpc registered")
 
-  const before = await rpc.get()
-  assert.equal(before.source, "config")
-  assert.equal(before.providerID, "p")
+  const before = await rpc.get({})
+  assert.equal(before.config.source, "deployment")
+  assert.equal(before.config.providerID, "p")
 
+  // Legacy pre-0.7 picker payload → written to the GLOBAL config file.
   const updated = await rpc.set({ providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
-  assert.deepEqual(updated, { providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" })
-  const after = await rpc.get()
-  assert.equal(after.source, "override")
-  assert.equal(captured.storage.get("advisor:override").providerID, "zai-coding-plan")
+  assert.equal(updated.config.providerID, "zai-coding-plan")
+  assert.equal(updated.config.source, "global")
+  const globalFile = join(process.env.XDG_CONFIG_HOME, "opencode", "opencode-advisor.json")
+  assert.deepEqual(JSON.parse(await readFile(globalFile, "utf8")), {
+    advisor: { providerID: "zai-coding-plan", id: "glm-5.3", variant: "high" },
+  })
 
-  // next consult: the sandwich switches the session to the OVERRIDE model
+  // next consult: the sandwich switches the session to the NEW model — no restart
   await captured.tools[0].execute({}, { sessionID: "s9", signal: new AbortController().signal })
   const switched = captured.switchModelCalls.find((c) => c.model.providerID === "zai-coding-plan")
-  assert.ok(switched, "override model used for the sub-call")
+  assert.ok(switched, "new model used for the sub-call")
   assert.equal(switched.model.id, "glm-5.3")
   assert.equal(switched.model.variant, "high")
 
-  const reset = await rpc.reset()
-  assert.equal(reset.providerID, "p")
-  assert.equal(captured.storage.get("advisor:override"), undefined)
+  // reset clears the file keys → deployment default returns immediately
+  const reset = await rpc.reset({})
+  assert.equal(reset.config.providerID, "p")
+  assert.equal(reset.config.source, "deployment")
+  assert.deepEqual(JSON.parse(await readFile(globalFile, "utf8")), {})
+  assert.equal(captured.storage.get("advisor:override"), undefined, "the storage override is retired")
+})
+
+test("manual config file edits are picked up by the settings RPC without restart", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  const target = join(ctx.location.directory, ".opencode", "opencode-advisor.json")
+  await mkdir(join(ctx.location.directory, ".opencode"), { recursive: true })
+  await writeFile(target, JSON.stringify({ preset: "thorough" }))
+
+  const out = await rpc.get({})
+  assert.equal(out.config.preset, "thorough")
+  assert.equal(out.config.maxUsesPerTask, 5, "preset expansion applied from the file")
+  assert.equal(out.tiers.preset, "project")
+  assert.equal(out.files.project, target, "provenance points at the project file")
+})
+
+test("settings RPC validates drafts before touching disk", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  await assert.rejects(() => rpc.set({ doc: { maxUsesPerTask: 999 }, scope: "project" }), /maxUsesPerTask/)
+  const entries = await readdir(join(ctx.location.directory, ".opencode")).catch(() => [])
+  assert.deepEqual(entries, [], "no file was created for an invalid draft")
+})
+
+test("settings RPC: a draft saves to the project file; reset clears known keys only", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  const target = join(ctx.location.directory, ".opencode", "opencode-advisor.json")
+
+  const out = await rpc.set({ doc: { preset: "economy", myOwnNote: "keep me" }, scope: "project" })
+  assert.equal(out.config.maxUsesPerTask, 1, "economy preset applied immediately")
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { preset: "economy", myOwnNote: "keep me" })
+
+  const reset = await rpc.reset({ scope: "project" })
+  assert.equal(reset.config.maxUsesPerTask, 3, "back to defaults")
+  assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { myOwnNote: "keep me" }, "unknown keys survive reset")
+})
+
+test("setup migrates a pre-0.7 stored pick into the global file once", async () => {
+  const { ctx, captured } = makeCtx()
+  captured.storage.set("advisor:override", { providerID: "z", id: "glm-9", variant: "max" })
+  await createV2Plugin().setup(ctx)
+  assert.equal(captured.storage.get("advisor:override"), undefined, "storage key retired")
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  const out = await rpc.get({})
+  assert.equal(out.config.providerID, "z")
+  assert.equal(out.config.variant, "max")
+  assert.equal(out.config.source, "global", "migrated pick lives in the global file")
 })
 
 test("/advisor-settings composes a lean shortlist and config-edit instruction", async () => {

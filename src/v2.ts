@@ -15,12 +15,11 @@
  *     the host's model call
  */
 
-import { readFile } from "node:fs/promises"
-import { homedir } from "node:os"
-import { join } from "node:path"
+import { ADVISOR_CONFIG_KEYS, loadAdvisorConfig, migrateStoredOverride, removeAdvisorConfigKeys, writeAdvisorConfig } from "./config.js"
+import type { AdvisorConfigSnapshot } from "./config.js"
 import { AdvisorEngine } from "./engine.js"
 import { extractToolNames, replaceSystemInBody } from "./inject.js"
-import { CONFIG_FILE_RELATIVE, mergeAdvisorConfigLayers, resolveOptions, shouldNudgeExecutor } from "./options.js"
+import { resolveOptions, shouldNudgeExecutor } from "./options.js"
 import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
@@ -177,52 +176,93 @@ export function extractLastAssistantText(messages: unknown): string {
 
 const EMPTY_INPUT = { type: "object", properties: {}, additionalProperties: false }
 
-/** Dedicated plugin config file (global → project, project wins), merged
- *  under the plugin's opencode.json options (explicit inline wins). Set
- *  whole nested objects (advisor/source) rather than partial merges. */
-async function loadAdvisorConfig(ctx: unknown): Promise<Record<string, unknown>> {
-  const c = ctx as { location?: { directory?: unknown }; options?: unknown } | undefined
-  const globalDir = process.env.XDG_CONFIG_HOME ? join(process.env.XDG_CONFIG_HOME, "opencode") : join(homedir(), ".config", "opencode")
-  const dir = typeof c?.location?.directory === "string" && c.location.directory !== "" ? c.location.directory : process.cwd()
-  const paths = [
-    join(globalDir, CONFIG_FILE_RELATIVE),
-    join(dir, ".opencode", CONFIG_FILE_RELATIVE),
-    join(dir, CONFIG_FILE_RELATIVE),
-  ]
-  const layers: unknown[] = []
-  for (const path of paths) {
-    try {
-      layers.push(JSON.parse(await readFile(path, "utf8")))
-    } catch (err) {
-      const code = (err as { code?: unknown }).code
-      if (code === "ENOENT") continue
-      throw new Error(`[advisor] config file ${path} is unreadable or invalid JSON: ${err instanceof Error ? err.message : String(err)}`)
-    }
-  }
-  return mergeAdvisorConfigLayers([...layers, c?.options])
-}
+/** Shared RPC output: effective config + provenance for the settings UI. */
+const CONFIG_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    config: {
+      type: "object",
+      properties: {
+        providerID: { type: "string" },
+        id: { type: "string" },
+        variant: { type: "string" },
+        source: { type: "string" },
+        preset: { type: "string" },
+        advisorMode: { type: "string" },
+        maxUsesPerTask: { type: "number" },
+        maxAttempts: { type: "number" },
+        timeoutMs: { type: "number" },
+        adviceWordBudget: { type: "number" },
+        transcriptBudgetChars: { type: "number" },
+        maxToolOutputChars: { type: "number" },
+        triggers: { type: "array", items: { type: "string" } },
+        logLevel: { type: "string" },
+      },
+      required: [
+        "providerID",
+        "id",
+        "variant",
+        "source",
+        "preset",
+        "advisorMode",
+        "maxUsesPerTask",
+        "maxAttempts",
+        "timeoutMs",
+        "adviceWordBudget",
+        "transcriptBudgetChars",
+        "maxToolOutputChars",
+        "triggers",
+        "logLevel",
+      ],
+      additionalProperties: false,
+    },
+    tiers: { type: "object", additionalProperties: { type: "string" } },
+    files: {
+      type: "object",
+      properties: {
+        global: { type: "string" },
+        project: { type: "string" },
+        used: { type: "array", items: { type: "string" } },
+      },
+      required: ["global", "project", "used"],
+      additionalProperties: false,
+    },
+  },
+  required: ["config", "tiers", "files"],
+  additionalProperties: false,
+} as const
+
+/** `set` accepts a full draft document (preferred) or the legacy pre-0.7 pick. */
+const CONFIG_SET_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    doc: { type: "object", additionalProperties: true },
+    scope: { type: "string" },
+    providerID: { type: "string" },
+    id: { type: "string" },
+    variant: { type: "string" },
+  },
+  additionalProperties: false,
+} as const
 
 export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise<() => void> } {
   return {
     id: PLUGIN_ID,
     async setup(ctxUnknown: unknown): Promise<() => void> {
       const ctx = ctxUnknown as any
+      const directory =
+        typeof ctx?.location?.directory === "string" && ctx.location.directory !== "" ? ctx.location.directory : undefined
+      let snapshot: AdvisorConfigSnapshot
       let opts: AdvisorOptions
       try {
-        opts = resolveOptions(await loadAdvisorConfig(ctx))
+        // Priority: defaults < env < opencode.json options < global file <
+        // project file. The files are the persistent source of truth.
+        snapshot = await loadAdvisorConfig({ directory, options: ctx?.options })
+        opts = resolveOptions(snapshot.merged)
       } catch (err) {
         // loud + rethrow: a misconfigured plugin must not load silently
         console.error(`[${PLUGIN_ID}] CONFIG ERROR: ${err instanceof Error ? err.message : String(err)}`)
         throw err
-      }
-
-      if (!isAdvisorConfigured(opts.advisor)) {
-        // Safe-by-default: fresh installs load UNCONFIGURED (zero spend).
-        // The advisor tool stays registered and answers with setup steps;
-        // /advisor-settings or the opencode.json option configures it.
-        console.warn(
-          `[${PLUGIN_ID}] no advisor model configured yet — the advisor tool will return setup steps until one is set (via /advisor-settings or the plugin's "advisor" option).`,
-        )
       }
 
       const RANK = { debug: 0, info: 1, warn: 2, error: 3 } as const
@@ -367,6 +407,34 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         persistUsage,
         log,
       }
+      // §6 migration: a pick stored by the pre-0.7 settings UI has no file to
+      // land in. Move it to the GLOBAL config file once, then retire the
+      // storage key. Runs before the engine exists so the resolved options
+      // already include the migrated pick. On failure the key is kept.
+      try {
+        if (ctx.storage && typeof ctx.storage.get === "function") {
+          const result = await migrateStoredOverride({
+            storage: ctx.storage,
+            globalPath: snapshot.files.global,
+            fileSetsAdvisor: snapshot.tiers.advisor === "global" || snapshot.tiers.advisor === "project",
+            log: (message) => log("info", message),
+          })
+          if (result === "migrated") {
+            snapshot = await loadAdvisorConfig({ directory, options: ctx?.options })
+            opts = resolveOptions(snapshot.merged)
+          }
+        }
+      } catch (err) {
+        log("warn", "config migration failed (will retry on next load)", err)
+      }
+      if (!isAdvisorConfigured(opts.advisor)) {
+        // Safe-by-default: fresh installs load UNCONFIGURED (zero spend).
+        // The advisor tool stays registered and answers with setup steps;
+        // /advisor-settings or a config file configures it.
+        console.warn(
+          `[${PLUGIN_ID}] no advisor model configured yet — the advisor tool will return setup steps until one is set (via /advisor-settings or ${snapshot.files.global}).`,
+        )
+      }
       const engine = new AdvisorEngine(opts, host)
       // Child sessions spawned by AGENT-MODE advisor consults. Used as a
       // recursion guard: a consult originating inside one of these returns
@@ -479,87 +547,62 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         pendingDirectives.delete(sessionID)
         return Date.now() - d.at > DIRECTIVE_TTL_MS ? undefined : d.text
       }
-      // Runtime advisor override (set via /advisor-settings). Persisted in
-      // plugin storage; wins over the opencode.json option until reset.
-      let overrideActive = false
-      try {
-        const saved = (await ctx.storage.get("advisor:override")) as
-          | { providerID?: unknown; id?: unknown; variant?: unknown }
-          | undefined
-        if (saved && typeof saved.providerID === "string" && typeof saved.id === "string" && saved.providerID !== "") {
-          engine.setAdvisor({
-            providerID: saved.providerID,
-            id: saved.id,
-            ...(typeof saved.variant === "string" ? { variant: saved.variant } : {}),
-          })
-          overrideActive = true
-          log("info", `advisor override active: ${advisorLabel(engine.advisor())}`)
-        }
-      } catch {
-        /* storage unavailable — stay on config default */
+      // ---- configuration: files are the single source of truth ----------
+      // get/set/reset operate on the JSON config files; set/reset also apply
+      // the resolved result to this running instance immediately (no
+      // restart). Manual file edits are picked up on the next get/set/reset,
+      // so the settings UI reads before displaying and never lies.
+      const reloadConfig = async (): Promise<{ resolved: AdvisorOptions; snapshot: AdvisorConfigSnapshot }> => {
+        const fresh = await loadAdvisorConfig({ directory, options: ctx?.options })
+        const resolved = resolveOptions(fresh.merged)
+        snapshot = fresh
+        opts = resolved
+        engine.applyOptions(resolved)
+        engine.setAdvisor(resolved.advisor)
+        return { resolved, snapshot: fresh }
       }
-      const persistAdvisorOverride = async (
-        ref: { providerID: string; id: string; variant?: string } | null,
-      ): Promise<void> => {
-        if (ref === null) {
-          overrideActive = false
-          engine.setAdvisor(opts.advisor)
-          await ctx.storage.remove("advisor:override").catch(() => {})
-          log("info", `advisor override cleared — back to ${advisorLabel(engine.advisor())}`)
-          return
+      const configOutput = (resolved: AdvisorOptions, snap: AdvisorConfigSnapshot): Record<string, unknown> => ({
+        config: {
+          providerID: resolved.advisor.providerID,
+          id: resolved.advisor.id,
+          variant: resolved.advisor.variant ?? "",
+          source: snap.tiers.advisor ?? "default",
+          preset: typeof snap.merged.preset === "string" ? snap.merged.preset : "",
+          advisorMode: resolved.advisorMode,
+          maxUsesPerTask: resolved.maxUsesPerTask,
+          maxAttempts: resolved.maxAttempts,
+          timeoutMs: resolved.timeoutMs,
+          adviceWordBudget: resolved.adviceWordBudget,
+          transcriptBudgetChars: resolved.prune.transcriptBudgetChars,
+          maxToolOutputChars: resolved.prune.maxToolOutputChars,
+          triggers: resolved.triggers,
+          logLevel: resolved.logLevel,
+        },
+        tiers: snap.tiers,
+        files: { global: snap.files.global, project: snap.files.project, used: snap.files.used },
+      })
+      /** Phase-1 rule: an existing project file wins, otherwise global. */
+      const pickConfigTarget = (scope: unknown): string => {
+        if (scope === "global") return snapshot.files.global
+        if (scope === "project") {
+          return snapshot.files.project !== "" ? snapshot.files.project : snapshot.files.projectDotOpencode
         }
-        engine.setAdvisor(ref)
-        overrideActive = true
-        await ctx.storage.set("advisor:override", engine.advisor()).catch(() => {})
-        log("info", `advisor set to ${advisorLabel(engine.advisor())} (override persisted)`)
+        return snapshot.files.project !== "" ? snapshot.files.project : snapshot.files.global
       }
-      // RPC surface for the TUI settings picker (and any client). Plain
-      // portable definition — no runtime dependency on @opencode/plugin/rpc.
+      // RPC surface for the TUI settings UI (and any client). Plain portable
+      // definition — no runtime dependency on @opencode/plugin/rpc. The
+      // handler output is the effective config + provenance (tier per key and
+      // the files actually read), which is exactly what the editor displays.
       try {
         const regRpc = await ctx.rpc.register(
           {
             id: "opencode-advisor",
             methods: {
-              get: {
-                input: { type: "object", properties: {}, additionalProperties: false },
-                output: {
-                  type: "object",
-                  properties: {
-                    providerID: { type: "string" },
-                    id: { type: "string" },
-                    variant: { type: "string" },
-                    source: { type: "string" },
-                  },
-                  required: ["providerID", "id", "source"],
-                  additionalProperties: false,
-                },
-              },
-              set: {
-                input: {
-                  type: "object",
-                  properties: {
-                    providerID: { type: "string" },
-                    id: { type: "string" },
-                    variant: { type: "string" },
-                  },
-                  required: ["providerID", "id"],
-                  additionalProperties: false,
-                },
-                output: {
-                  type: "object",
-                  properties: { providerID: { type: "string" }, id: { type: "string" }, variant: { type: "string" } },
-                  required: ["providerID", "id"],
-                  additionalProperties: false,
-                },
-              },
+              get: { input: EMPTY_INPUT, output: CONFIG_OUTPUT_SCHEMA },
+              set: { input: CONFIG_SET_INPUT_SCHEMA, output: CONFIG_OUTPUT_SCHEMA },
               reset: {
-                input: { type: "object", properties: {}, additionalProperties: false },
-                output: {
-                  type: "object",
-                  properties: { providerID: { type: "string" }, id: { type: "string" }, variant: { type: "string" } },
-                  required: ["providerID", "id"],
-                  additionalProperties: false,
-                },
+                input: { type: "object", properties: { scope: { type: "string" } }, additionalProperties: false },
+                output: CONFIG_OUTPUT_SCHEMA,
               },
               "claim": {
                 input: { type: "object", properties: {}, additionalProperties: false },
@@ -570,27 +613,51 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           },
           {
             get: async () => {
-              const ref = engine.advisor()
-              return {
-                providerID: ref.providerID,
-                id: ref.id,
-                ...(ref.variant ? { variant: ref.variant } : {}),
-                source: overrideActive ? "override" : "config",
-              }
+              const { resolved, snapshot: snap } = await reloadConfig()
+              return configOutput(resolved, snap)
             },
             set: async (input: any) => {
-              const providerID = String(input?.providerID ?? "")
-              const id = String(input?.id ?? "")
-              const variant = typeof input?.variant === "string" && input.variant !== "" ? String(input.variant) : undefined
-              if (providerID === "" || id === "") throw new Error("advisor.set requires providerID and id")
-              await persistAdvisorOverride({ providerID, id, ...(variant ? { variant } : {}) })
-              const ref = engine.advisor()
-              return { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) }
+              let draft: Record<string, unknown>
+              if (input?.doc !== undefined) {
+                if (input.doc === null || typeof input.doc !== "object" || Array.isArray(input.doc)) {
+                  throw new Error('advisor.set: "doc" must be a JSON object')
+                }
+                draft = input.doc as Record<string, unknown>
+              } else if (
+                typeof input?.providerID === "string" &&
+                input.providerID !== "" &&
+                typeof input?.id === "string" &&
+                input.id !== ""
+              ) {
+                // Legacy pre-0.7 picker payload → { advisor: … }.
+                draft = {
+                  advisor: {
+                    providerID: input.providerID,
+                    id: input.id,
+                    ...(typeof input.variant === "string" && input.variant !== "" ? { variant: input.variant } : {}),
+                  },
+                }
+              } else {
+                throw new Error('advisor.set: provide a "doc" object (or legacy providerID/id)')
+              }
+              // Validate BEFORE touching disk: resolveOptions throws precise
+              // errors naming the key and bounds.
+              resolveOptions({ ...draft })
+              const target = pickConfigTarget(input?.scope)
+              await writeAdvisorConfig(target, draft)
+              const { resolved, snapshot: snap } = await reloadConfig()
+              log(
+                "info",
+                `config written → ${target} (advisor: ${isAdvisorConfigured(resolved.advisor) ? advisorLabel(resolved.advisor) : "unconfigured"})`,
+              )
+              return configOutput(resolved, snap)
             },
-            reset: async () => {
-              await persistAdvisorOverride(null)
-              const ref = engine.advisor()
-              return { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) }
+            reset: async (input: any) => {
+              const target = pickConfigTarget(input?.scope)
+              await removeAdvisorConfigKeys(target, ADVISOR_CONFIG_KEYS)
+              const { resolved, snapshot: snap } = await reloadConfig()
+              log("info", `config reset → ${target}`)
+              return configOutput(resolved, snap)
             },
             "claim": async () => {
               try {
@@ -613,7 +680,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         )
         regs.push(regRpc)
       } catch (err) {
-        log("warn", "RPC registration failed (TUI settings picker will be unavailable; executor settings flow still works)", err)
+        log("warn", "RPC registration failed (settings UI will be unavailable; file editing still works)", err)
       }
       // Hook/tool registrations must be disposed on unload — otherwise a
       // plugin reload leaks callbacks and injections fire repeatedly.

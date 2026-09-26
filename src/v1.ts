@@ -19,6 +19,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { AdvisorEngine } from "./engine.js"
 import { resolveOptions, shouldNudgeExecutor } from "./options.js"
+import { loadAdvisorConfig } from "./config.js"
 import { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, triggerDirective } from "./prompts.js"
 import { frameAdvice } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
@@ -128,7 +129,9 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
 
   let opts: AdvisorOptions
   try {
-    opts = resolveOptions(options ?? {})
+    // Same config files as V2 (project directory = cwd, the best V1 can do).
+    const snapshot = await loadAdvisorConfig({ directory: process.cwd(), options })
+    opts = resolveOptions(snapshot.merged)
   } catch (err) {
     console.error(`[${PLUGIN_ID}] CONFIG ERROR (v1 adapter): ${err instanceof Error ? err.message : String(err)}`)
     throw err

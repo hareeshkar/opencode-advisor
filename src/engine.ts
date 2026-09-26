@@ -125,13 +125,13 @@ export class AdvisorEngine {
   private advisorRef: import("./types.js").AdvisorModelRef
 
   constructor(
-    private readonly opts: AdvisorOptions,
+    private opts: AdvisorOptions,
     private readonly host: Host,
   ) {
     this.advisorRef = { ...opts.advisor }
   }
 
-  /** The advisor model currently in effect (override or config default). */
+  /** The advisor model currently in effect (config default or hot-swapped). */
   advisor(): import("./types.js").AdvisorModelRef {
     return this.advisorRef
   }
@@ -139,6 +139,15 @@ export class AdvisorEngine {
   /** Hot-swap the advisor model (used by /advisor-settings). */
   setAdvisor(ref: import("./types.js").AdvisorModelRef): void {
     this.advisorRef = { providerID: ref.providerID, id: ref.id, ...(ref.variant ? { variant: ref.variant } : {}) }
+  }
+
+  /**
+   * Apply a freshly resolved option set (settings save / config file reload).
+   * Takes effect immediately — no restart. Callers own model hot-swap via
+   * setAdvisor; this only replaces limits, budgets, mode, and triggers.
+   */
+  applyOptions(next: AdvisorOptions): void {
+    this.opts = next
   }
 
   private state(sessionID: string): TaskState {

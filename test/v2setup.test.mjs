@@ -723,3 +723,30 @@ test("fast consults deliver inline — no double injection (reviewer finding 1)"
   assert.ok(status.content.includes("delivery inline"), "ledger records inline delivery")
 })
 
+test("follow-up consults carry a session-context header and a prior-advice digest", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  await advisorTool.execute({}, { sessionID: "s-d1", signal: new AbortController().signal })
+  await advisorTool.execute({}, { sessionID: "s-d1", signal: new AbortController().signal })
+  const second = captured.generateTextInputs[1]?.prompt ?? ""
+  assert.ok(second.includes("SESSION CONTEXT: working directory"), "metadata header present")
+  assert.ok(second.includes("PRIOR ADVISORY CONTEXT"), "prior-advice digest present")
+  assert.ok(second.includes("earlier consult"), "digest entry present")
+})
+
+test("empty direct responses retry once before falling back", async () => {
+  const { ctx, captured } = makeCtx()
+  let direct = 0
+  ctx.generate.text = async () => {
+    direct++
+    if (direct === 1) return { text: "" }
+    return { text: "RETRIED-OK" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const ok = await advisorTool.execute({}, { sessionID: "s-retry", signal: new AbortController().signal })
+  assert.ok(ok.content.includes("RETRIED-OK"), "retry succeeded on the direct transport")
+  assert.equal(captured.switchModelCalls.length, 0, "no fallback needed — the retry recovered it")
+})
+

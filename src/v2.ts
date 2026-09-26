@@ -272,6 +272,22 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             // settles. Cleanup happens in this function's finally.
             pendingAdvisorCalls.set(nonce, sessionID)
           }
+          // Continuity + grounding: a compact session-context line and, for
+          // follow-up consults, a digest of this task's earlier advice. The
+          // advisor stops being amnesiac about its own prior consults, and it
+          // is told the true environment instead of inferring it.
+          let dispatchPrompt = `SESSION CONTEXT: working directory ${directory ?? process.cwd()}; plugin opencode-advisor v${PLUGIN_VERSION}.\n\n${prompt}`
+          const priorAdvice = ledger
+            .list(sessionID)
+            .filter((r) => r.state === "completed" && r.advice)
+            .slice(0, 2)
+          if (priorAdvice.length > 0) {
+            const digest = priorAdvice
+              .map((r) => `- earlier consult: ${(r.advice ?? "").split("\n").slice(2).join(" ").slice(0, 240)}`)
+              .join("\n")
+            dispatchPrompt += `\n\nPRIOR ADVISORY CONTEXT (this task — earlier consult conclusions; if your advice contradicts them, say why):\n${digest}\n`
+          }
+
           try {
             // PRIMARY — history-less direct generation: the native transport
             // for a session-less job. No session context, no model-switch
@@ -279,10 +295,19 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
             // hook attach provider routing (x-opencode-session), exactly as it
             // did for the sandwich.
             try {
-              const res = (await ctx.generate.text({ prompt, model: advisorRef })) as { text?: unknown } | undefined
-              const text = res?.text
-              if (typeof text !== "string" || text.trim() === "") {
-                const shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
+              // Empty completions are a real transient (usage-limit windows,
+              // provider hiccups — live finding A3): retry the direct call
+              // once before falling back to the session sandwich.
+              let text = ""
+              let shape = "undefined"
+              for (let attempt = 1; attempt <= 2; attempt++) {
+                const res = (await ctx.generate.text({ prompt: dispatchPrompt, model: advisorRef })) as { text?: unknown } | undefined
+                text = typeof res?.text === "string" ? res.text : ""
+                shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
+                if (text.trim() !== "") break
+                if (attempt === 1) log("warn", "direct transport returned an empty response — retrying once (transient provider behavior)")
+              }
+              if (text.trim() === "") {
                 throw new Error(`generate.text returned no text (response shape: ${shape})`)
               }
               transportUsed = "direct"
@@ -330,10 +355,16 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               await ctx.session.switchModel({ sessionID, model: advisorRef })
             }
             try {
-              const res = (await ctx.session.generate({ sessionID, prompt })) as { text?: unknown } | undefined
-              const text = res?.text
-              if (typeof text !== "string" || text.trim() === "") {
-                const shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
+              let text = ""
+              let shape = "undefined"
+              for (let attempt = 1; attempt <= 2; attempt++) {
+                const res = (await ctx.session.generate({ sessionID, prompt: dispatchPrompt })) as { text?: unknown } | undefined
+                text = typeof res?.text === "string" ? res.text : ""
+                shape = res && typeof res === "object" ? Object.keys(res).join(",") : typeof res
+                if (text.trim() !== "") break
+                if (attempt === 1) log("warn", "sandwich transport returned an empty response — retrying once (transient provider behavior)")
+              }
+              if (text.trim() === "") {
                 throw new Error(`advisor sub-call returned no text (response shape: ${shape})`)
               }
               transportUsed = "sandwich"

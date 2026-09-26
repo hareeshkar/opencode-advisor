@@ -3,6 +3,22 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.9.0] — 2026-09-26
+
+### Added
+- **Continuity**: follow-up consults in the same task carry a compact digest
+  of this task's earlier advice (conclusions only, capped), so the advisor
+  can assess whether its prior guidance was followed and what changed — no
+  more amnesiac consults.
+- **Grounding header**: every sub-call opens with a session-context line
+  (working directory, plugin version) — the advisor is told the true
+  environment instead of inferring it, closing the false-environment-facts
+  failure class from the field report at the root.
+
+### Fixed
+- Empty provider completions (the A3-class transient) now retry the same
+  transport once before any fallback, on both the direct and sandwich paths.
+
 ## [0.8.2] — 2026-09-26
 
 ### Fixed

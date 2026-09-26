@@ -5,11 +5,9 @@ import { AdvisorEngine } from "../dist/opencode-advisor.js"
 const OPTS = {
   advisor: { providerID: "test", id: "advisor-x" },
   maxUsesPerTask: 2,
-  adviceWordBudget: 120,
+  adviceTokenBudget: 8_000,
   timeoutMs: 50,
   prune: { maxToolOutputChars: 200, transcriptBudgetChars: 1_000 },
-  nudge: "off",
-  injectTimingPrompt: true,
   logLevel: "error",
 }
 
@@ -97,42 +95,24 @@ test("rate-limit error strings map to too_many_requests", async () => {
   assert.equal(r.errorCode, "too_many_requests")
 })
 
-test("hard output cap trims runaway advice at a word boundary", async () => {
+test("hard output cap trims runaway advice to the token budget (≈4 chars/token)", async () => {
   const host = makeHost({ runAdvisor: async () => "word ".repeat(2_000) })
-  const engine = new AdvisorEngine({ ...OPTS, adviceWordBudget: 50 }, host)
+  const engine = new AdvisorEngine({ ...OPTS, adviceTokenBudget: 500 }, host)
   const r = await engine.consult("s8", new AbortController().signal)
   assert.equal(r.ok, true)
-  assert.ok(r.advice.split(/\s+/).length <= 55, `advice word count ${r.advice.split(/\s+/).length}`)
+  assert.ok(r.advice.length <= 500 * 4 + 16, `advice chars ${r.advice.length} within budget + marker`)
+  assert.ok(r.advice.length >= 500 * 4 - 20, `advice chars ${r.advice.length} actually uses the budget`)
   assert.ok(r.advice.includes("…[truncated]"))
+  assert.ok(r.advice.startsWith("word word"), "cut at a word boundary, not mid-word")
 })
 
-test("noteStep: timing on first injectable call only, nudge respects mode", async () => {
-  const engine = new AdvisorEngine({ ...OPTS, nudge: "on" }, makeHost())
-  const first = engine.noteStep("s9", true)
-  assert.equal(first.injectTiming, true)
-  assert.equal(first.injectNudge, false)
-  const second = engine.noteStep("s9", true)
-  assert.equal(second.injectTiming, false)
-  assert.equal(second.injectNudge, true)
-  const third = engine.noteStep("s9", true)
-  assert.equal(third.injectNudge, false, "nudge fires once per task")
-})
-
-test("noteStep: canInject=false defers timing without consuming it (F2 hole 3)", async () => {
-  const engine = new AdvisorEngine({ ...OPTS, nudge: "on" }, makeHost())
-  const blocked = engine.noteStep("s11", true, false)
-  assert.equal(blocked.injectTiming, false, "no injection when system not writable")
-  assert.equal(blocked.injectNudge, false)
-  const next = engine.noteStep("s11", true, true)
-  assert.equal(next.injectTiming, true, "timing not latched by the blocked call")
-})
-
-test("noteStep: nudge suppressed after advisor use", async () => {
-  const engine = new AdvisorEngine({ ...OPTS, nudge: "on" }, makeHost())
-  engine.markAdvisorUsed("s12")
-  engine.noteStep("s12", true)
-  const second = engine.noteStep("s12", true)
-  assert.equal(second.injectNudge, false)
+test("noteStep counts steps and returns void (no injection decisions)", () => {
+  const engine = new AdvisorEngine(OPTS, makeHost())
+  assert.equal(engine.noteStep("s9"), undefined, "step accounting only — nothing is returned")
+  engine.noteStep("s9")
+  assert.equal(engine.health("s9").steps, 2)
+  engine.resetTask("s9")
+  assert.equal(engine.health("s9").steps, 0, "a new task resets the step count")
 })
 
 test("transient failures do not consume the success cap", async () => {
@@ -172,30 +152,18 @@ test("parallel consults respect the cap via in-flight reservation", async () => 
   assert.ok(results.filter((r) => !r.ok).every((r) => r.errorCode === "max_uses_exceeded"))
 })
 
-test("hook-delivery warning fires once when injections never land", async () => {
-  const warnings = []
-  const host = makeHost({ log: (level, msg) => { if (level === "warn") warnings.push(msg) } })
-  const engine = new AdvisorEngine(OPTS, host)
-  for (let i = 0; i < 4; i++) engine.noteStep("hw", false, false)
-  await engine.consult("hw", new AbortController().signal)
-  assert.equal(warnings.length, 1)
-  assert.ok(warnings[0].includes("context hooks"))
-})
-
-test("health() snapshots task state for diagnostics", () => {
+test("health() snapshots the 4-field task state for diagnostics", () => {
   const engine = new AdvisorEngine(OPTS, makeHost())
   assert.deepEqual(engine.health("nope"), {
     calls: 0,
     attempts: 0,
     steps: 0,
-    timingInjected: false,
     advisorUsed: false,
-    nudged: false,
   })
-  engine.noteStep("h1", true)
-  const h = engine.health("h1")
-  assert.equal(h.steps, 1)
-  assert.equal(h.timingInjected, true)
+  engine.noteStep("h1")
+  assert.equal(engine.health("h1").steps, 1)
+  engine.markAdvisorUsed("h1")
+  assert.equal(engine.health("h1").advisorUsed, true)
 })
 test("upstream secrets never reach the tool result", async () => {
   const host = makeHost({
@@ -208,12 +176,12 @@ test("upstream secrets never reach the tool result", async () => {
   assert.ok(!r.message.includes("abc.def.ghi"), "bearer redacted")
   assert.ok(r.message.includes("<redacted>"))
 })
-test("prompt-enforced budget appears in the advisor prompt", async () => {
+test("prompt-enforced token budget appears in the advisor prompt", async () => {
   let seenPrompt = ""
   const host = makeHost({ runAdvisor: async (p) => { seenPrompt = p; return "ok advice" } })
-  const engine = new AdvisorEngine({ ...OPTS, adviceWordBudget: 80 }, host)
+  const engine = new AdvisorEngine({ ...OPTS, adviceTokenBudget: 8_000 }, host)
   await engine.consult("s10", new AbortController().signal)
-  assert.ok(seenPrompt.includes("under 80 words"), "budget instruction present")
+  assert.ok(seenPrompt.includes("under 8000 tokens"), "token budget instruction present")
   assert.ok(/<transcript-[a-z0-9]+>/.test(seenPrompt), "transcript framed with nonce delimiter")
   assert.ok(seenPrompt.includes("EVIDENCE"), "injection defense present")
   assert.ok(seenPrompt.includes("transcript pruned"), "pruning manifest present (F7)")
@@ -270,7 +238,7 @@ test("straggler consult after resetTask does not consume the new task's quota (g
 
 test("health() reflects the generation counter bump", () => {
   const engine = new AdvisorEngine(OPTS, makeHost())
-  engine.noteStep("g1", false)
+  engine.noteStep("g1")
   engine.health("g1")
   engine.resetTask("g1")
   const h = engine.health("g1")

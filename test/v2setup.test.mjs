@@ -320,6 +320,31 @@ test("unconfigured install injects no timing guidance (token discipline)", async
   assert.equal(sys.system.length, 0, "nothing injected while unconfigured")
 })
 
+test("GUARANTEE: no explicit request ⇒ nothing injected and no advisor sub-call", async () => {
+  const { ctx, captured } = makeCtx()
+  let generateCalls = 0
+  ctx.session.generate = async () => {
+    generateCalls++
+    return { text: "SHOULD-NOT-RUN" }
+  }
+  await createV2Plugin().setup(ctx)
+
+  // An ordinary prompt (no trigger word, no /advisor): nothing is queued.
+  await captured.promptHooks[0]({ sessionID: "s-quiet", prompt: { text: "deploy the cache" } })
+  const ctxEvent = { sessionID: "s-quiet", kind: "primary", model: { providerID: "p", id: "m" }, system: [] }
+  await captured.contextHooks[0](ctxEvent)
+  assert.equal(ctxEvent.system.length, 0, "context hook pushes nothing")
+
+  const raw = JSON.stringify({ model: "m", system: "base", messages: [{ role: "user", content: "deploy" }] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: raw })
+  const httpEvent = { sessionID: "s-quiet", kind: "primary", request }
+  await captured.httpHooks[0](httpEvent)
+  assert.equal(httpEvent.request, request, "request object untouched")
+  assert.equal(await httpEvent.request.clone().text(), raw, "request body byte-identical")
+  assert.equal(generateCalls, 0, "no advisor sub-call was made")
+  assert.equal(captured.prompts.length, 0, "no synthetic prompt was submitted")
+})
+
 test("agent mode spawns a read-only child session, polls to idle, returns its advice", async () => {
   const adviceText = "AGENT-GROUNDED-ADVICE: verified in engine.ts line 42."
   let childID = ""
@@ -356,7 +381,12 @@ test("agent mode spawns a read-only child session, polls to idle, returns its ad
 
   const childPrompt = captured.prompts.find((p) => p.sessionID === "ses_child_agent")
   assert.ok(childPrompt, "child prompted")
-  assert.ok(childPrompt.text.startsWith("You are the ADVISOR operating in AGENT MODE"), "agent prefix present")
+  assert.ok(
+    childPrompt.text.startsWith("You are the ADVISOR operating in REVIEW + AGENT mode"),
+    "agent prefix names the MAP/TERRITORY mechanism",
+  )
+  assert.ok(childPrompt.text.includes("MAP"), "conversation framed as the map")
+  assert.ok(childPrompt.text.includes("TERRITORY"), "tools framed as the territory")
   assert.ok(childPrompt.text.includes("<transcript-"), "transcript forwarded for grounding")
 })
 

@@ -3,6 +3,44 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.7.0] — 2026-09-26
+
+### Added
+- **File-as-truth configuration**: `opencode-advisor.json` (global + project;
+  project wins) with per-key provenance, atomic tmp+fsync+rename writes, and
+  a one-time migration of the pre-0.7 stored pick. Manual JSON edits and the
+  settings UI edit the same file; **Inherit** removes a key instead of
+  freezing today's value.
+- **Token-native budgets**: `adviceTokenBudget` = advisor OUTPUT tokens
+  (presets 4K/8K/16K/32K; range 500–64K — model max-output caps are typically
+  8K–65K) and `transcriptBudgetTokens` = INPUT context (presets
+  8K/16K/32K/64K; range 2K–1M; chars derived ×4 for the pruner). A preset
+  whose exact quantities no longer match displays as **Custom** (computed,
+  never persisted).
+- **Full settings menu**: `/advisor-settings` edits Model (live catalog,
+  variants, custom, Inherit), Preset (with consequences), Mode
+  (Review / Review + Agent), and Limits (consults, timeout, context tokens,
+  advice tokens, per-tool cap, retry ceiling, log level). Draft → Save (one
+  atomic write) or Cancel; nothing writes until Save.
+- **Evidence hygiene (fixes a live degeneration)**: prior advisor replies and
+  trailing in-flight assistant drafts are excluded from consult evidence, and
+  the advisor prompt forbids continuing/narrating consultation machinery.
+
+### Changed
+- **Manual-only by design**: removed the nudge, the executor timing prompt,
+  and all grant/"stuck" semantics — no explicit user request (trigger words,
+  `/advisor`, or a direct ask), no consultation, no spend. Unconfigured
+  installs answer with setup steps (model is the only required choice;
+  Balanced preset and all limits are pre-tuned) and cost nothing.
+- **Review + Agent** naming: the read-only child session gets the pruned
+  conversation as its MAP and verifies implicated files as the TERRITORY
+  (`review-agent` accepted as a config alias).
+- Retry ceiling documented as transport attempts — never extra paid consults.
+
+### Removed
+- Storage override (`advisor:override`), timing/nudge prompt assets and tier
+  heuristics, and word-based budget knobs in favor of token budgets.
+
 ## [0.5.0] — 2026-09-26
 
 ### Added

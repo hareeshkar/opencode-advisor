@@ -1,7 +1,7 @@
 /**
  * AdvisorEngine — host-agnostic orchestration core.
  *
- * Owns everything except transport: per-task call caps, step/nudge decisions,
+ * Owns everything except transport: per-task call caps, step accounting,
  * pruning, prompt assembly, timeout enforcement, error-code mapping, output
  * caps, and usage accounting. V1/V2 adapters provide the Host implementation.
  *
@@ -20,31 +20,23 @@ import type {
   ConsultResult,
   Host,
   Slice,
-  StepDecision,
   TaskState,
   UsageEntry,
 } from "./types.js"
 
 /**
- * Physical output cap: enforce the word budget exactly (token length varies
- * wildly across languages and models), with a char-based safety ceiling for
- * pathological single-token runs. One word is reserved for the truncation
- * marker so output is never `words + 1`.
+ * Physical output cap: enforce the token budget with a ≈4-chars/token
+ * conversion (exact tokenization is model-specific; the prompt states the
+ * budget in tokens, this is the safety net that keeps pathological runs
+ * bounded).
  */
-function hardCapWords(text: string, words: number): string {
+function hardCapTokens(text: string, tokens: number): string {
   const MARKER = "…[truncated]"
-  let t = text
-  const maxChars = words * 12
-  if (t.length > maxChars) {
-    const cut = t.slice(0, maxChars)
-    const lastSpace = cut.lastIndexOf(" ")
-    t = (lastSpace > maxChars * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()
-  }
-  const parts = t.split(/\s+/).filter((w) => w !== "")
-  if (parts.length > words) {
-    t = parts.slice(0, Math.max(1, words - 1)).join(" ") + " " + MARKER
-  }
-  return t
+  const maxChars = tokens * 4
+  if (text.length <= maxChars) return text
+  const cut = text.slice(0, maxChars)
+  const lastSpace = cut.lastIndexOf(" ")
+  return `${(lastSpace > maxChars * 0.6 ? cut.slice(0, lastSpace) : cut).trimEnd()} ${MARKER}`
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, signal: AbortSignal): Promise<T> {
@@ -160,11 +152,8 @@ export class AdvisorEngine {
         inFlight: 0,
         generation: 0,
         steps: 0,
-        timingInjected: false,
         advisorUsed: false,
-        nudged: false,
         taskFingerprint: undefined,
-        hookWarned: false,
         lastSeen: Date.now(),
       }
       this.tasks.set(sessionID, st)
@@ -194,11 +183,8 @@ export class AdvisorEngine {
     st.attempts = 0
     st.inFlight = 0
     st.steps = 0
-    st.timingInjected = false
     st.advisorUsed = false
-    st.nudged = false
     st.taskFingerprint = undefined
-    st.hookWarned = false
     st.lastSeen = Date.now()
   }
 
@@ -207,56 +193,20 @@ export class AdvisorEngine {
   }
 
   /** Snapshot of task state for diagnostics (drives the diag:health ledger key). */
-  health(sessionID: string): {
-    calls: number
-    attempts: number
-    steps: number
-    timingInjected: boolean
-    advisorUsed: boolean
-    nudged: boolean
-  } {
+  health(sessionID: string): { calls: number; attempts: number; steps: number; advisorUsed: boolean } {
     const st = this.tasks.get(sessionID)
-    if (!st) {
-      return { calls: 0, attempts: 0, steps: 0, timingInjected: false, advisorUsed: false, nudged: false }
-    }
-    return {
-      calls: st.calls,
-      attempts: st.attempts,
-      steps: st.steps,
-      timingInjected: st.timingInjected,
-      advisorUsed: st.advisorUsed,
-      nudged: st.nudged,
-    }
+    if (!st) return { calls: 0, attempts: 0, steps: 0, advisorUsed: false }
+    return { calls: st.calls, attempts: st.attempts, steps: st.steps, advisorUsed: st.advisorUsed }
   }
 
   /**
-   * Called once per model request (context hook / system transform).
-   *
-   * Injection is STATE-DRIVEN, not index-driven: the timing prompt fires on
-   * the first *injectable* call of a task (whatever its index), and flags
-   * latch only when the caller confirms the system array was actually
-   * writable — so a non-array `event.system` or a failed prompt-hook
-   * registration degrades gracefully instead of silently suppressing
-   * guidance. The nudge window opens at the 2nd call and stays open, so
-   * hidden/auxiliary model calls can't steal the slot.
-   *
-   * `nudgeEligible` may be a lazy callback so executor-tier matching runs
-   * only when a nudge is actually on the table.
+   * Called once per primary model request (context hook / system transform).
+   * Step accounting only — no timing prompt, no nudge, no autonomous
+   * steering: the plugin never injects guidance the user did not request.
+   * Counts feed diagnostics (diag:health).
    */
-  noteStep(
-    sessionID: string,
-    nudgeEligible: boolean | (() => boolean),
-    canInject = true,
-  ): StepDecision {
-    const st = this.state(sessionID)
-    st.steps++
-    const injectTiming = this.opts.injectTimingPrompt && !st.timingInjected && canInject
-    if (injectTiming) st.timingInjected = true
-    const nudgePossible = !st.nudged && !st.advisorUsed && st.steps >= 2
-    const eligible = nudgePossible ? (typeof nudgeEligible === "function" ? nudgeEligible() : nudgeEligible) : false
-    const injectNudge = nudgePossible && eligible && canInject && this.opts.nudge !== "off"
-    if (injectNudge) st.nudged = true
-    return { injectTiming, injectNudge }
+  noteStep(sessionID: string): void {
+    this.state(sessionID).steps++
   }
 
   /** The core escalation path, invoked by the `advisor` tool executor. */
@@ -355,18 +305,6 @@ export class AdvisorEngine {
     const promptChars = prompt.length
     const estTokensIn = Math.ceil(promptChars / 4)
 
-    // Turn-1 assertion: if model calls keep arriving but no injection was
-    // ever delivered, the host is swallowing context hooks — say so once,
-    // loudly, instead of running a silently unguided task.
-    if (!st.timingInjected && st.steps > 3 && !st.hookWarned) {
-      st.hookWarned = true
-      this.host.log(
-        "warn",
-        "advisor: no system injection delivered after 3+ model calls — host may not be delivering " +
-          "context hooks (timing/nudge guidance inactive). See opencode-advisor troubleshooting.",
-      )
-    }
-
     let raw: string
     try {
       raw = await withTimeout(this.host.runAdvisor(prompt, signal, sessionID, nonce, this.advisorRef), this.opts.timeoutMs, signal)
@@ -375,7 +313,7 @@ export class AdvisorEngine {
       return fail(errorCode, message, estTokensIn)
     }
 
-    const advice = sanitizeAdviceText(hardCapWords(raw.trim(), this.opts.adviceWordBudget))
+    const advice = sanitizeAdviceText(hardCapTokens(raw.trim(), this.opts.adviceTokenBudget))
     if (advice === "") {
       return fail("unavailable", "Advisor returned an empty response.", estTokensIn)
     }

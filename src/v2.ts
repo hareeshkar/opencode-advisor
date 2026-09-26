@@ -4,7 +4,7 @@
  * Mapping of our architecture onto V2 primitives:
  *   advisor tool        → ctx.tool.transform (zero-arg JSON-Schema tool)
  *   task reset          → ctx.session.hook("prompt")
- *   timing/nudge inject → ctx.session.hook("context")  (transient — never persisted)
+ *   directive delivery  → ctx.session.hook("context")  (transient — never persisted)
  *   advisor sub-call    → ctx.generate.text (no session, no tools, no history)
  *   usage ledger        → ctx.storage (durable, plugin-scoped)
  *
@@ -19,10 +19,10 @@ import { ADVISOR_CONFIG_KEYS, loadAdvisorConfig, migrateStoredOverride, removeAd
 import type { AdvisorConfigSnapshot } from "./config.js"
 import { AdvisorEngine } from "./engine.js"
 import { extractToolNames, replaceSystemInBody } from "./inject.js"
-import { resolveOptions, shouldNudgeExecutor } from "./options.js"
+import { resolveOptions } from "./options.js"
 import { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA } from "./settings.js"
-import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, EXECUTOR_TIMING_PROMPT, NUDGE_TEXT, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
-import { frameAdvice } from "./sanitize.js"
+import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
+import { frameAdvice, isAdvisorOutputFrame } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, Host, LogLevel, Slice, UsageEntry } from "./types.js"
 
@@ -135,7 +135,9 @@ export function normalizeV2Transcript(messages: unknown): Slice[] {
             out.push({ role: "assistant", text: p.text })
           } else if (p?.type === "tool") {
             const s = toolSlice(p.name, p)
-            if (s) out.push(s)
+            // Evidence hygiene: prior advisor replies are the model's own
+            // voice — never feed them back (self-imitation channel).
+            if (s && !isAdvisorOutputFrame(s.text)) out.push(s)
           }
           // reasoning parts are intentionally skipped: verbose, low advisor value
         }
@@ -144,11 +146,16 @@ export function normalizeV2Transcript(messages: unknown): Slice[] {
     }
     if (type === "shell") {
       const text = typeof msg.text === "string" ? msg.text : toText(msg.output)
-      if (text) out.push({ role: "tool", name: "shell", text })
+      if (text && !isAdvisorOutputFrame(text)) out.push({ role: "tool", name: "shell", text })
       continue
     }
     // system / compaction / idle / skill / *Selected → no advisor signal
   }
+  // Evidence hygiene: the in-flight assistant text of the CURRENT turn is a
+  // draft, not evidence — GLM-5.3 was observed continuing the executor's own
+  // sentence (live regression 2026-09-26, attempt 1). Completed prior turns
+  // remain; at least one slice is always kept.
+  while (out.length > 1 && out[out.length - 1]!.role === "assistant") out.pop()
   return out
 }
 
@@ -504,8 +511,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           maxUsesPerTask: resolved.maxUsesPerTask,
           maxAttempts: resolved.maxAttempts,
           timeoutMs: resolved.timeoutMs,
-          adviceWordBudget: resolved.adviceWordBudget,
-          transcriptBudgetChars: resolved.prune.transcriptBudgetChars,
+          adviceTokenBudget: resolved.adviceTokenBudget,
+          transcriptBudgetTokens: resolved.transcriptBudgetTokens,
           maxToolOutputChars: resolved.prune.maxToolOutputChars,
           triggers: resolved.triggers,
           logLevel: resolved.logLevel,
@@ -676,8 +683,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
               // Observable hook-delivery signal: last-write-wins health per
               // consult (bounded: 1 small write per consult, not per call).
               // Lets post-hoc analysis distinguish "hooks never delivered"
-              // (timingInjected=false, steps high) from "model chose not to
-              // call" — the key ambiguity of the pilot benchmark.
+              // (steps high) from "model chose not to call" — the key
+              // ambiguity of the pilot benchmark.
               try {
                 void ctx.storage
                   .set("diag:health", { sessionID, time: Date.now(), ...engine.health(sessionID) })
@@ -833,18 +840,19 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         }
       }
 
-      // --- 3) transient system injection (timing + nudge) -----------------
+      // --- 3) transient consult-directive delivery ------------------------
+      // The ONLY system text queued here: a user-requested consult directive
+      // (trigger words / /advisor). There is no timing guidance, no nudge,
+      // no autonomous steering: no request ⇒ nothing is ever injected.
       try {
         const reg3 = await ctx.session.hook("context", (event: any) => {
           try {
             const sid = String(event?.sessionID ?? "")
             // Skip auxiliary / non-primary requests (compaction, title,
-            // hidden generations share the hook identity) and malformed
-            // events — they must never consume injection slots or steps.
+            // hidden generations share the hook identity) and malformed events.
             if (!sid) return
             if (event?.kind !== undefined && event.kind !== "primary") return
             const modelRef = event?.model
-            const modelId = modelRef ? `${String(modelRef.providerID ?? "")}/${String(modelRef.id ?? "")}` : undefined
             // Track the executor model for the sandwich restore.
             if (modelRef && typeof modelRef.id === "string" && typeof modelRef.providerID === "string") {
               sessionModel.set(sid, {
@@ -853,22 +861,13 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 ...(typeof modelRef.variant === "string" ? { variant: modelRef.variant } : {}),
               })
             }
-            // canInject: flags latch only when the system array is actually writable,
-            // so a non-array event.system retries next call instead of losing the
-            // injection for the whole task. Eligibility is lazy so tier regexes
-            // run only when a nudge is actually on the table.
-            const canInject = Array.isArray(event?.system)
-            // Unconfigured installs inject nothing: no timing guidance for a
-            // tool that would only return setup steps (token discipline).
-            const d = isAdvisorConfigured(engine.advisor())
-              ? engine.noteStep(sid, () => shouldNudgeExecutor(modelId, opts.nudge), canInject)
-              : { injectTiming: false, injectNudge: false }
+            engine.noteStep(sid)
             // Permanent hook-delivery census: one tiny write on each session's
             // first model call (last-write-wins single key — bounded). Lets
             // post-hoc analysis prove hooks fire in any session type
             // (one-shot `run`, subagents, TUI) without per-call amplification.
             // The richer `diag:ctx` write additionally records the SHAPE of
-            // the context event (canInject depends on system being an array).
+            // the context event.
             if (engine.health(sid).steps === 1) {
               try {
                 void ctx.storage.set("diag:hookcheck", { sessionID: sid, time: Date.now() }).catch(() => {})
@@ -886,27 +885,15 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 /* diagnostics only */
               }
             }
-            // Transient guidance is QUEUED here, not pushed into
-            // event.system: v2.0.16 does not deliver context-hook system
+            // A pending user-requested directive is QUEUED here, not pushed
+            // into event.system: v2.0.16 does not deliver context-hook system
             // mutations to the provider (verified with an in-band canary).
             // Delivery happens in the http.request hook by rewriting the
             // outgoing body (native, request-level).
-            {
-              const directive = takeDirective(sid)
-              const injections: string[] = []
-              if (directive) injections.push(directive)
-              if (d.injectTiming) injections.push(EXECUTOR_TIMING_PROMPT)
-              if (d.injectNudge) injections.push(NUDGE_TEXT)
-              if (injections.length > 0) {
-                queueSystemInjection(sid, injections)
-              }
-              diagDirective("context", sid, {
-                queued: injections.length,
-                directive: directive !== undefined,
-                timing: d.injectTiming,
-                nudge: d.injectNudge,
-                kind: String(event?.kind ?? "(none)"),
-              })
+            const directive = takeDirective(sid)
+            if (directive) {
+              queueSystemInjection(sid, [directive])
+              diagDirective("context", sid, { queued: 1, directive: true, kind: String(event?.kind ?? "(none)") })
             }
           } catch (err) {
             log("warn", "context hook body failed (ignored — model call proceeds)", err)
@@ -914,7 +901,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         })
         regs.push(reg3)
       } catch (err) {
-        log("warn", "context hook registration failed (timing prompt will not be injected)", err)
+        log("warn", "context hook registration failed (consult directives will not be delivered)", err)
       }
 
       // --- 4) native request rewrite: session header + transient system ----
@@ -1094,7 +1081,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         const tools = await ctx.tool.list()
         const listed = Array.isArray(tools) && tools.some((t: any) => String(t?.id ?? t?.name ?? "") === "advisor")
         if (editorSawAdvisor && listed) {
-          log("info", `ready v${PLUGIN_VERSION} — tool=✓ advisor=${opts.advisor.providerID}/${opts.advisor.id} maxUses/task=${opts.maxUsesPerTask} budget=${opts.adviceWordBudget}w`)
+          log("info", `ready v${PLUGIN_VERSION} — tool=✓ advisor=${opts.advisor.providerID}/${opts.advisor.id} maxUses/task=${opts.maxUsesPerTask} advice=${opts.adviceTokenBudget}t context=${opts.transcriptBudgetTokens}t`)
         } else {
           log("error", `SELF-PROBE WEAK: editorSaw=${editorSawAdvisor} listed=${listed} — the tool may register without dispatching (host issue class #44788). Consults will warn if hooks never deliver.`)
         }

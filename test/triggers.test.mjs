@@ -32,12 +32,15 @@ test("hasDirective detects the marker", () => {
   assert.equal(hasDirective("blah [advisor requested by user — trigger: \"x\"] blah"), true)
 })
 
-test("triggerDirective: mention mode distinguishes request-now from permit-later", () => {
+test("triggerDirective: mention mode asks for a request now, never a deferred grant", () => {
   const d = triggerDirective("get consultation", "mention")
   assert.ok(d.includes('"get consultation"'))
-  assert.ok(d.includes("asks for consultation now"))
-  assert.ok(d.includes("merely permits future use"), "grant clause present")
-  assert.ok(d.includes("do NOT call now"))
+  assert.ok(d.includes("requests consultation now"))
+  assert.ok(d.includes("merely mentions or discusses the advisor"), "mention-only is explicitly non-spending")
+  assert.ok(d.includes("no deferred or automatic consultation"), "no deferred semantics")
+  assert.ok(d.includes("do NOT call"), "permission-only messages must not call")
+  assert.ok(!d.includes("remember"), "nothing to grant or remember")
+  assert.ok(!d.includes("before declaring done"), "no timing hook left")
   assert.ok(d.includes("not_configured"), "relay setup steps on unconfigured")
 })
 
@@ -50,9 +53,11 @@ test("triggerDirective: command mode is unconditional", () => {
 })
 
 test("frugal UX invariants are locked in prompt assets", async () => {
-  const { ADVISOR_TOOL_DESCRIPTION, EXECUTOR_TIMING_PROMPT } = await import("../dist/opencode-advisor.js")
+  const mod = await import("../dist/opencode-advisor.js")
+  const { ADVISOR_TOOL_DESCRIPTION } = mod
   assert.ok(ADVISOR_TOOL_DESCRIPTION.includes("Do NOT call unprompted"), "tool description forbids autonomous calls")
-  assert.ok(ADVISOR_TOOL_DESCRIPTION.includes("permitted advisor use"), "grant-gated stuck calls")
-  assert.ok(EXECUTOR_TIMING_PROMPT.includes("WITHOUT calling it"), "timing teaches solo-default")
-  assert.ok(EXECUTOR_TIMING_PROMPT.includes("ONLY when the user explicitly asks"), "request-gating")
+  assert.ok(ADVISOR_TOOL_DESCRIPTION.includes("no autonomous or deferred consultation"), "manual-only semantics")
+  assert.ok(ADVISOR_TOOL_DESCRIPTION.includes("default to your best solo work"), "solo-default credit discipline")
+  assert.equal("EXECUTOR_TIMING_PROMPT" in mod, false, "timing prompt is gone from the public surface")
+  assert.equal("NUDGE_TEXT" in mod, false, "nudge asset is gone from the public surface")
 })

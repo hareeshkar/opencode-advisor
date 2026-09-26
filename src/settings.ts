@@ -35,8 +35,8 @@ export const CONFIG_OUTPUT_SCHEMA = {
         maxUsesPerTask: { type: "number" },
         maxAttempts: { type: "number" },
         timeoutMs: { type: "number" },
-        adviceWordBudget: { type: "number" },
-        transcriptBudgetChars: { type: "number" },
+        adviceTokenBudget: { type: "number" },
+        transcriptBudgetTokens: { type: "number" },
         maxToolOutputChars: { type: "number" },
         triggers: { type: "array", items: { type: "string" } },
         logLevel: { type: "string" },
@@ -51,8 +51,8 @@ export const CONFIG_OUTPUT_SCHEMA = {
         "maxUsesPerTask",
         "maxAttempts",
         "timeoutMs",
-        "adviceWordBudget",
-        "transcriptBudgetChars",
+        "adviceTokenBudget",
+        "transcriptBudgetTokens",
         "maxToolOutputChars",
         "triggers",
         "logLevel",
@@ -101,8 +101,8 @@ export interface AdvisorSettingsView {
     maxUsesPerTask: number
     maxAttempts: number
     timeoutMs: number
-    adviceWordBudget: number
-    transcriptBudgetChars: number
+    adviceTokenBudget: number
+    transcriptBudgetTokens: number
     maxToolOutputChars: number
     triggers: string[]
     logLevel: string
@@ -132,6 +132,7 @@ export interface SettingsSelectOption {
   description?: string
   footer?: string
   category?: string
+  disabled?: boolean
 }
 
 export interface SettingsPorts {
@@ -192,9 +193,9 @@ export function presetBlurb(name: string): string {
   const preset = PRESETS[name]
   if (!preset) return ""
   const uses = preset.maxUsesPerTask as number
-  const context = parseHumanSize(preset.transcriptBudgetChars as string | number) ?? 0
-  const words = preset.adviceWordBudget as number
-  return `${uses} consult${uses === 1 ? "" : "s"}/task · ${formatSize(context)} context · ${words}-word advice`
+  const context = parseHumanSize(preset.transcriptBudgetTokens as string | number) ?? 0
+  const advice = preset.adviceTokenBudget as number
+  return `${uses} consult${uses === 1 ? "" : "s"}/task · ${formatSize(context)} context tokens · ${formatSize(advice)} advice tokens`
 }
 
 export function tierLabel(tier: string | undefined): string {
@@ -263,22 +264,78 @@ export function currentModel(view: AdvisorSettingsView, draft: SettingsDraft): M
   }
 }
 
+export type PresetKind = "preset" | "custom" | "inherit"
+
 export interface PresetDisplay {
+  kind: PresetKind
   name: string
   title: string
   blurb: string
-  inherit: boolean
   isDefault: boolean
 }
 
-export function currentPreset(view: AdvisorSettingsView, draft: SettingsDraft): PresetDisplay {
-  const value = draft.preset !== undefined ? draft.preset : view.config.preset === "" ? undefined : view.config.preset
-  if (value === null) {
-    return { name: "", title: "Inherit", blurb: "No preset key in this file — falls back to other layers", inherit: true, isDefault: true }
+/** A preset's three controlled quantities (context/advice in TOKENS). */
+export function presetExpansion(name: string): { consults: number; contextTokens: number; adviceTokens: number } {
+  const preset = PRESETS[name] ?? PRESETS.balanced!
+  return {
+    consults: preset.maxUsesPerTask as number,
+    contextTokens: parseHumanSize(preset.transcriptBudgetTokens as string | number) ?? 16_000,
+    adviceTokens: preset.adviceTokenBudget as number,
   }
-  const name = typeof value === "string" && value !== "" ? value : "balanced"
-  const isDefault = typeof value !== "string"
-  return { name, title: presetTitle(name), blurb: presetBlurb(name), inherit: false, isDefault }
+}
+
+/**
+ * Preset = exactly its expansion, resolved like the runtime would: explicit
+ * draft keys win; explicit file/deployment keys beat the preset; otherwise
+ * the declared preset expands (default: balanced). Any deviation ⇒ Custom —
+ * computed, never persisted, so the row never lies about the effective mix.
+ */
+export function currentPreset(view: AdvisorSettingsView, draft: SettingsDraft): PresetDisplay {
+  if (draft.preset === null) {
+    return { kind: "inherit", name: "", title: "Inherit", blurb: "No preset key in this file — falls back to other layers", isDefault: false }
+  }
+  const declaredRaw = draft.preset !== undefined ? draft.preset : view.config.preset
+  const declared = typeof declaredRaw === "string" && declaredRaw !== "" ? declaredRaw : ""
+  const draftedPreset = typeof draft.preset === "string" && draft.preset !== "" ? draft.preset : undefined
+  const base = presetExpansion(declared)
+  const resolveKey = (draftKey: string, baseValue: number): number => {
+    if (draft[draftKey] === null) return baseValue
+    if (draft[draftKey] !== undefined) return draft[draftKey] as number
+    // A freshly drafted preset means the server-resolved values are stale for
+    // keys the new preset would control — unless an explicit file/deployment
+    // value persists and overrides it (tier-attributed), which keeps its value.
+    if (draftedPreset !== undefined && view.tiers[draftKey] === undefined) return baseValue
+    return (view.config as unknown as Record<string, number>)[draftKey] ?? baseValue
+  }
+  const effective = {
+    consults: resolveKey("maxUsesPerTask", base.consults),
+    contextTokens: resolveKey("transcriptBudgetTokens", base.contextTokens),
+    adviceTokens: resolveKey("adviceTokenBudget", base.adviceTokens),
+  }
+  const match = Object.keys(PRESETS).find((name) => {
+    const expansion = presetExpansion(name)
+    return (
+      expansion.consults === effective.consults &&
+      expansion.contextTokens === effective.contextTokens &&
+      expansion.adviceTokens === effective.adviceTokens
+    )
+  })
+  if (match) {
+    return {
+      kind: "preset",
+      name: match,
+      title: presetTitle(match),
+      blurb: presetBlurb(match),
+      isDefault: declared === "" && match === "balanced",
+    }
+  }
+  return {
+    kind: "custom",
+    name: "",
+    title: "Custom",
+    blurb: "Effective limits match no preset — pick one to snap back, or keep this mix",
+    isDefault: false,
+  }
 }
 
 export interface ModeDisplay {
@@ -289,8 +346,8 @@ export interface ModeDisplay {
 }
 
 export const MODE_DESCRIPTIONS: Record<"review" | "agent", string> = {
-  review: "Pruned conversation → compact advice. Fast, economical (default).",
-  agent: "Advisor reads project files and verifies before advising. Slower, costlier.",
+  review: "Pruned conversation → compact advice. Fastest, most economical (default).",
+  agent: "Review + Agent — the conversation is the map; the advisor verifies the implicated files with read-only tools before advising.",
 }
 
 export function currentMode(view: AdvisorSettingsView, draft: SettingsDraft): ModeDisplay {
@@ -299,13 +356,16 @@ export function currentMode(view: AdvisorSettingsView, draft: SettingsDraft): Mo
     return { mode: "review", title: "Inherit", description: "No mode key in this file — falls back to other layers", inherit: true }
   }
   const mode = value === "agent" ? "agent" : "review"
-  return { mode, title: mode === "agent" ? "Agent" : "Review", description: MODE_DESCRIPTIONS[mode], inherit: false }
+  return { mode, title: mode === "agent" ? "Review + Agent" : "Review", description: MODE_DESCRIPTIONS[mode], inherit: false }
 }
 
 export interface LimitsDisplay {
   consults: number
   timeoutMs: number
-  contextChars: number
+  /** INPUT context budget, in tokens (≈4 chars/token when pruning). */
+  contextTokens: number
+  /** OUTPUT budget for the advisor's reply, in tokens. */
+  adviceTokens: number
   toolCap: number
   attempts: number
   logLevel: string
@@ -324,7 +384,8 @@ export function currentLimits(view: AdvisorSettingsView, draft: SettingsDraft): 
   return {
     consults: pick("maxUsesPerTask", 3) as number,
     timeoutMs: pick("timeoutMs", 90_000) as number,
-    contextChars: pick("transcriptBudgetChars", 32_000) as number,
+    contextTokens: pick("transcriptBudgetTokens", 16_000) as number,
+    adviceTokens: pick("adviceTokenBudget", 8_000) as number,
     toolCap: pick("maxToolOutputChars", 1_500) as number,
     attempts: pick("maxAttempts", 11) as number,
     logLevel: pick("logLevel", "info") as string,
@@ -345,7 +406,7 @@ export function mainMenuRows(view: AdvisorSettingsView, draft: SettingsDraft): M
     {
       category: "Settings",
       value: "preset",
-      title: `Preset — ${preset.title}${preset.isDefault && !preset.inherit ? " · default" : ""}`,
+      title: `Preset — ${preset.title}${preset.kind === "preset" && preset.isDefault ? " · default" : ""}`,
       description: preset.blurb,
     },
     { category: "Settings", value: "mode", title: `Mode — ${mode.title}`, description: mode.description },
@@ -353,7 +414,7 @@ export function mainMenuRows(view: AdvisorSettingsView, draft: SettingsDraft): M
       category: "Settings",
       value: "limits",
       title: `Limits — ${limits.consults} consults/task · ${formatDuration(limits.timeoutMs)}`,
-      description: `${formatSize(limits.contextChars)} context · ${formatSize(limits.toolCap)} per tool output · ${limits.attempts} retries · log ${limits.logLevel}`,
+      description: `${formatSize(limits.contextTokens)} context tokens · ${formatSize(limits.adviceTokens)} advice tokens · ${formatSize(limits.toolCap)} chars per tool output · ${limits.attempts} retries`,
     },
     { category: "Actions", value: "save", title: "Save changes", description: hasChanges(draft) ? `Write to ${target}` : "No changes yet" },
     { category: "Actions", value: "reset", title: "Reset all settings…", description: `Remove the plugin's keys from ${target}` },
@@ -366,9 +427,30 @@ export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): Menu
   return [
     { category: "", value: "consults", title: `Consults per task — ${limits.consults}`, description: "Advisor calls allowed per user task (safety cap)" },
     { category: "", value: "timeout", title: `Timeout — ${formatDuration(limits.timeoutMs)}`, description: "Abort a consult that runs too long" },
-    { category: "Advanced", value: "context", title: `Context budget — ${formatSize(limits.contextChars)}`, description: "Characters of pruned transcript sent to the advisor" },
-    { category: "Advanced", value: "toolcap", title: `Per-tool output cap — ${formatSize(limits.toolCap)}`, description: "Maximum characters kept from a single tool output" },
-    { category: "Advanced", value: "retries", title: `Retry ceiling — ${limits.attempts}`, description: "Anti-retry-storm ceiling on dispatch attempts per task" },
+    {
+      category: "Advanced",
+      value: "context",
+      title: `Context budget — ${formatSize(limits.contextTokens)} tokens`,
+      description: "INPUT tokens of conversation sent to the advisor (up to the model's context window)",
+    },
+    {
+      category: "Advanced",
+      value: "advice",
+      title: `Advice length — ${formatSize(limits.adviceTokens)} tokens`,
+      description: "OUTPUT tokens for the advisor's reply (under the model's max output limit)",
+    },
+    {
+      category: "Advanced",
+      value: "toolcap",
+      title: `Per-tool output cap — ${formatSize(limits.toolCap)} chars`,
+      description: "Maximum characters kept from a single tool output",
+    },
+    {
+      category: "Advanced",
+      value: "retries",
+      title: `Retry ceiling — ${limits.attempts}`,
+      description: "Transport attempts per task — NOT extra paid consults",
+    },
     { category: "Advanced", value: "loglevel", title: `Log level — ${limits.logLevel}`, description: "Plugin diagnostics verbosity" },
     { category: "Actions", value: "back", title: "← Back", description: "Return to the main menu" },
   ]
@@ -383,9 +465,9 @@ export function summaryMessage(view: AdvisorSettingsView): string {
   const limits = currentLimits(view, {})
   return [
     `Model     ${model.label}`,
-    `Preset    ${preset.title}${preset.isDefault && !preset.inherit ? " (default)" : ""} — ${preset.blurb}`,
+    `Preset    ${preset.title}${preset.kind === "preset" && preset.isDefault ? " (default)" : ""} — ${preset.blurb}`,
     `Mode      ${mode.title} — ${MODE_DESCRIPTIONS[mode.mode]}`,
-    `Limits    ${limits.consults} consults/task · ${formatDuration(limits.timeoutMs)} · ${formatSize(limits.contextChars)} context`,
+    `Limits    ${limits.consults} consults/task · ${formatDuration(limits.timeoutMs)} · ${formatSize(limits.contextTokens)} context tokens · ${formatSize(limits.adviceTokens)} advice tokens`,
     `File      ${view.files.project || view.files.global}`,
     `Applies immediately — no restart.`,
   ].join("\n")
@@ -487,14 +569,27 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
       case "context":
         next = await pickNumber(ports, {
           title: "Context budget",
-          description: "Characters of pruned transcript sent to the advisor",
-          current: currentLimits(view, draft).contextChars,
-          choices: [16_000, 32_000, 64_000, 128_000, 500_000, 1_000_000],
+          description: "INPUT tokens of pruned conversation sent to the advisor",
+          current: currentLimits(view, draft).contextTokens,
+          choices: [8_000, 16_000, 32_000, 64_000, 128_000, 500_000, 1_000_000],
           format: formatSize,
           parse: parseHumanSize,
           min: 2_000,
-          max: 2_000_000,
-          rangeHint: `2K–2M chars, e.g. 128k`,
+          max: 1_000_000,
+          rangeHint: "2K–1M tokens, e.g. 128k",
+        })
+        break
+      case "advice":
+        next = await pickNumber(ports, {
+          title: "Advice length",
+          description: "OUTPUT token budget for the advisor's reply",
+          current: currentLimits(view, draft).adviceTokens,
+          choices: [4_000, 8_000, 16_000, 32_000],
+          format: formatSize,
+          parse: parseHumanSize,
+          min: 500,
+          max: 64_000,
+          rangeHint: "500–64000 tokens (model caps are typically 8K–65K)",
         })
         break
       case "toolcap":
@@ -542,7 +637,18 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
       }
     }
     if (next !== undefined) {
-      const key = choice === "consults" ? "maxUsesPerTask" : choice === "timeout" ? "timeoutMs" : choice === "context" ? "transcriptBudgetChars" : choice === "toolcap" ? "maxToolOutputChars" : "maxAttempts"
+      const key =
+        choice === "consults"
+          ? "maxUsesPerTask"
+          : choice === "timeout"
+            ? "timeoutMs"
+            : choice === "context"
+              ? "transcriptBudgetTokens"
+              : choice === "advice"
+                ? "adviceTokenBudget"
+                : choice === "toolcap"
+                  ? "maxToolOutputChars"
+                  : "maxAttempts"
       draft[key] = next
     }
   }
@@ -654,13 +760,23 @@ export async function runSettingsFlow(ports: SettingsPorts): Promise<void> {
 
     if (choice === "preset") {
       const current = currentPreset(view, draft)
+      const options: SettingsSelectOption[] = [
+        { category: "Actions", title: "Inherit — remove the preset key", value: "__inherit__", description: "Falls back to other config layers" },
+        ...Object.keys(PRESETS).map((name) => ({ title: presetTitle(name), value: name, description: presetBlurb(name) })),
+      ]
+      if (current.kind === "custom") {
+        options.unshift({
+          category: "Current",
+          title: "Custom — current effective mix",
+          value: "__custom_current__",
+          description: "Matches no preset; pick one below to snap back",
+          disabled: true,
+        })
+      }
       const picked = await ports.select({
         title: "Preset — how much resource the advisor may use",
-        current: current.isDefault ? "balanced" : current.name,
-        options: [
-          { category: "Actions", title: "Inherit — remove the preset key", value: "__inherit__", description: "Falls back to other config layers" },
-          ...Object.keys(PRESETS).map((name) => ({ title: presetTitle(name), value: name, description: presetBlurb(name) })),
-        ],
+        current: current.kind === "preset" ? current.name : "",
+        options,
       })
       if (picked !== undefined) draft.preset = picked === "__inherit__" ? null : picked
       continue
@@ -674,7 +790,7 @@ export async function runSettingsFlow(ports: SettingsPorts): Promise<void> {
         options: [
           { category: "Actions", title: "Inherit — remove the mode key", value: "__inherit__", description: "Falls back to other config layers" },
           { title: "Review", value: "review", description: MODE_DESCRIPTIONS.review },
-          { title: "Agent", value: "agent", description: MODE_DESCRIPTIONS.agent },
+          { title: "Review + Agent", value: "agent", description: MODE_DESCRIPTIONS.agent },
         ],
       })
       if (picked !== undefined) draft.advisorMode = picked === "__inherit__" ? null : picked

@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
+  ADVISOR_CONFIG_KEYS,
   ADVISOR_OVERRIDE_KEY,
   advisorConfigPaths,
   atomicWriteJson,
@@ -55,15 +56,15 @@ test("precedence: deployment < global < project root < project .opencode", async
 
       const snap = await loadAdvisorConfig({
         directory: s.project,
-        options: { maxUsesPerTask: 3, adviceWordBudget: 90 },
+        options: { maxUsesPerTask: 3, adviceTokenBudget: 5_000 },
       })
       assert.equal(snap.merged.maxUsesPerTask, 9, "canonical .opencode project file wins")
       assert.equal(snap.merged.timeoutMs, 40_000, "root project file wins over global/options")
-      assert.equal(snap.merged.adviceWordBudget, 90, "deployment key survives where files are silent")
+      assert.equal(snap.merged.adviceTokenBudget, 5_000, "deployment key survives where files are silent")
       assert.equal(snap.merged.preset, "thorough", "global key survives where project is silent")
       assert.equal(snap.tiers.maxUsesPerTask, "project")
       assert.equal(snap.tiers.timeoutMs, "project")
-      assert.equal(snap.tiers.adviceWordBudget, "deployment")
+      assert.equal(snap.tiers.adviceTokenBudget, "deployment")
       assert.equal(snap.tiers.preset, "global")
       assert.equal(snap.files.project, join(s.project, ".opencode", "opencode-advisor.json"))
       assert.deepEqual(snap.files.used, [
@@ -74,8 +75,8 @@ test("precedence: deployment < global < project root < project .opencode", async
 
       const effective = resolveOptions(snap.merged)
       assert.equal(effective.maxUsesPerTask, 9, "explicit project key beats the preset quantity")
-      assert.equal(effective.prune.transcriptBudgetChars, 128_000, "thorough preset expands from the global file")
-      assert.equal(effective.adviceWordBudget, 90, "explicit deployment key beats the preset value")
+      assert.equal(effective.prune.transcriptBudgetChars, 128_000, "thorough (32k tokens) expands to 128k pruner chars")
+      assert.equal(effective.adviceTokenBudget, 5_000, "explicit deployment key beats the preset value")
     })
   } finally {
     await s.cleanup()
@@ -266,4 +267,13 @@ test("advisorConfigPaths honors XDG_CONFIG_HOME and the project directory", asyn
   } finally {
     await s.cleanup()
   }
+})
+
+test("ADVISOR_CONFIG_KEYS carries the token budgets and no retired knobs", () => {
+  assert.ok(ADVISOR_CONFIG_KEYS.includes("adviceTokenBudget"))
+  assert.ok(ADVISOR_CONFIG_KEYS.includes("transcriptBudgetTokens"))
+  assert.ok(!ADVISOR_CONFIG_KEYS.includes("nudge"), "nudge is retired")
+  assert.ok(!ADVISOR_CONFIG_KEYS.includes("injectTimingPrompt"), "timing injection is retired")
+  assert.ok(!ADVISOR_CONFIG_KEYS.includes("adviceWordBudget"), "word budgets are retired")
+  assert.ok(!ADVISOR_CONFIG_KEYS.includes("transcriptBudgetChars"), "char budgets are not user config")
 })

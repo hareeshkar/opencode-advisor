@@ -196,12 +196,10 @@ export const ADVISOR_CONFIG_KEYS = [
   "maxUsesPerTask",
   "maxAttempts",
   "timeoutMs",
-  "adviceWordBudget",
-  "transcriptBudgetChars",
+  "adviceTokenBudget",
+  "transcriptBudgetTokens",
   "maxToolOutputChars",
   "triggers",
-  "nudge",
-  "injectTimingPrompt",
   "logLevel",
 ] as const
 

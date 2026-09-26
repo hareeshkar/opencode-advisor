@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import { test } from "node:test"
 import {
   MODE_DESCRIPTIONS,
+  PRESETS,
   currentLimits,
   currentMode,
   currentModel,
@@ -31,8 +32,8 @@ function makeView(overrides = {}) {
       maxUsesPerTask: 3,
       maxAttempts: 11,
       timeoutMs: 90_000,
-      adviceWordBudget: 120,
-      transcriptBudgetChars: 32_000,
+      adviceTokenBudget: 8_000,
+      transcriptBudgetTokens: 16_000,
       maxToolOutputChars: 1_500,
       triggers: ["advice"],
       logLevel: "info",
@@ -60,9 +61,22 @@ function scripted(options = {}) {
       calls.saved.push(doc)
       if (options.saveError) throw new Error(options.saveError)
       if (options.saveView) return options.saveView(doc, view)
-      // Shallow-merge the draft into the view's config — mirrors what the
-      // server does for the keys this flow writes.
-      return { ...view, config: { ...view.config, ...doc } }
+      // Faithful merge: a preset expands to its quantities (as resolveOptions
+      // does), then explicit draft keys override — so the post-save view is
+      // exactly what the server would return.
+      const config = { ...view.config }
+      if (typeof doc.preset === "string" && PRESETS[doc.preset]) {
+        const preset = PRESETS[doc.preset]
+        config.maxUsesPerTask = preset.maxUsesPerTask
+        config.transcriptBudgetTokens =
+          typeof preset.transcriptBudgetTokens === "string" ? parseHumanSize(preset.transcriptBudgetTokens) : preset.transcriptBudgetTokens
+        config.adviceTokenBudget = preset.adviceTokenBudget
+      }
+      for (const [key, value] of Object.entries(doc)) {
+        if (value === null) continue // "inherit" — cannot resolve other layers here
+        config[key] = value
+      }
+      return { ...view, config }
     },
     select: async (request) => {
       calls.selects.push(request)
@@ -91,10 +105,10 @@ function scripted(options = {}) {
 
 test("preset table is exactly the documented quantities (single source: PRESETS)", () => {
   const expected = {
-    economy: "1 consult/task · 16K context · 80-word advice",
-    balanced: "3 consults/task · 32K context · 120-word advice",
-    thorough: "5 consults/task · 128K context · 200-word advice",
-    exhaustive: "8 consults/task · 500K context · 300-word advice",
+    economy: "1 consult/task · 8K context tokens · 4K advice tokens",
+    balanced: "3 consults/task · 16K context tokens · 8K advice tokens",
+    thorough: "5 consults/task · 32K context tokens · 16K advice tokens",
+    exhaustive: "8 consults/task · 64K context tokens · 32K advice tokens",
   }
   for (const [name, blurb] of Object.entries(expected)) assert.equal(presetBlurb(name), blurb, name)
   assert.equal(presetTitle("balanced"), "Balanced (recommended)")
@@ -117,9 +131,9 @@ test("formatting: sizes, durations, human input", () => {
 })
 
 test("display state and menu rows reflect the effective view + draft", () => {
-  // The server returns PRESET-RESOLVED values: thorough ⇒ 5 / 128K / 200.
+  // The server returns PRESET-RESOLVED values: thorough ⇒ 5 / 32K / 16K.
   const view = makeView({
-    config: { preset: "thorough", maxUsesPerTask: 5, transcriptBudgetChars: 128_000, adviceWordBudget: 200 },
+    config: { preset: "thorough", maxUsesPerTask: 5, transcriptBudgetTokens: 32_000, adviceTokenBudget: 16_000 },
   })
   const model = currentModel(view, {})
   assert.equal(model.label, "glm-5.3 · high")
@@ -132,6 +146,10 @@ test("display state and menu rows reflect the effective view + draft", () => {
   const rows = mainMenuRows(view, {})
   assert.ok(rows.find((r) => r.value === "preset").title.includes("Thorough"))
   assert.ok(rows.find((r) => r.value === "limits").title.includes("5 consults/task"))
+  assert.ok(
+    rows.find((r) => r.value === "limits").description.includes("32K context tokens · 16K advice tokens"),
+    "limits row speaks tokens",
+  )
 
   // Draft overrides win; null means inherit.
   const rowsDraft = mainMenuRows(view, { preset: null, maxUsesPerTask: 2 })
@@ -142,9 +160,44 @@ test("display state and menu rows reflect the effective view + draft", () => {
   assert.equal(tierLabel(undefined), "default")
 
   assert.equal(currentLimits(view, {}).consults, 5, "limits follow the preset-resolved effective view")
+  assert.equal(currentLimits(view, {}).contextTokens, 32_000)
+  assert.equal(currentLimits(view, {}).adviceTokens, 16_000)
   assert.equal(currentMode(view, {}).mode, "review")
-  assert.equal(limitRows(view, {}).length, 7)
+  assert.equal(limitRows(view, {}).length, 8, "8 rows: consults, timeout, context, advice, toolcap, retries, loglevel, back")
+  assert.ok(limitRows(view, {}).some((r) => r.value === "advice" && r.title.includes("16K tokens")))
   assert.ok(summaryMessage(makeView()).includes("Applies immediately"))
+})
+
+test("preset display: matching values report the preset; deviations compute Custom", () => {
+  // (c) file-attributed values matching a preset exactly → that preset
+  const explicit = makeView({
+    config: { preset: "", maxUsesPerTask: 5, transcriptBudgetTokens: 32_000, adviceTokenBudget: 16_000 },
+    tiers: { maxUsesPerTask: "project", transcriptBudgetTokens: "project", adviceTokenBudget: "project" },
+  })
+  const matched = currentPreset(explicit, {})
+  assert.equal(matched.kind, "preset")
+  assert.equal(matched.name, "thorough")
+
+  // A pristine balanced view is the default preset.
+  const balanced = currentPreset(makeView(), {})
+  assert.equal(balanced.kind, "preset")
+  assert.equal(balanced.name, "balanced")
+  assert.equal(balanced.isDefault, true)
+
+  // (a) a file-attributed context budget matching no preset → Custom
+  const deviated = makeView({
+    config: { transcriptBudgetTokens: 12_000 },
+    tiers: { transcriptBudgetTokens: "project" },
+  })
+  const custom = currentPreset(deviated, {})
+  assert.equal(custom.kind, "custom")
+  assert.equal(custom.title, "Custom")
+
+  // (b) a draft deviation from the balanced base → Custom too
+  assert.equal(currentPreset(makeView(), { adviceTokenBudget: 4_000 }).kind, "custom")
+
+  // Inherit still wins over both computed states.
+  assert.equal(currentPreset(makeView(), { preset: null }).kind, "inherit")
 })
 
 /* ---------------------------------- flow ---------------------------------- */
@@ -199,7 +252,26 @@ test("flow: custom limit values are validated via the prompt dialog", async () =
 
   const good = scripted({ select: ["limits", "context", "__custom__", "back", "save"], prompt: ["128k"] })
   await runSettingsFlow(good.ports)
-  assert.deepEqual(good.calls.saved, [{ transcriptBudgetChars: 128_000 }])
+  assert.deepEqual(good.calls.saved, [{ transcriptBudgetTokens: 128_000 }])
+})
+
+test("flow: context and advice pickers offer the token presets through the draft keys", async () => {
+  const { ports, calls } = scripted({ select: ["limits", "context", "32000", "advice", "16000", "back", "save"] })
+  await runSettingsFlow(ports)
+  assert.deepEqual(calls.saved, [{ transcriptBudgetTokens: 32_000, adviceTokenBudget: 16_000 }])
+
+  const contextPicker = calls.selects.find((s) => s.title === "Context budget")
+  assert.deepEqual(
+    contextPicker.options.filter((o) => /^\d+$/.test(o.value)).map((o) => Number(o.value)),
+    [8_000, 16_000, 32_000, 64_000, 128_000, 500_000, 1_000_000],
+    "context choices run up to 1M tokens",
+  )
+  const advicePicker = calls.selects.find((s) => s.title === "Advice length")
+  assert.deepEqual(
+    advicePicker.options.filter((o) => /^\d+$/.test(o.value)).map((o) => Number(o.value)),
+    [4_000, 8_000, 16_000, 32_000],
+    "advice choices are output-token presets",
+  )
 })
 
 test("flow: model picker uses the live catalog and keeps preset keys untouched", async () => {
@@ -261,5 +333,6 @@ test("flow: an unreadable config shows an error toast and exits", async () => {
 
 test("mode choices document both mechanisms", () => {
   assert.ok(MODE_DESCRIPTIONS.review.includes("Fast"))
+  assert.ok(MODE_DESCRIPTIONS.agent.startsWith("Review + Agent —"), "agent mode is labelled Review + Agent")
   assert.ok(MODE_DESCRIPTIONS.agent.includes("verifies"))
 })

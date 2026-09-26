@@ -9,7 +9,7 @@ import {
   sanitizeEvidence,
 } from "../dist/opencode-advisor.js"
 
-const OPTS = { adviceWordBudget: 120 }
+const OPTS = { adviceTokenBudget: 8_000 }
 
 /* ---------------- evidence-region breakout ---------------- */
 

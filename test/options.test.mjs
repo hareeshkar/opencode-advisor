@@ -1,42 +1,24 @@
 import assert from "node:assert/strict"
 import { test } from "node:test"
-import { mergeAdvisorConfigLayers, resolveOptions, shouldNudgeExecutor } from "../dist/opencode-advisor.js"
+import { mergeAdvisorConfigLayers, normalizeAdvisorMode, resolveOptions } from "../dist/opencode-advisor.js"
 
-/* ---------------- tiers ---------------- */
+/* ---------------- mode ids ---------------- */
 
-const cases = [
-  ["p/deepseek-v4-flash", true],
-  ["p/deepseek-v4.1-flash", true],
-  ["o/claude-haiku-4-5", true],
-  ["z/glm-5.3-flash", true],
-  ["m/mimo-v2.6-flash", true],
-  ["p/deepseek-v4-pro", false],
-  ["m/mimo-v2.6-pro", false],
-  ["a/claude-opus-5", false],
-  ["a/claude-sonnet-5", false],
-  ["z/glm-5.3", false],
-  ["z/glm-5.2", false],
-  ["x/gpt-5.6-luna", false],
-  ["x/grok-4.7", false],
-  ["x/minimax-m2.7", false],
-  ["openai/o1", false],
-  ["openai/o10", false],
-  ["x/prod", false],
-  ["q/qwen3.6-plus", false],
-  ["k/kimi-k2.7-code", false],
-]
+test("normalizeAdvisorMode: review/agent plus the review-agent alias", () => {
+  assert.equal(normalizeAdvisorMode("review"), "review")
+  assert.equal(normalizeAdvisorMode("agent"), "agent")
+  assert.equal(normalizeAdvisorMode("review-agent"), "agent")
+  assert.equal(normalizeAdvisorMode("review+agent"), "agent")
+  assert.equal(normalizeAdvisorMode("bogus"), undefined)
+})
 
-for (const [model, expected] of cases) {
-  test(`tier auto: ${model} → ${expected}`, () => {
-    assert.equal(shouldNudgeExecutor(model, "auto"), expected)
-  })
-}
-
-test("mode on/off override tiers; undefined model never nudges", () => {
-  assert.equal(shouldNudgeExecutor("a/claude-opus-5", "on"), true)
-  assert.equal(shouldNudgeExecutor("p/deepseek-v4-flash", "off"), false)
-  assert.equal(shouldNudgeExecutor(undefined, "auto"), false)
-  assert.equal(shouldNudgeExecutor(undefined, "on"), true)
+test("advisorMode accepts the review-agent alias and rejects unknown modes", () => {
+  const base = { advisor: { providerID: "p", id: "m" } }
+  assert.equal(resolveOptions({ ...base, advisorMode: "review" }).advisorMode, "review")
+  assert.equal(resolveOptions({ ...base, advisorMode: "agent" }).advisorMode, "agent")
+  assert.equal(resolveOptions({ ...base, advisorMode: "review-agent" }).advisorMode, "agent", "alias normalizes to agent")
+  assert.equal(resolveOptions({ ...base, advisorMode: "review+agent" }).advisorMode, "agent")
+  assert.throws(() => resolveOptions({ ...base, advisorMode: "nudge" }), /review\|agent\|review-agent/)
 })
 
 /* ---------------- validation ---------------- */
@@ -76,39 +58,69 @@ test("explicit options beat environment", () => {
 
 test("out-of-range values throw with bounds", () => {
   assert.throws(() => resolveOptions({ advisor: { providerID: "a", id: "b" }, maxUsesPerTask: 0 }), /1 and 50/)
-  assert.throws(() => resolveOptions({ advisor: { providerID: "a", id: "b" }, nudge: "sometimes" }), /auto\|on\|off/)
+  assert.throws(() => resolveOptions({ advisor: { providerID: "a", id: "b" }, adviceTokenBudget: 100 }), /500 and 64000/)
   assert.throws(() => resolveOptions({ advisor: { providerID: "a" } }), /providerID, id/)
 })
 
-test("nudge defaults to off (credit-conscious: no autonomous spend)", () => {
-  const o = resolveOptions({ advisor: { providerID: "p", id: "m" } })
-  assert.equal(o.nudge, "off")
+/* ---------------- token budgets ---------------- */
+
+test("defaults are token-native: 16k context + 8k advice tokens", () => {
+  const o = resolveOptions({})
+  assert.equal(o.transcriptBudgetTokens, 16_000)
+  assert.equal(o.prune.transcriptBudgetChars, 64_000, "pruner budget derives at ≈4 chars/token")
+  assert.equal(o.adviceTokenBudget, 8_000, "default = balanced preset, never below economy")
+  assert.equal(o.maxUsesPerTask, 3)
 })
 
-test("human budgets: 64k / 128k / 500k / 1.5m parse to chars", () => {
+test("adviceTokenBudget is validated at 500..64000", () => {
   const base = { advisor: { providerID: "p", id: "m" } }
-  assert.equal(resolveOptions({ ...base, transcriptBudgetChars: "64k" }).prune.transcriptBudgetChars, 64_000)
-  assert.equal(resolveOptions({ ...base, transcriptBudgetChars: "128k" }).prune.transcriptBudgetChars, 128_000)
-  assert.equal(resolveOptions({ ...base, transcriptBudgetChars: "500k" }).prune.transcriptBudgetChars, 500_000)
-  assert.equal(resolveOptions({ ...base, transcriptBudgetChars: "1.5m" }).prune.transcriptBudgetChars, 1_500_000)
-  assert.equal(resolveOptions({ ...base, maxToolOutputChars: "3k" }).prune.maxToolOutputChars, 3_000)
-  assert.throws(() => resolveOptions({ ...base, transcriptBudgetChars: "huge" }), /size like "64k"/)
+  assert.equal(resolveOptions({ ...base, adviceTokenBudget: 500 }).adviceTokenBudget, 500)
+  assert.equal(resolveOptions({ ...base, adviceTokenBudget: 64_000 }).adviceTokenBudget, 64_000)
+  assert.throws(() => resolveOptions({ ...base, adviceTokenBudget: 499 }), /500 and 64000/)
+  assert.throws(() => resolveOptions({ ...base, adviceTokenBudget: 64_001 }), /500 and 64000/)
 })
 
-test("presets tune the curve; explicit options override them", () => {
-  const economy = resolveOptions({ advisor: { providerID: "p", id: "m" }, preset: "economy" })
+test("human budgets: transcriptBudgetTokens (64k/500k) parse; chars derive at ≈4/token", () => {
+  const base = { advisor: { providerID: "p", id: "m" } }
+  assert.equal(resolveOptions({ ...base, transcriptBudgetTokens: "64k" }).transcriptBudgetTokens, 64_000)
+  assert.equal(resolveOptions({ ...base, transcriptBudgetTokens: "64k" }).prune.transcriptBudgetChars, 256_000)
+  assert.equal(resolveOptions({ ...base, transcriptBudgetTokens: "500k" }).prune.transcriptBudgetChars, 2_000_000)
+  assert.equal(resolveOptions({ ...base, maxToolOutputChars: "3k" }).prune.maxToolOutputChars, 3_000)
+  assert.throws(() => resolveOptions({ ...base, transcriptBudgetTokens: "2m" }), /2000 and 1000000/)
+  assert.throws(() => resolveOptions({ ...base, transcriptBudgetTokens: "huge" }), /size like "64k"/)
+})
+
+test("presets tune the token curve; explicit options override them", () => {
+  const ref = { advisor: { providerID: "p", id: "m" } }
+
+  const economy = resolveOptions({ ...ref, preset: "economy" })
   assert.equal(economy.maxUsesPerTask, 1)
-  assert.equal(economy.prune.transcriptBudgetChars, 16_000)
-  assert.equal(economy.adviceWordBudget, 80)
+  assert.equal(economy.transcriptBudgetTokens, 8_000)
+  assert.equal(economy.prune.transcriptBudgetChars, 32_000)
+  assert.equal(economy.adviceTokenBudget, 4_000)
 
-  const exhaustive = resolveOptions({ advisor: { providerID: "p", id: "m" }, preset: "exhaustive" })
+  const balanced = resolveOptions({ ...ref, preset: "balanced" })
+  assert.equal(balanced.maxUsesPerTask, 3)
+  assert.equal(balanced.transcriptBudgetTokens, 16_000)
+  assert.equal(balanced.adviceTokenBudget, 8_000)
+
+  const thorough = resolveOptions({ ...ref, preset: "thorough" })
+  assert.equal(thorough.maxUsesPerTask, 5)
+  assert.equal(thorough.transcriptBudgetTokens, 32_000)
+  assert.equal(thorough.adviceTokenBudget, 16_000)
+
+  const exhaustive = resolveOptions({ ...ref, preset: "exhaustive" })
   assert.equal(exhaustive.maxUsesPerTask, 8)
-  assert.equal(exhaustive.prune.transcriptBudgetChars, 500_000)
+  assert.equal(exhaustive.transcriptBudgetTokens, 64_000)
+  assert.equal(exhaustive.prune.transcriptBudgetChars, 256_000)
+  assert.equal(exhaustive.adviceTokenBudget, 32_000)
 
-  const overridden = resolveOptions({ advisor: { providerID: "p", id: "m" }, preset: "economy", maxUsesPerTask: 4 })
+  const overridden = resolveOptions({ ...ref, preset: "economy", maxUsesPerTask: 4 })
   assert.equal(overridden.maxUsesPerTask, 4)
+  const adviceOverride = resolveOptions({ ...ref, preset: "economy", adviceTokenBudget: 6_000 })
+  assert.equal(adviceOverride.adviceTokenBudget, 6_000, "explicit advice budget beats the preset")
 
-  assert.throws(() => resolveOptions({ advisor: { providerID: "p", id: "m" }, preset: "turbo" }), /must be one of/)
+  assert.throws(() => resolveOptions({ ...ref, preset: "turbo" }), /must be one of/)
 })
 
 test("maxAttempts: derived by default, explicit when set", () => {
@@ -121,13 +133,13 @@ test("maxAttempts: derived by default, explicit when set", () => {
 test("config layers merge: later wins, nested objects replaced whole", () => {
   const merged = mergeAdvisorConfigLayers([
     { maxUsesPerTask: 1, advisor: { providerID: "a", id: "x" }, preset: "economy" },
-    { maxUsesPerTask: 3, transcriptBudgetChars: "64k" },
+    { maxUsesPerTask: 3, transcriptBudgetTokens: "64k" },
     { logLevel: "debug" },
   ])
   assert.equal(merged.maxUsesPerTask, 3)
-  assert.equal(merged.transcriptBudgetChars, "64k")
+  assert.equal(merged.transcriptBudgetTokens, "64k")
   assert.equal(merged.logLevel, "debug")
   const opts = resolveOptions(merged)
-  assert.equal(opts.prune.transcriptBudgetChars, 64_000)
+  assert.equal(opts.prune.transcriptBudgetChars, 256_000)
   assert.equal(opts.advisor.providerID, "a")
 })

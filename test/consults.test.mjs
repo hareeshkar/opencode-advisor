@@ -82,3 +82,20 @@ test("trim prefers evicting terminal records over running ones", () => {
   assert.equal(ledger.get("t0"), undefined, "oldest terminal evicted instead")
 })
 
+test("persistence caps stored advice; in-memory replay keeps the full text", async () => {
+  const saved = []
+  const ledger = new ConsultLedger(fakeClock(), {
+    load: async () => undefined,
+    save: async (records) => {
+      saved.length = 0
+      saved.push(...records)
+    },
+  })
+  const longAdvice = "A".repeat(5000)
+  ledger.start({ id: "c1", ...REC })
+  ledger.complete("c1", longAdvice)
+  assert.equal(ledger.get("c1")?.advice?.length, 5000, "in-memory replay keeps the full advice")
+  assert.equal(saved[0]?.advice?.length, 2012, "persisted copy capped at 2000 + truncation marker")
+  assert.ok(saved[0].advice.includes("…[truncated]"), "truncation marker present")
+})
+

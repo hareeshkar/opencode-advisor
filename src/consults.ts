@@ -56,6 +56,14 @@ export interface ConsultPersistence {
   save(records: ConsultRecord[]): Promise<void>
 }
 
+/**
+ * Policy: the durable copy caps stored advice at 2000 characters — enough for
+ * advisor_status replay after a reload, without turning plugin storage into a
+ * transcript archive. The in-memory record keeps the full framed advice for
+ * the live session.
+ */
+export const PERSISTED_ADVICE_CAP = 2_000
+
 const MAX_RECORDS = 100
 
 export const CONSULT_CONCURRENCY = 2
@@ -107,7 +115,10 @@ export class ConsultLedger {
 
   private persist(): void {
     if (!this.persistence) return
-    this.persistence.save([...this.entries.values()]).catch(() => {})
+    const records = [...this.entries.values()].map((r) =>
+      r.advice && r.advice.length > PERSISTED_ADVICE_CAP ? { ...r, advice: r.advice.slice(0, PERSISTED_ADVICE_CAP) + "…[truncated]" } : r,
+    )
+    this.persistence.save(records).catch(() => {})
   }
 
   start(rec: Omit<ConsultRecord, "state" | "delivery" | "startedAt" | "elapsedMs"> & { startedAt?: number }): ConsultRecord {

@@ -23,6 +23,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); version
   consults are never touched — fixes the setup-sweep race (DEFECT-1) where
   re-instantiation bursts could permanently falsify a delivered consult.
 
+## [0.9.1] — 2026-09-27
+
+### Fixed
+- **Review + Agent exploration proven live** (sentinel SB-1CE1E38E recalled
+  with a file citation, 10 tool inspections on the plan-agent child): the
+  prompt now REQUIRES exploration (FIRST ACTION imperative + cite-every-file
+  contract) instead of merely permitting it, and the mode-aware prompt rule
+  removes the "you have NO tools" contradiction in agent mode.
+- Honest provenance suffixes on agent-mode advice: verified-against-repository
+  (N inspections) or an explicit no-files-examined note.
+- Cap-inversion message: when the consult cap is lowered below the consults
+  already used in a task, the error now states the facts instead of printing
+  a nonsense fraction.
+- timeoutMs emits a deprecation warning when consumed.
+
+### Changed
+- Child-session deny list completed: webfetch and websearch now denied
+  alongside edit/shell/subagent — the Review + Agent child cannot reach the
+  network under a frame claiming read-only project verification.
+- Durable ledger advice capped at 2000 chars in the persisted copy (kv
+  hygiene); in-memory replay keeps the full text.
+
 ## [0.8.2] — 2026-09-26
 
 ### Fixed

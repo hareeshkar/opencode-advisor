@@ -7,7 +7,7 @@
  */
 
 export const PLUGIN_ID = "opencode-advisor"
-export const PLUGIN_VERSION = "0.9.0"
+export const PLUGIN_VERSION = "0.9.1"
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 

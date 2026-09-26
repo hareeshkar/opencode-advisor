@@ -64,8 +64,13 @@ defects found by a 60-scenario live campaign are fixed at the root.
   one.
 
 ### Changed
-- `pruning` is part of the resolved option set and of the settings menu; the
-  schema validates it as `standard | none`.
+- `pruning` is editable from the Limits menu, not JSON-only: the row names the
+  active policy (`standard` / `none (verbatim)`) and states the trade, and
+  Inherit still removes the key. The schema validates it as `standard | none`.
+- Troubleshooting documents what `pruning: "none"` does at the context limit:
+  the call fails loudly as `prompt_too_long` rather than being silently
+  trimmed, because a quietly shortened transcript reads to the advisor as
+  complete evidence.
 
 ### Tests
 - The abort path now has real regression coverage. The ceiling-expiry fix was
@@ -81,7 +86,7 @@ defects found by a 60-scenario live campaign are fixed at the root.
   killed by an executor interruption, because its advice is still delivered.
 
 ### Verified
-- 191 unit tests green, typecheck clean.
+- 192 unit tests green, typecheck clean.
 - 60-scenario live campaign on a single frozen build: 56 PASS, 3 FAIL (fixed
   here), 1 SKIP (budget), 1 PARTIAL (test-design — see the regression report).
   Baseline config restored byte-for-byte; `opencode.json` never written;

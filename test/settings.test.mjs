@@ -167,10 +167,24 @@ test("display state and menu rows reflect the effective view + draft", () => {
   assert.equal(currentLimits(view, {}).toolCap, 750, "per-tool cap is a token budget")
   assert.equal(currentLimits(view, {}).pruning, "standard")
   assert.equal(currentMode(view, {}).mode, "review")
-  assert.equal(limitRows(view, {}).length, 9, "9 rows: consults, wait, ceiling, context, advice, toolcap, retries, loglevel, back")
+  assert.equal(
+    limitRows(view, {}).length,
+    10,
+    "10 rows: consults, wait, ceiling, context, advice, toolcap, pruning, retries, loglevel, back",
+  )
+  assert.ok(
+    limitRows(view, {}).some((r) => r.value === "pruning" && r.title.includes("Pruning — standard")),
+    "the pruning policy is editable, not JSON-only",
+  )
   assert.ok(limitRows(view, {}).some((r) => r.value === "wait" && r.title.includes("Response wait — 90s")))
   assert.ok(limitRows(view, {}).some((r) => r.value === "ceiling" && r.title.includes("Consult ceiling — 1h")))
   assert.ok(limitRows(view, {}).some((r) => r.value === "advice" && r.title.includes("32K tokens")))
+  // The row states the consequence, not just the name: "none" is a real mode.
+  const noneView = makeView({ config: { ...makeView().config, pruning: "none" } })
+  assert.ok(
+    limitRows(noneView, {}).some((r) => r.value === "pruning" && r.title.includes("none (verbatim)")),
+    "pruning:none is visible and labelled",
+  )
   assert.ok(
     limitRows(view, {}).some((r) => r.value === "toolcap" && r.title.includes("750 tokens")),
     "per-tool cap speaks tokens, not characters",
@@ -345,4 +359,20 @@ test("mode choices document both mechanisms", () => {
   assert.ok(MODE_DESCRIPTIONS.review.includes("Fast"))
   assert.ok(MODE_DESCRIPTIONS.agent.startsWith("Review + Agent —"), "agent mode is labelled Review + Agent")
   assert.ok(MODE_DESCRIPTIONS.agent.includes("verifies"))
+})
+
+test("flow: the pruning picker writes pruning:none and supports Inherit", async () => {
+  const none = scripted({ select: ["limits", "pruning", "none", "back", "save"] })
+  await runSettingsFlow(none.ports)
+  assert.deepEqual(none.calls.saved, [{ pruning: "none" }], "verbatim mode is saved under its own key")
+
+  const inherit = scripted({ select: ["limits", "pruning", "__inherit__", "back", "save"] })
+  await runSettingsFlow(inherit.ports)
+  assert.deepEqual(inherit.calls.saved, [{ pruning: null }], "Inherit removes the key rather than freezing a value")
+
+  const picker = none.calls.selects.find((s) => s.title === "Pruning")
+  assert.ok(
+    picker.options.some((o) => o.value === "none" && o.description.includes("context window")),
+    "the picker explains the trade, not just the label",
+  )
 })

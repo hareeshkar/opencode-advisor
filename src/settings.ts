@@ -462,6 +462,15 @@ export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): Menu
     },
     {
       category: "Advanced",
+      value: "pruning",
+      title: `Pruning — ${limits.pruning === "none" ? "none (verbatim)" : "standard"}`,
+      description:
+        limits.pruning === "none"
+          ? "No windowing, no truncation — the advisor sees the task whole"
+          : "Window the transcript to the context budget; truncate per tool output",
+    },
+    {
+      category: "Advanced",
       value: "retries",
       title: `Retry ceiling — ${limits.attempts}`,
       description: "Transport attempts per task — NOT extra paid consults",
@@ -646,6 +655,29 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
           rangeHint: "1–100",
         })
         break
+      case "pruning": {
+        const current = currentLimits(view, draft).pruning
+        const picked = await ports.select({
+          title: "Pruning",
+          current,
+          options: [
+            { category: "Actions", title: "Inherit — remove this key", value: "__inherit__", description: "Falls back to other config layers" },
+            {
+              title: "standard",
+              value: "standard",
+              description: "Window to transcriptBudgetTokens; truncate each tool output to maxToolOutputTokens (default)",
+            },
+            {
+              title: "none",
+              value: "none",
+              description: "No windowing, no truncation — bounded only by the advisor's own context window",
+            },
+          ],
+        })
+        if (picked === undefined) break
+        draft.pruning = picked === "__inherit__" ? null : (picked as "standard" | "none")
+        continue
+      }
       case "loglevel": {
         const current = currentLimits(view, draft).logLevel
         const picked = await ports.select({

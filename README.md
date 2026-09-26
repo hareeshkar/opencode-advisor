@@ -204,9 +204,10 @@ Economy is one consult per task with an 8K input budget and 4K advice tokens; Re
 
 - **"No advisor model is configured."** Fresh installs are intentionally unconfigured and spend nothing. Run `/advisor-settings` and pick a model — the only required choice. It applies immediately.
 - **A loud load error names a config file.** The plugin never falls back silently on invalid config. The message includes the file path and the problem. Fix the JSON at that path — strict JSON, no comments or trailing commas.
-- **Advice is too long, too short, or cut off.** Tune the output budget: `adviceTokenBudget` (500–64,000; presets 4K–32K). Model max-output caps are typically 8K–65K.
-- **The advisor seems to be missing context.** Raise `transcriptBudgetTokens`; lower `maxToolOutputChars` if a single tool output crowds the budget.
-- **Spend is higher than expected.** Advice re-enters the executor's context and is re-paid on later turns until compaction — Exhaustive can add ~32K tokens of advice per task. Prefer Economy/Balanced, or lower `adviceTokenBudget`.
+- **Advice is too long, too short, or cut off.** Tune the output budget: `adviceTokenBudget` (16–1,000,000; presets 8K–64K). The model's own max-output limit is the real ceiling.
+- **The advisor seems to be missing context.** Raise `transcriptBudgetTokens`; lower `maxToolOutputTokens` if a single tool output crowds the budget.
+- **Spend is higher than expected.** Advice re-enters the executor's context and is re-paid on later turns until compaction — Exhaustive can add ~64K tokens of advice per task. Prefer Economy/Balanced, or lower `adviceTokenBudget`.
+- **`pruning: "none"` and the context window.** With pruning off there is no plugin-side budget, so the advisor's *own* context window is the only limit. Exceed it and the call fails loudly as `prompt_too_long` — the plugin never silently trims your transcript, because a quietly shortened transcript would read to the advisor as complete evidence. That is the trade: fidelity or a guaranteed fit, never a partial answer presented as a whole.
 - **The tool said `ADVISOR CONSULT RUNNING`.** The advisor needed longer than the response wait; the consult continues in the background and the framed advice is delivered automatically on the executor's next turn. `advisor_status` lists progress and replays delivered advice — never start another consultation for the same question.
 - **`advisor_not_running — no response within …`** The consult hit its lifetime ceiling (`maxConsultMs`). The cap was not consumed — retry, or raise the ceiling.
 - **The consult cap was reached.** `maxUsesPerTask` counts successful consults per user task; failed attempts don't count. Start a new task or raise the cap (the retry ceiling is separate and free of charge).

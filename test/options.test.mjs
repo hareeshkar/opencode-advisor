@@ -143,3 +143,23 @@ test("config layers merge: later wins, nested objects replaced whole", () => {
   assert.equal(opts.prune.transcriptBudgetChars, 256_000)
   assert.equal(opts.advisor.providerID, "a")
 })
+
+test("patience is uniform: presets never set the wait or the ceiling", () => {
+  for (const preset of ["economy", "balanced", "thorough", "exhaustive"]) {
+    const o = resolveOptions({ advisor: { providerID: "p", id: "m" }, preset })
+    assert.equal(o.advisorResponseWaitMs, 90_000, `${preset} wait is 90s for every preset`)
+    assert.equal(o.maxConsultMs, 3_600_000, `${preset} ceiling is 1h for every preset`)
+  }
+})
+
+test("advisorResponseWaitMs: deprecated timeoutMs alias, precedence, and clamp", () => {
+  const base = { advisor: { providerID: "p", id: "m" } }
+  const alias = resolveOptions({ ...base, timeoutMs: 120_000 })
+  assert.equal(alias.advisorResponseWaitMs, 120_000, "timeoutMs maps to the response wait")
+  assert.throws(() => resolveOptions({ ...base, advisorResponseWaitMs: 50 }), /between 100 and 600000/)
+  const both = resolveOptions({ ...base, timeoutMs: 120_000, advisorResponseWaitMs: 30_000 })
+  assert.equal(both.advisorResponseWaitMs, 30_000, "new key wins when both set")
+  const clamped = resolveOptions({ ...base, advisorResponseWaitMs: 600_000, maxConsultMs: 300_000 })
+  assert.equal(clamped.maxConsultMs, 600_000, "ceiling raised to cover the wait window")
+})
+

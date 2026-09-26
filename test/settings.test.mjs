@@ -31,7 +31,8 @@ function makeView(overrides = {}) {
       advisorMode: "review",
       maxUsesPerTask: 3,
       maxAttempts: 11,
-      timeoutMs: 90_000,
+      advisorResponseWaitMs: 90_000,
+      maxConsultMs: 3_600_000,
       adviceTokenBudget: 8_000,
       transcriptBudgetTokens: 16_000,
       maxToolOutputChars: 1_500,
@@ -163,7 +164,9 @@ test("display state and menu rows reflect the effective view + draft", () => {
   assert.equal(currentLimits(view, {}).contextTokens, 32_000)
   assert.equal(currentLimits(view, {}).adviceTokens, 16_000)
   assert.equal(currentMode(view, {}).mode, "review")
-  assert.equal(limitRows(view, {}).length, 8, "8 rows: consults, timeout, context, advice, toolcap, retries, loglevel, back")
+  assert.equal(limitRows(view, {}).length, 9, "9 rows: consults, wait, ceiling, context, advice, toolcap, retries, loglevel, back")
+  assert.ok(limitRows(view, {}).some((r) => r.value === "wait" && r.title.includes("Response wait — 90s")))
+  assert.ok(limitRows(view, {}).some((r) => r.value === "ceiling" && r.title.includes("Consult ceiling — 1h")))
   assert.ok(limitRows(view, {}).some((r) => r.value === "advice" && r.title.includes("16K tokens")))
   assert.ok(summaryMessage(makeView()).includes("Applies immediately"))
 })

@@ -31,6 +31,8 @@ export { buildAdvisorPrompt, ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, DEFAUL
 export { redactError, sanitizeEvidence, sanitizeAdviceText, frameAdvice, isAdvisorOutputFrame } from "./sanitize.js"
 export { CONFIG_FILE_RELATIVE, PRESETS, mergeAdvisorConfigLayers, normalizeAdvisorMode, resolveOptions } from "./options.js"
 export { ADVISOR_CONFIG_KEYS, ADVISOR_OVERRIDE_KEY, advisorConfigPaths, atomicWriteJson, loadAdvisorConfig, migrateStoredOverride, removeAdvisorConfigKeys, updateAdvisorConfig, writeAdvisorConfig } from "./config.js"
+export { CONSULT_CONCURRENCY, ConsultLedger, runningMessage } from "./consults.js"
+export type { ConsultDelivery, ConsultRecord, ConsultState } from "./consults.js"
 export type { AdvisorConfigFiles, AdvisorConfigSnapshot, AdvisorConfigTier, MigrationResult, OverrideStorage } from "./config.js"
 export { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA, MODE_DESCRIPTIONS, currentLimits, currentMode, currentModel, currentPreset, formatDuration, formatSize, hasChanges, limitRows, mainMenuRows, parseHumanSize, presetBlurb, presetTitle, runSettingsFlow, summaryMessage, tierLabel } from "./settings.js"
 export type { AdvisorSettingsView, MenuRow, SettingsDraft, SettingsModelInfo, SettingsPorts, SettingsSelectOption } from "./settings.js"

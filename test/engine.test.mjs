@@ -6,7 +6,7 @@ const OPTS = {
   advisor: { providerID: "test", id: "advisor-x" },
   maxUsesPerTask: 2,
   adviceTokenBudget: 8_000,
-  timeoutMs: 50,
+  maxConsultMs: 50,
   prune: { maxToolOutputChars: 200, transcriptBudgetChars: 1_000 },
   logLevel: "error",
 }

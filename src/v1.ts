@@ -168,7 +168,7 @@ export async function createV1Hooks(input: unknown, options?: unknown): Promise<
             "(or ADVISOR_SOURCE_KIND/URL/KEY_ENV/MODEL env vars)",
         )
       }
-      return callAdvisorProvider(opts.source, prompt, opts.timeoutMs, signal, {
+      return callAdvisorProvider(opts.source, prompt, opts.maxConsultMs, signal, {
         "x-opencode-session": sessionID,
       })
     },

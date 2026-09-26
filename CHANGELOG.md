@@ -3,6 +3,32 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.8.0] — 2026-09-26
+
+### Added
+- **Async advisor consults**: the 90-second window is now a *response wait*,
+  not a kill switch. Launch failures fail fast (`advisor_not_running —
+  <reason>`); consults that need longer keep running in the background and the
+  tool returns `ADVISOR CONSULT RUNNING` (id + elapsed + "You do not need to
+  start another consultation"). New **`advisor_status`** tool lists this
+  session's consults (running/completed/failed + elapsed + delivery state) and
+  replays delivered advice. Completed background consults are auto-delivered
+  through the native injection channel on the executor's next model call, and
+  recorded in a consult ledger (last 100) with a setup-time reaper for entries
+  that outlive the ceiling.
+- `advisorResponseWaitMs` (default 90s — **uniform across presets**: presets
+  scale budget, never patience) and `maxConsultMs` (default 1h ceiling; expiry
+  fails the consult WITHOUT consuming the consult cap). Concurrency guard: ≤2
+  running consults; rejections never consume the cap. Consults own their
+  AbortController — executor interruption cancels waiting, never thinking.
+
+### Changed
+- Review-mode transport is now history-less direct generation first
+  (`generate.text`), isolated session sandwich as fallback; the calling
+  session's model is never switched on the common path.
+- `timeoutMs` accepted as a deprecated alias for `advisorResponseWaitMs`
+  (the new key wins when both are set; the wait is clamped to ≤ `maxConsultMs`).
+
 ## [0.7.1] — 2026-09-26
 
 ### Fixed

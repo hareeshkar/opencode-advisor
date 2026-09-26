@@ -44,7 +44,8 @@ export const DEFAULTS = {
   advisor: { providerID: "", id: "" } as AdvisorModelRef,
   maxUsesPerTask: 3,
   adviceTokenBudget: 8_000,
-  timeoutMs: 90_000,
+  advisorResponseWaitMs: 90_000,
+  maxConsultMs: 3_600_000,
   maxToolOutputChars: 1_500,
   // 16k tokens ≈ 64k chars: balanced default — the recency-weighted excerpt
   // plus original-task pinning preserves signal at roughly ⅔ the cost of a
@@ -145,7 +146,8 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   let advisor = DEFAULTS.advisor
   let maxUsesPerTask = DEFAULTS.maxUsesPerTask
   let adviceTokenBudget = DEFAULTS.adviceTokenBudget
-  let timeoutMs = DEFAULTS.timeoutMs
+  let advisorResponseWaitMs = DEFAULTS.advisorResponseWaitMs
+  let maxConsultMs = DEFAULTS.maxConsultMs
   let maxToolOutputChars = DEFAULTS.maxToolOutputChars
   let transcriptBudgetTokens = DEFAULTS.transcriptBudgetTokens
   let advisorMode: AdvisorOptions["advisorMode"] = DEFAULTS.advisorMode
@@ -203,7 +205,14 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   maxUsesPerTask = readInt(opts, "maxUsesPerTask", 1, 50) ?? maxUsesPerTask
   let maxAttempts = readInt(opts, "maxAttempts", 1, 100) ?? 0 // 0 = derive from cap
   adviceTokenBudget = readInt(opts, "adviceTokenBudget", 500, 64_000) ?? adviceTokenBudget
-  timeoutMs = readInt(opts, "timeoutMs", 1_000, 600_000) ?? timeoutMs
+  advisorResponseWaitMs = readInt(opts, "advisorResponseWaitMs", 100, 600_000) ?? readInt(opts, "timeoutMs", 100, 600_000) ?? advisorResponseWaitMs
+  maxConsultMs = readInt(opts, "maxConsultMs", 1_000, 86_400_000) ?? maxConsultMs
+  if (maxConsultMs < advisorResponseWaitMs) {
+    console.warn(
+      `[advisor] maxConsultMs (${maxConsultMs}) raised to advisorResponseWaitMs (${advisorResponseWaitMs}) — the ceiling must cover the wait window`,
+    )
+    maxConsultMs = advisorResponseWaitMs
+  }
   maxToolOutputChars = readSize(opts, "maxToolOutputChars", 100, 200_000) ?? maxToolOutputChars
   transcriptBudgetTokens = readSize(opts, "transcriptBudgetTokens", 2_000, 1_000_000) ?? transcriptBudgetTokens
   let triggers: string[] = [...DEFAULT_TRIGGERS]
@@ -253,7 +262,8 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     maxAttempts: maxAttempts > 0 ? maxAttempts : maxUsesPerTask * 3 + 2,
     adviceTokenBudget,
     transcriptBudgetTokens,
-    timeoutMs,
+    advisorResponseWaitMs,
+    maxConsultMs,
     prune: { maxToolOutputChars, transcriptBudgetChars: transcriptBudgetTokens * 4 },
     advisorMode,
     triggers,

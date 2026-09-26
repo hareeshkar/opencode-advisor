@@ -34,7 +34,8 @@ export const CONFIG_OUTPUT_SCHEMA = {
         advisorMode: { type: "string" },
         maxUsesPerTask: { type: "number" },
         maxAttempts: { type: "number" },
-        timeoutMs: { type: "number" },
+        advisorResponseWaitMs: { type: "number" },
+        maxConsultMs: { type: "number" },
         adviceTokenBudget: { type: "number" },
         transcriptBudgetTokens: { type: "number" },
         maxToolOutputChars: { type: "number" },
@@ -50,7 +51,8 @@ export const CONFIG_OUTPUT_SCHEMA = {
         "advisorMode",
         "maxUsesPerTask",
         "maxAttempts",
-        "timeoutMs",
+        "advisorResponseWaitMs",
+        "maxConsultMs",
         "adviceTokenBudget",
         "transcriptBudgetTokens",
         "maxToolOutputChars",
@@ -100,7 +102,8 @@ export interface AdvisorSettingsView {
     advisorMode: string
     maxUsesPerTask: number
     maxAttempts: number
-    timeoutMs: number
+    advisorResponseWaitMs: number
+    maxConsultMs: number
     adviceTokenBudget: number
     transcriptBudgetTokens: number
     maxToolOutputChars: number
@@ -167,11 +170,11 @@ export function formatSize(chars: number): string {
   return String(Math.floor(chars))
 }
 
-/** 90000 → "90s", 120000 → "2 min", 300000 → "5 min". */
+/** 90000 → "90s", 120000 → "2 min", 3600000 → "1h", 86400000 → "24h". */
 export function formatDuration(ms: number): string {
   if (ms < 120_000) return `${Math.round(ms / 1000)}s`
-  const minutes = ms / 60_000
-  return `${trimNumber(minutes)} min`
+  if (ms < 3_600_000) return `${trimNumber(ms / 60_000)} min`
+  return `${trimNumber(ms / 3_600_000)}h`
 }
 
 /** Human sizes in config files: 32000 | "32k" | "1.5m" (1000-based). */
@@ -361,7 +364,10 @@ export function currentMode(view: AdvisorSettingsView, draft: SettingsDraft): Mo
 
 export interface LimitsDisplay {
   consults: number
-  timeoutMs: number
+  /** How long the executor waits for advice before continuing in the background. */
+  responseWaitMs: number
+  /** Maximum advisor lifetime; expiry fails the consult without consuming the cap. */
+  ceilingMs: number
   /** INPUT context budget, in tokens (≈4 chars/token when pruning). */
   contextTokens: number
   /** OUTPUT budget for the advisor's reply, in tokens. */
@@ -383,7 +389,8 @@ export function currentLimits(view: AdvisorSettingsView, draft: SettingsDraft): 
   }
   return {
     consults: pick("maxUsesPerTask", 3) as number,
-    timeoutMs: pick("timeoutMs", 90_000) as number,
+    responseWaitMs: pick("advisorResponseWaitMs", 90_000) as number,
+    ceilingMs: pick("maxConsultMs", 3_600_000) as number,
     contextTokens: pick("transcriptBudgetTokens", 16_000) as number,
     adviceTokens: pick("adviceTokenBudget", 8_000) as number,
     toolCap: pick("maxToolOutputChars", 1_500) as number,
@@ -413,8 +420,8 @@ export function mainMenuRows(view: AdvisorSettingsView, draft: SettingsDraft): M
     {
       category: "Settings",
       value: "limits",
-      title: `Limits — ${limits.consults} consults/task · ${formatDuration(limits.timeoutMs)}`,
-      description: `${formatSize(limits.contextTokens)} context tokens · ${formatSize(limits.adviceTokens)} advice tokens · ${formatSize(limits.toolCap)} chars per tool output · ${limits.attempts} retries`,
+      title: `Limits — ${limits.consults} consults/task · response wait ${formatDuration(limits.responseWaitMs)}`,
+      description: `${formatSize(limits.contextTokens)} context tokens · ${formatSize(limits.adviceTokens)} advice tokens · ceiling ${formatDuration(limits.ceilingMs)} · ${limits.attempts} retries`,
     },
     { category: "Actions", value: "save", title: "Save changes", description: hasChanges(draft) ? `Write to ${target}` : "No changes yet" },
     { category: "Actions", value: "reset", title: "Reset all settings…", description: `Remove the plugin's keys from ${target}` },
@@ -426,7 +433,8 @@ export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): Menu
   const limits = currentLimits(view, draft)
   return [
     { category: "", value: "consults", title: `Consults per task — ${limits.consults}`, description: "Advisor calls allowed per user task (safety cap)" },
-    { category: "", value: "timeout", title: `Timeout — ${formatDuration(limits.timeoutMs)}`, description: "Abort a consult that runs too long" },
+    { category: "", value: "wait", title: `Response wait — ${formatDuration(limits.responseWaitMs)}`, description: "How long to wait for advisor advice before continuing in the background (the advisor keeps running)" },
+    { category: "Advanced", value: "ceiling", title: `Consult ceiling — ${formatDuration(limits.ceilingMs)}`, description: "Maximum advisor lifetime; expiry fails the consult without consuming the cap" },
     {
       category: "Advanced",
       value: "context",
@@ -467,7 +475,7 @@ export function summaryMessage(view: AdvisorSettingsView): string {
     `Model     ${model.label}`,
     `Preset    ${preset.title}${preset.kind === "preset" && preset.isDefault ? " (default)" : ""} — ${preset.blurb}`,
     `Mode      ${mode.title} — ${MODE_DESCRIPTIONS[mode.mode]}`,
-    `Limits    ${limits.consults} consults/task · ${formatDuration(limits.timeoutMs)} · ${formatSize(limits.contextTokens)} context tokens · ${formatSize(limits.adviceTokens)} advice tokens`,
+    `Limits    ${limits.consults} consults/task · response wait ${formatDuration(limits.responseWaitMs)} · ${formatSize(limits.contextTokens)} context tokens · ${formatSize(limits.adviceTokens)} advice tokens`,
     `File      ${view.files.project || view.files.global}`,
     `Applies immediately — no restart.`,
   ].join("\n")
@@ -550,20 +558,33 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
           rangeHint: "1–50",
         })
         break
-      case "timeout":
+      case "wait":
         next = await pickNumber(ports, {
-          title: "Timeout",
-          description: "Milliseconds before a consult is aborted",
-          current: currentLimits(view, draft).timeoutMs,
-          choices: [30_000, 45_000, 60_000, 90_000, 120_000, 300_000],
+          title: "Response wait",
+          description: "How long to wait for advisor advice before continuing in the background",
+          current: currentLimits(view, draft).responseWaitMs,
+          choices: [30_000, 60_000, 90_000, 120_000, 180_000, 300_000],
           format: formatDuration,
           parse: (raw) => {
             const seconds = /^\d+$/.test(raw) ? Number(raw) : undefined
             return seconds === undefined ? undefined : seconds * 1000
           },
-          min: 5_000,
+          min: 1_000,
           max: 600_000,
-          rangeHint: "5–600 seconds",
+          rangeHint: "1–600 seconds",
+        })
+        break
+      case "ceiling":
+        next = await pickNumber(ports, {
+          title: "Consult ceiling",
+          description: "Maximum advisor lifetime; expiry fails the consult without consuming the cap",
+          current: currentLimits(view, draft).ceilingMs,
+          choices: [300_000, 900_000, 1_800_000, 3_600_000, 10_800_000, 86_400_000],
+          format: formatDuration,
+          parse: parseHumanSize,
+          min: 30_000,
+          max: 86_400_000,
+          rangeHint: "30s–24h, e.g. 1h",
         })
         break
       case "context":
@@ -640,15 +661,17 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
       const key =
         choice === "consults"
           ? "maxUsesPerTask"
-          : choice === "timeout"
-            ? "timeoutMs"
-            : choice === "context"
-              ? "transcriptBudgetTokens"
-              : choice === "advice"
-                ? "adviceTokenBudget"
-                : choice === "toolcap"
-                  ? "maxToolOutputChars"
-                  : "maxAttempts"
+          : choice === "wait"
+            ? "advisorResponseWaitMs"
+            : choice === "ceiling"
+              ? "maxConsultMs"
+              : choice === "context"
+                ? "transcriptBudgetTokens"
+                : choice === "advice"
+                  ? "adviceTokenBudget"
+                  : choice === "toolcap"
+                    ? "maxToolOutputChars"
+                    : "maxAttempts"
       draft[key] = next
     }
   }

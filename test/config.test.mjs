@@ -51,7 +51,7 @@ test("precedence: deployment < global < project root < project .opencode", async
       await mkdir(join(s.home, "opencode"), { recursive: true })
       await mkdir(join(s.project, ".opencode"), { recursive: true })
       await writeFile(join(s.home, GLOBAL_REL), JSON.stringify({ maxUsesPerTask: 5, preset: "thorough" }))
-      await writeFile(join(s.project, "opencode-advisor.json"), JSON.stringify({ timeoutMs: 40_000 }))
+      await writeFile(join(s.project, "opencode-advisor.json"), JSON.stringify({ advisorResponseWaitMs: 40_000 }))
       await writeFile(join(s.project, ".opencode", "opencode-advisor.json"), JSON.stringify({ maxUsesPerTask: 9 }))
 
       const snap = await loadAdvisorConfig({
@@ -59,11 +59,11 @@ test("precedence: deployment < global < project root < project .opencode", async
         options: { maxUsesPerTask: 3, adviceTokenBudget: 5_000 },
       })
       assert.equal(snap.merged.maxUsesPerTask, 9, "canonical .opencode project file wins")
-      assert.equal(snap.merged.timeoutMs, 40_000, "root project file wins over global/options")
+      assert.equal(snap.merged.advisorResponseWaitMs, 40_000, "root project file wins over global/options")
       assert.equal(snap.merged.adviceTokenBudget, 5_000, "deployment key survives where files are silent")
       assert.equal(snap.merged.preset, "thorough", "global key survives where project is silent")
       assert.equal(snap.tiers.maxUsesPerTask, "project")
-      assert.equal(snap.tiers.timeoutMs, "project")
+      assert.equal(snap.tiers.advisorResponseWaitMs, "project")
       assert.equal(snap.tiers.adviceTokenBudget, "deployment")
       assert.equal(snap.tiers.preset, "global")
       assert.equal(snap.files.project, join(s.project, ".opencode", "opencode-advisor.json"))
@@ -140,7 +140,7 @@ test("removeAdvisorConfigKeys clears known keys, preserves unknown ones, no-ops 
   try {
     const target = join(s.dir, "cfg.json")
     await writeFile(target, JSON.stringify({ preset: "economy", myCustom: true }))
-    await removeAdvisorConfigKeys(target, ["preset", "advisor", "timeoutMs"])
+    await removeAdvisorConfigKeys(target, ["preset", "advisor", "advisorResponseWaitMs"])
     assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { myCustom: true })
     await removeAdvisorConfigKeys(join(s.dir, "missing.json"), ["preset"])
     assert.deepEqual(await readdir(s.dir), ["cfg.json"])

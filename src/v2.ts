@@ -17,6 +17,7 @@
 
 import { ADVISOR_CONFIG_KEYS, loadAdvisorConfig, migrateStoredOverride, removeAdvisorConfigKeys, updateAdvisorConfig } from "./config.js"
 import type { AdvisorConfigSnapshot } from "./config.js"
+import { CONSULT_CONCURRENCY, ConsultLedger, runningMessage } from "./consults.js"
 import { AdvisorEngine } from "./engine.js"
 import { extractToolNames, replaceSystemInBody } from "./inject.js"
 import { resolveOptions } from "./options.js"
@@ -24,7 +25,7 @@ import { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA } from "./settings.js"
 import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
 import { frameAdvice, isAdvisorOutputFrame } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
-import type { AdvisorOptions, Host, LogLevel, Slice, UsageEntry } from "./types.js"
+import type { AdvisorOptions, ConsultResult, Host, LogLevel, Slice, UsageEntry } from "./types.js"
 
 /* ------------------------------------------------------------------ */
 /* transcript normalization                                            */
@@ -266,11 +267,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           if (model.variant) advisorRef.variant = model.variant
           transportUsed = "none"
           if (nonce && sessionID) {
+            // Correlation lives for the WHOLE consult lifetime (the ceiling) —
+            // a backgrounded direct call still needs routing headers until it
+            // settles. Cleanup happens in this function's finally.
             pendingAdvisorCalls.set(nonce, sessionID)
-            const timer = setTimeout(() => pendingAdvisorCalls.delete(nonce), opts.timeoutMs + 30_000)
-            if (typeof timer === "object" && timer !== null && "unref" in timer) {
-              (timer as { unref(): void }).unref()
-            }
           }
           try {
             // PRIMARY — history-less direct generation: the native transport
@@ -386,6 +386,17 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           `[${PLUGIN_ID}] no advisor model configured yet — the advisor tool will return setup steps until one is set (via /advisor-settings or ${snapshot.files.global}).`,
         )
       }
+      // Async consult lifecycle (v0.8.0): ledger + lifecycle sweep. The
+      // ledger keeps the last 100 consults (in memory — never prompts).
+      // Lifecycle sweep: every `running` entry is stale by definition at
+      // setup (this process owns no detached promises from a previous
+      // instance) — fail them all so hot-reload orphans cannot permanently
+      // occupy concurrency slots. Idempotent.
+      const ledger = new ConsultLedger()
+      const interrupted = ledger.failAllRunning("advisor_not_running — interrupted by plugin reload")
+      if (interrupted.length > 0) {
+        log("warn", `consult lifecycle sweep failed ${interrupted.length} orphaned consult(s): ${interrupted.join(", ")}`)
+      }
       const engine = new AdvisorEngine(opts, host)
       // Child sessions spawned by AGENT-MODE advisor consults. Used as a
       // recursion guard: a consult originating inside one of these returns
@@ -412,10 +423,10 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
         try {
           await ctx.session.prompt({ sessionID: childID, text: `${AGENT_MODE_PREFIX}${prompt}` })
           // Poll to completion (idle message marks the end of the run).
-          const deadline = Date.now() + opts.timeoutMs
+          const deadline = Date.now() + opts.maxConsultMs
           let lastText = ""
           for (;;) {
-            if (Date.now() > deadline) throw new Error(`agent-mode advisor timed out after ${opts.timeoutMs}ms`)
+            if (Date.now() > deadline) throw new Error(`advisor_not_running — no response within ${Math.round(opts.maxConsultMs / 1000)}s`)
             await new Promise((r) => setTimeout(r, 1_500))
             let messages: unknown[] = []
             try {
@@ -522,7 +533,8 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
           advisorMode: resolved.advisorMode,
           maxUsesPerTask: resolved.maxUsesPerTask,
           maxAttempts: resolved.maxAttempts,
-          timeoutMs: resolved.timeoutMs,
+          advisorResponseWaitMs: resolved.advisorResponseWaitMs,
+          maxConsultMs: resolved.maxConsultMs,
           adviceTokenBudget: resolved.adviceTokenBudget,
           transcriptBudgetTokens: resolved.transcriptBudgetTokens,
           maxToolOutputChars: resolved.prune.maxToolOutputChars,
@@ -693,8 +705,86 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                     "advisor_tool_result_error: unavailable — nested advisor sessions are not supported. You ARE the advisor: answer with your guidance.",
                 }
               }
-              const signal: AbortSignal = tctx?.signal ?? new AbortController().signal
-              const r = await engine.consult(sessionID, signal)
+              if (ledger.runningCount() >= CONSULT_CONCURRENCY) {
+                // Nothing started — the consult cap is not consumed.
+                return {
+                  content:
+                    "advisor_tool_result_error: advisor_not_running — maximum 2 consultations already running. Check advisor_status; do not start another consultation.",
+                }
+              }
+              // Lifecycle: the consult gets its OWN controller — the tool's
+              // signal gates only the synchronous wait (executor interruption
+              // cancels WAITING, never THINKING). Once launched, a consult
+              // lives until completion or maxConsultMs.
+              const consultController = new AbortController()
+              const startedAt = ledger.now()
+              const consultId = `c${startedAt.toString(36)}${Math.random().toString(36).slice(2, 6)}`
+              ledger.start({
+                id: consultId,
+                sessionID,
+                mode: opts.advisorMode,
+                model: advisorLabel(engine.advisor()),
+              })
+              const consultPromise = engine.consult(sessionID, consultController.signal)
+              // Delivery + terminal ownership, attached AT SPAWN: a rejection
+              // after this tool returned must never become an unhandled
+              // rejection, and completed advice must be delivered through the
+              // native injection channel and recorded for advisor_status.
+              consultPromise
+                .then((r) => {
+                  try {
+                    void ctx.storage
+                      .set("diag:health", { sessionID, time: Date.now(), ...engine.health(sessionID) })
+                      .catch(() => {})
+                  } catch {
+                    /* diagnostics only */
+                  }
+                  if (r.ok) {
+                    const framed = frameAdvice(r.advice, advisorLabel(engine.advisor()))
+                    ledger.complete(consultId, framed)
+                    queueSystemInjection(sessionID, [framed])
+                    ledger.markInjected(consultId)
+                    log("info", `background consult ${consultId} completed — advice delivered to the session`)
+                  } else {
+                    // Ceiling expiry gets the user-facing wording: the advisor
+                    // did not deliver within its lifetime.
+                    const reason =
+                      r.errorCode === "execution_time_exceeded"
+                        ? `advisor_not_running — no response within ${Math.round(opts.maxConsultMs / 1000)}s`
+                        : `${r.errorCode} — ${r.message}`
+                    ledger.fail(consultId, reason)
+                    log("warn", `background consult ${consultId} failed: ${reason}`)
+                  }
+                })
+                .catch((err: unknown) => {
+                  ledger.fail(consultId, `advisor_not_running — ${err instanceof Error ? err.message : String(err)}`)
+                  log("warn", `background consult ${consultId} failed`, err)
+                })
+              // Synchronous wait window: block the executor for a normal
+              // answer; on expiry return RUNNING and let the consult finish
+              // in the background. Launch failures inside the window fail
+              // fast — they are never awaited out.
+              const settled = consultPromise.then((r) => ({ kind: "done" as const, r }))
+              settled.catch(() => {}) // failure ownership belongs to the chain above
+              const syncWait = new Promise<"wait">((resolve) => {
+                const timer = setTimeout(() => resolve("wait"), opts.advisorResponseWaitMs)
+                if (typeof timer === "object" && timer !== null && "unref" in timer) {
+                  (timer as { unref(): void }).unref()
+                }
+              })
+              let raced: { kind: "done"; r: ConsultResult } | "wait"
+              try {
+                raced = await Promise.race([settled, syncWait])
+              } catch (err) {
+                const reason = err instanceof Error ? err.message : String(err)
+                ledger.fail(consultId, `advisor_not_running — ${reason}`)
+                log("warn", `consult launch failed: ${reason}`)
+                return { content: `advisor_tool_result_error: advisor_not_running — ${reason}` }
+              }
+              if (raced === "wait") {
+                return { content: runningMessage(consultId, ledger.now() - startedAt) }
+              }
+              const r = raced.r
               // Observable hook-delivery signal: last-write-wins health per
               // consult (bounded: 1 small write per consult, not per call).
               // Lets post-hoc analysis distinguish "hooks never delivered"
@@ -708,6 +798,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 /* storage unavailable — diagnostics only */
               }
               if (!r.ok) {
+                ledger.fail(consultId, `${r.errorCode} — ${r.message}`)
                 log("warn", `consult failed: ${r.errorCode} — ${r.message}`)
                 let content = `advisor_tool_result_error: ${r.errorCode} — ${r.message}`
                 if (opts.logLevel === "debug") {
@@ -715,7 +806,30 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                 }
                 return { content }
               }
+              ledger.complete(consultId, frameAdvice(r.advice, advisorLabel(engine.advisor())))
               return { content: frameAdvice(r.advice, advisorLabel(engine.advisor())) }
+            },
+          })
+          editor.add({
+            name: "advisor_status",
+            description:
+              "Check advisor consultation status for this session (running/completed/failed) and replay delivered advice. Zero parameters.",
+            input: EMPTY_INPUT,
+            execute: async (_input: unknown, tctx: any) => {
+              const sessionID = String(tctx?.sessionID ?? "")
+              const records = ledger.list(sessionID)
+              if (records.length === 0) {
+                return { content: "No advisor consultations recorded in this session yet." }
+              }
+              const now = ledger.now()
+              const blocks = records.map((r) => {
+                const elapsed = Math.max(1, Math.round((r.elapsedMs ?? now - r.startedAt) / 1000))
+                const head = `${r.id} · ${r.mode} · ${r.model} · ${r.state.toUpperCase()} · ${elapsed}s · delivery ${r.delivery}`
+                if (r.state === "completed" && r.advice) return `${head}\n${r.advice}`
+                if (r.state === "failed") return `${head}\n${r.error ?? "failed"}`
+                return head
+              })
+              return { content: blocks.join("\n\n") }
             },
           })
           try {

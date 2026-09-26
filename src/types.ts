@@ -7,7 +7,7 @@
  */
 
 export const PLUGIN_ID = "opencode-advisor"
-export const PLUGIN_VERSION = "0.7.1"
+export const PLUGIN_VERSION = "0.8.0"
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -57,8 +57,22 @@ export interface AdvisorOptions {
    * the pruner — the pruner measures exactly, the user budgets natively.
    */
   transcriptBudgetTokens: number
-  /** Sub-call timeout in ms. Default 90_000. */
-  timeoutMs: number
+  /**
+   * How long the executor's tool call waits for the advisor response before
+   * returning control (the consult keeps running in the background and the
+   * advice is delivered automatically). This is a UX wait window — NOT a kill
+   * switch, and NOT the mechanism for detecting launch failures (those surface
+   * immediately from the provider response). Default 90_000. Renamed from
+   * `timeoutMs` (accepted as a deprecated alias).
+   */
+  advisorResponseWaitMs: number
+  /**
+   * Maximum lifetime of a consultation. Expiry marks it failed
+   * ("advisor not running") WITHOUT consuming the consult cap. Default
+   * 3_600_000 (1h) — reasoning models may think for a long time. Range
+   * 30_000–86_400_000.
+   */
+  maxConsultMs: number
   /** Transcript pruning knobs (chars: derived from tokens; exact for the pruner). */
   prune: PruneOptions
   /**

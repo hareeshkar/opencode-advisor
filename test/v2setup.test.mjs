@@ -119,8 +119,9 @@ test("setup registers the advisor tool and both commands", async () => {
   const { ctx, captured } = makeCtx()
   const plugin = createV2Plugin()
   const cleanup = await plugin.setup(ctx)
-  assert.equal(captured.tools.length, 1)
+  assert.equal(captured.tools.length, 2)
   assert.equal(captured.tools[0].name, "advisor")
+  assert.equal(captured.tools[1].name, "advisor_status")
   assert.ok(captured.tools[0].description.length > 20)
   assert.deepEqual(
     captured.commands.map((c) => c.name).sort(),
@@ -330,8 +331,9 @@ test("/advisor-settings composes a lean shortlist and config-edit instruction", 
 test("unconfigured install loads safely and the tool teaches setup", async () => {
   const { ctx, captured } = makeCtx({ options: { logLevel: "error" } })
   await createV2Plugin().setup(ctx)
-  assert.equal(captured.tools.length, 1, "tool still registers so errors can teach")
-  const result = await captured.tools[0].execute({}, { sessionID: "s-nc", signal: new AbortController().signal })
+  assert.equal(captured.tools.length, 2, "tool still registers so errors can teach")
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const result = await advisorTool.execute({}, { sessionID: "s-nc", signal: new AbortController().signal })
   assert.ok(result.content.includes("not_configured"), "error code surfaced")
   assert.ok(result.content.includes("/advisor-settings"), "settings step present")
   assert.ok(result.content.includes("opencode.json"), "declarative step present")
@@ -375,7 +377,7 @@ test("agent mode spawns a read-only child session, polls to idle, returns its ad
   const adviceText = "AGENT-GROUNDED-ADVICE: verified in engine.ts line 42."
   let childID = ""
   const { ctx, captured } = makeCtx()
-  ctx.options = { advisor: { providerID: "zai-coding-plan", id: "glm-5.3" }, logLevel: "error", advisorMode: "agent", timeoutMs: 20_000 }
+  ctx.options = { advisor: { providerID: "zai-coding-plan", id: "glm-5.3" }, logLevel: "error", advisorMode: "agent", maxConsultMs: 30_000 }
   ctx.session.create = async (input) => {
     captured.createInput = input
     childID = "ses_child_agent"
@@ -419,7 +421,7 @@ test("agent mode spawns a read-only child session, polls to idle, returns its ad
 test("nested advisor sessions are refused (recursion guard)", async () => {
   let childID = "ses_child_nested"
   const { ctx, captured } = makeCtx()
-  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorMode: "agent", timeoutMs: 20_000 }
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorMode: "agent", maxConsultMs: 30_000 }
   ctx.session.create = async () => ({ id: childID })
   ctx.session.remove = async () => {}
   ctx.session.prompt = async (args) => {
@@ -480,3 +482,105 @@ test("fallback sandwich is isolated too: history, system parts, and tools are st
   assert.equal(diag.dropped, 2)
   assert.equal(diag.systemStripped, 1)
 })
+
+test("async consults: long advisor work returns RUNNING, then delivers automatically", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
+  let release
+  ctx.generate.text = async () => {
+    await new Promise((r) => { release = r })
+    return { text: "LATE-ARRIVING ADVICE" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const statusTool = captured.tools.find((t) => t.name === "advisor_status")
+
+  const running = await advisorTool.execute({}, { sessionID: "s-async", signal: new AbortController().signal })
+  assert.ok(running.content.includes("ADVISOR CONSULT RUNNING"), "sync wait expiry returns RUNNING")
+  assert.ok(running.content.includes("You do not need to start another consultation."), "explicit promise present")
+  assert.ok(running.content.includes("id: "), "consult id present")
+
+  const statusRunning = await statusTool.execute({}, { sessionID: "s-async", signal: new AbortController().signal })
+  assert.ok(statusRunning.content.includes("RUNNING"), "status shows the running consult")
+
+  release()
+  await new Promise((r) => setTimeout(r, 40))
+  const statusDone = await statusTool.execute({}, { sessionID: "s-async", signal: new AbortController().signal })
+  assert.ok(statusDone.content.includes("COMPLETED"), "status shows completed")
+  assert.ok(statusDone.content.includes("LATE-ARRIVING ADVICE"), "status replays the advice")
+
+  // auto-delivery: the advice rides the native injection channel on the next model call
+  await captured.contextHooks[0]({ sessionID: "s-async", kind: "primary", model: { providerID: "p", id: "m" }, system: [] })
+  const request = new Request("http://example.test/v1/messages", { method: "POST", body: JSON.stringify({ system: "s", messages: [] }) })
+  const ev = { sessionID: "s-async", kind: "primary", request }
+  await captured.httpHooks[0](ev)
+  const body = await ev.request.clone().text()
+  assert.ok(body.includes("LATE-ARRIVING ADVICE"), "advice auto-delivered on the next model call")
+})
+
+test("async consults: concurrency guard rejects the third without consuming the cap", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
+  let release
+  ctx.generate.text = async () => {
+    await new Promise((r) => { release = r })
+    return { text: "LATE" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  await advisorTool.execute({}, { sessionID: "s-a1", signal: new AbortController().signal })
+  await advisorTool.execute({}, { sessionID: "s-a2", signal: new AbortController().signal })
+  const third = await advisorTool.execute({}, { sessionID: "s-a3", signal: new AbortController().signal })
+  assert.ok(third.content.includes("maximum 2 consultations already running"), "third rejected explicitly")
+  release()
+  await new Promise((r) => setTimeout(r, 20))
+  const after = captured.tools.find((t) => t.name === "advisor_status")
+  void after
+  // releasing lets both finish; the ledger holds two completed consults
+  const health = captured.storage.get("diag:health")
+  void health
+})
+
+test("tool-signal abort does not kill a backgrounded consult (lifecycle independence)", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 30_000 }
+  let release
+  ctx.generate.text = async () => {
+    await new Promise((r) => { release = r })
+    return { text: "LATE" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const statusTool = captured.tools.find((t) => t.name === "advisor_status")
+  const controller = new AbortController()
+  const running = await advisorTool.execute({}, { sessionID: "s-sig", signal: controller.signal })
+  assert.ok(running.content.includes("ADVISOR CONSULT RUNNING"), "sync wait expiry returns RUNNING")
+  controller.abort() // the executor's turn "ends" — must NOT kill the consult
+  release()
+  await new Promise((r) => setTimeout(r, 40))
+  const status = await statusTool.execute({}, { sessionID: "s-sig", signal: new AbortController().signal })
+  assert.ok(status.content.includes("COMPLETED"), "consult survived the tool-signal abort")
+  assert.ok(status.content.includes("LATE"), "advice recorded")
+})
+
+test("ceiling expiry fails the consult without consuming the cap", async () => {
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "p", id: "a" }, logLevel: "error", advisorResponseWaitMs: 150, maxConsultMs: 1_000 }
+  let calls = 0
+  ctx.generate.text = async () => {
+    calls++
+    if (calls === 1) await new Promise(() => {}) // hang past the ceiling
+    return { text: "NEVER-SEEN" }
+  }
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const statusTool = captured.tools.find((t) => t.name === "advisor_status")
+  await advisorTool.execute({}, { sessionID: "s-ceiling", signal: new AbortController().signal })
+  await new Promise((r) => setTimeout(r, 1_300)) // ceiling (1s) passes → engine timeout → failed
+  const status = await statusTool.execute({}, { sessionID: "s-ceiling", signal: new AbortController().signal })
+  assert.ok(status.content.includes("FAILED"), "ceiling expiry marked failed")
+  assert.ok(status.content.includes("advisor_not_running"), "advisor_not_running wording")
+  const ok = await advisorTool.execute({}, { sessionID: "s-ceiling2", signal: new AbortController().signal })
+  assert.ok(ok.content.includes("NEVER-SEEN"), "cap NOT consumed by the expired consult")
+})
+

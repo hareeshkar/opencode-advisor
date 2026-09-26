@@ -307,7 +307,10 @@ export class AdvisorEngine {
 
     let raw: string
     try {
-      raw = await withTimeout(this.host.runAdvisor(prompt, signal, sessionID, nonce, this.advisorRef), this.opts.timeoutMs, signal)
+      // The lifetime ceiling (maxConsultMs) — NOT a UX kill switch. The executor's
+    // wait window (advisorResponseWaitMs) is enforced by the adapter, which
+    // backgrounds the consult instead of aborting it.
+    raw = await withTimeout(this.host.runAdvisor(prompt, signal, sessionID, nonce, this.advisorRef), this.opts.maxConsultMs, signal)
     } catch (err) {
       const { errorCode, message } = classifyError(err)
       return fail(errorCode, message, estTokensIn)

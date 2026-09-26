@@ -3,6 +3,37 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [0.8.2] — 2026-09-26
+
+### Fixed
+- **Review + Agent actually explores now.** The child session answered from
+  the transcript alone — zero tool calls — because the prompt merely permitted
+  exploration and the child inherited the parent's Plan-mode framing.
+  Exploration is now REQUIRED: a FIRST ACTION imperative (inspect the
+  implicated artifacts before advising), an explicit read-only tool-use
+  authorization that countermands discuss-only system reminders, a hard
+  no-mutation contract (the advisor never creates, modifies, or deletes
+  files — coding is the requesting agent's job), the child on the plan agent
+  with a completed read-only deny list (edit/shell/subagent/webfetch/
+  websearch), and the mode-aware prompt rule (agent mode grants read/grep/
+  glob; only Review mode says "you have NO tools"). Verified live with a
+  recall-proof sentinel: the advisor read a file whose contents never entered
+  any transcript and reported the value with a file citation
+  (10 tool inspections on the final configuration).
+
+### Added
+- Epistemic honesty contract: every claim labelled OBSERVED / INFERRED /
+  UNVERIFIED, each OBSERVED claim carries its evidence reference, each
+  recommendation states its falsifying condition. Evidence-limitations
+  manifest in every consult (pruned content, truncated outputs, absent
+  artifacts — state uncertainty, never assume).
+- Mode-labelled advice frames with the evidence basis stated verbatim
+  (excerpt-only vs files-verified), so the executor knows exactly how much
+  to trust factual claims. Conservative injection-marker rule: flag genuine
+  override attempts, never ordinary discussion of the plugin. Provenance
+  suffix on agent-mode advice: verified-against-repository (N inspections)
+  or an explicit no-files-examined note.
+
 ## [0.8.1] — 2026-09-26
 
 ### Fixed

@@ -416,6 +416,50 @@ test("agent mode spawns a read-only child session, polls to idle, returns its ad
   assert.ok(childPrompt.text.includes("MAP"), "conversation framed as the map")
   assert.ok(childPrompt.text.includes("TERRITORY"), "tools framed as the territory")
   assert.ok(childPrompt.text.includes("<transcript-"), "transcript forwarded for grounding")
+  assert.ok(
+    result.content.includes("[NOTE: no files were examined"),
+    "honest no-exploration provenance: the fake child made no tool calls",
+  )
+})
+
+test("agent-mode advice carries an honest provenance suffix when the child verifies files", async () => {
+  const adviceText = "VERIFIED-ADVICE: the claim holds at the cited line."
+  let childID = ""
+  const { ctx, captured } = makeCtx()
+  ctx.options = { advisor: { providerID: "zai-coding-plan", id: "glm-5.3" }, logLevel: "error", advisorMode: "agent", maxConsultMs: 30_000 }
+  ctx.session.create = async (input) => {
+    captured.createInput = input
+    childID = "ses_child_verified"
+    return { id: childID }
+  }
+  ctx.session.prompt = async (args) => {
+    captured.prompts.push(args)
+    return {}
+  }
+  ctx.session.context = async ({ sessionID }) => {
+    if (sessionID === childID) {
+      return [
+        {
+          type: "assistant",
+          content: [
+            { type: "text", text: adviceText },
+            { type: "tool", name: "read", state: { status: "completed", input: "src/v2.ts", output: "config freshness block" } },
+          ],
+        },
+        { type: "idle" },
+      ]
+    }
+    return [{ type: "user", text: "do the thing" }]
+  }
+  ctx.session.remove = async () => {}
+  await createV2Plugin().setup(ctx)
+
+  const result = await captured.tools[0].execute({}, { sessionID: "s-verified", signal: new AbortController().signal })
+  assert.ok(result.content.includes("VERIFIED-ADVICE"), "child advice returned")
+  assert.ok(
+    result.content.includes("[Verified against the repository: 1 tool inspection(s) performed.]"),
+    "verified provenance suffix appended when the child inspected files",
+  )
 })
 
 test("nested advisor sessions are refused (recursion guard)", async () => {

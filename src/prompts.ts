@@ -182,8 +182,8 @@ export function shortlistAdvisorModels(
 
 /**
  * Review + Agent prefix prepended to the advisor prompt when the advisor runs
- * as a read-only child session (build agent with write/shell/subagent denied
- * via create-time permissions): the pruned conversation is its MAP; read-only
+ * as a read-only child session (plan agent; create-time permissions deny
+ * edit/shell/subagent/webfetch/websearch): the pruned conversation is its MAP; read-only
  * tools let it verify the territory before answering.
  */
 export const AGENT_MODE_PREFIX = [

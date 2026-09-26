@@ -182,3 +182,39 @@ test("advisorResponseWaitMs: deprecated timeoutMs alias, precedence, and clamp",
   assert.throws(() => resolveOptions({ ...base, maxUsesPerTask: 1_001 }), /1 and 1000/)
 })
 
+
+/* ---------- deprecation notices are migration notices, not per-call noise ---------- */
+
+/** Collect console.warn output for a run of resolves. The first resolve is
+ *  done with the real console because an earlier test in this same process may
+ *  already have damped it — the contract under test is only that repeats add
+ *  no NEW notice, which is order-independent by construction. */
+function warningsAfterFirst(options, times) {
+  resolveOptions(options)
+  const seen = []
+  const real = console.warn
+  console.warn = (m) => seen.push(String(m))
+  try {
+    for (let i = 0; i < times; i++) resolveOptions(options)
+  } finally {
+    console.warn = real
+  }
+  return seen
+}
+
+test("deprecation warnings do not repeat on every resolve", () => {
+  // Config is hot-reloaded by design, so resolveOptions runs per consult. An
+  // undamped warning becomes log spam that trains readers to ignore the one
+  // line that matters.
+  const legacy = { advisor: { providerID: "p", id: "m" }, timeoutMs: 120_000, maxToolOutputChars: "3k" }
+  assert.deepEqual(warningsAfterFirst(legacy, 5), [], "five further resolves emit no new notice")
+  // And the conversion the notice describes is applied every time regardless.
+  assert.equal(resolveOptions(legacy).advisorResponseWaitMs, 120_000)
+  assert.equal(resolveOptions(legacy).maxToolOutputTokens, 750)
+})
+
+test("a stable validation warning does not repeat, but the correction still applies", () => {
+  const bad = { advisor: { providerID: "p", id: "m" }, maxConsultMs: 1_000, advisorResponseWaitMs: 60_000 }
+  assert.deepEqual(warningsAfterFirst(bad, 4), [], "a stable misconfiguration stays quiet")
+  assert.equal(resolveOptions(bad).maxConsultMs, 60_000, "the ceiling is still raised to cover the wait")
+})

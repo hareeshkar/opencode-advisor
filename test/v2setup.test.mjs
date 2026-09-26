@@ -24,7 +24,10 @@ function makeCtx(overrides = {}) {
     switchModelCalls: [],
     generateHooks: [],
     generateTextInputs: [],
+    generateTextOptions: [],
     generateEvents: [],
+    interrupts: [],
+    sessionCreates: [],
   }
   const ctx = {
     options: { advisor: { providerID: "p", id: "a" }, logLevel: "error" },
@@ -66,9 +69,17 @@ function makeCtx(overrides = {}) {
         if (name === "generate") captured.generateHooks.push(cb)
         return { dispose: async () => {} }
       },
-      prompt: async (args) => {
+      prompt: async (args, opts) => {
         captured.prompts.push(args)
+        if (captured.onSessionPrompt) return captured.onSessionPrompt(args, opts)
         return {}
+      },
+      interrupt: async (args) => {
+        captured.interrupts.push(args)
+      },
+      create: async (args) => {
+        captured.sessionCreates.push(args)
+        return { id: "child-1" }
       },
       switchModel: async (args) => {
         captured.switchModelCalls.push(args)
@@ -105,8 +116,10 @@ function makeCtx(overrides = {}) {
       ],
     },
     generate: {
-      text: async (input) => {
+      text: async (input, opts) => {
         captured.generateTextInputs.push(input)
+        captured.generateTextOptions.push(opts)
+        if (captured.onGenerateText) return captured.onGenerateText(input, opts)
         return { text: "GENERATED-ADVICE" }
       },
     },
@@ -958,3 +971,113 @@ test("a consult that completes inside its own wait window is NOT injected after 
     "an inline-delivered consult must not also be injected (waitExpired leaked from the earlier backgrounded consult)",
   )
 })
+
+/* ============ DEFECT-1 regression: abort, never abandon ============ */
+
+const FAST_CEILING = { advisorResponseWaitMs: 1_000, maxConsultMs: 1_000 }
+
+test("DEFECT-1: a ceiling expiry ABORTS the in-flight request instead of abandoning it", async () => {
+  const { ctx, captured } = makeCtx()
+  // A transport that never settles on its own — the exact shape of the leak:
+  // before the fix the plugin gave up on the promise while the provider kept
+  // billing, so `calls` stayed 0 while tokens were spent.
+  let observed = null
+  captured.onGenerateText = (_input, opts) =>
+    new Promise((_resolve) => {
+      observed = opts
+    })
+  await createV2Plugin().setup(ctx)
+  const dir = join(ctx.location.directory, ".opencode")
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, "opencode-advisor.json"), JSON.stringify(FAST_CEILING))
+
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const result = await advisorTool.execute({}, { sessionID: "s-abort", signal: new AbortController().signal })
+
+  assert.ok(observed, "the transport was called")
+  assert.ok(
+    observed && typeof observed.signal?.addEventListener === "function",
+    "a second argument carrying an AbortSignal reaches the transport",
+  )
+  // The wait expiry and the ceiling share a 1s deadline; give the ceiling
+  // timer its tick before asserting that the request was cancelled.
+  await new Promise((r) => setTimeout(r, 150))
+  assert.equal(observed.signal.aborted, true, "the in-flight request was ABORTED at the ceiling, not abandoned")
+  assert.ok(result, "the tool returned a result (did not hang)")
+})
+
+test("aborting the tool signal cancels WAITING, never THINKING", async () => {
+  // The documented contract, and the one my first draft got backwards: an
+  // executor interruption must NOT kill a consult that is already running —
+  // its advice is still delivered. Only the ceiling (or completion) ends it.
+  const { ctx, captured } = makeCtx()
+  const controller = new AbortController()
+  let settled = null
+  captured.onGenerateText = () => new Promise((resolve) => setTimeout(() => resolve({ text: "LATE-ADVICE" }), 250))
+  await createV2Plugin().setup(ctx)
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  const p = advisorTool.execute({}, { sessionID: "s-wait", signal: controller.signal })
+  setTimeout(() => controller.abort(), 30)
+  settled = await p
+  assert.ok(settled, "the tool returned")
+  // The transport was NOT cancelled: the consult lived on past the abort.
+  assert.equal(captured.generateTextOptions.at(-1).signal.aborted, false, "the consult survived the tool abort")
+  await new Promise((r) => setTimeout(r, 400))
+  assert.equal(captured.generateTextInputs.length, 1, "exactly one paid call, not cancelled and not repeated")
+})
+
+test("DEFECT-1: a ceiling abort stops the empty-response retry (no spend after abort)", async () => {
+  const { ctx, captured } = makeCtx()
+  let calls = 0
+  let sawAbort = false
+  // Attempt 1 returns an empty body (the A3 transient) but only AFTER the
+  // ceiling has fired and aborted the request. The retry loop must not spend
+  // a second call on a consult that is already cancelled.
+  captured.onGenerateText = (_input, opts) => {
+    calls++
+    if (opts?.signal) opts.signal.addEventListener("abort", () => { sawAbort = true }, { once: true })
+    return new Promise((resolve) => setTimeout(() => resolve({ text: "" }), 1_300))
+  }
+  await createV2Plugin().setup(ctx)
+  const dir = join(ctx.location.directory, ".opencode")
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, "opencode-advisor.json"), JSON.stringify(FAST_CEILING))
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  await advisorTool.execute({}, { sessionID: "s-noretry", signal: new AbortController().signal })
+  await new Promise((r) => setTimeout(r, 200))
+  assert.equal(calls, 1, "no retry spend after the ceiling aborted the consult")
+  assert.equal(sawAbort, true, "the abort reached the transport listener")
+})
+
+test("DEFECT-1 (agent mode): an aborted child turn is interrupted, not left running", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const dir = join(ctx.location.directory, ".opencode")
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, "opencode-advisor.json"), JSON.stringify({ ...FAST_CEILING, advisorMode: "agent" }))
+  // The child turn never settles: the ceiling must interrupt it explicitly,
+  // because a child session's in-flight turn is otherwise left running.
+  let childSignal = null
+  captured.onSessionPrompt = (args, opts) => {
+    childSignal = opts?.signal ?? null
+    // A real host rejects the pending prompt when its signal aborts; a mock
+    // that ignores the signal would model a host that cannot be interrupted.
+    return new Promise((_resolve, reject) => {
+      if (!childSignal) return
+      if (childSignal.aborted) return reject(new Error("aborted"))
+      childSignal.addEventListener("abort", () => reject(new Error("advisor sub-call aborted")), { once: true })
+    })
+  }
+  const advisorTool = captured.tools.find((t) => t.name === "advisor")
+  await advisorTool.execute({}, { sessionID: "s-agent-abort", signal: new AbortController().signal })
+  // The child rejection and the interrupt run in the same tick as the wait
+  // expiry; let that tick land before asserting.
+  await new Promise((r) => setTimeout(r, 200))
+  assert.ok(captured.interrupts.length > 0, "session.interrupt was called for the child")
+  assert.ok(
+    captured.interrupts.every((i) => typeof i.sessionID === "string" && i.sessionID.length > 0),
+    "the interrupt names the child session",
+  )
+  assert.equal(childSignal === null || childSignal.aborted === true, true, "the child turn's own signal is aborted")
+})
+

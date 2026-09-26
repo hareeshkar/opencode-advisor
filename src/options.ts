@@ -17,6 +17,17 @@ const ENV = process.env as Record<string, string | undefined>
  *  pruner's exact char arithmetic, and by this to reach the response cap. */
 export const CHARS_PER_TOKEN = 4
 
+/** Deprecation notices already emitted in this process. Options resolve on
+ *  every dispatch (config is hot-reloaded by design), so an undamped warning
+ *  repeats per consult and trains readers to ignore it. Once is enough. */
+const warned = new Set<string>()
+function warnOnce(key: string, message: string): void {
+  if (warned.has(key)) return
+  warned.add(key)
+  console.warn(message)
+}
+
+
 /** Dedicated config file names, lowest → highest precedence. */
 export const CONFIG_FILE_RELATIVE = "opencode-advisor.json"
 
@@ -218,12 +229,13 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   const waitLegacy = readInt(opts, "timeoutMs", 1, 3_600_000)
   advisorResponseWaitMs = waitExplicit ?? waitLegacy ?? advisorResponseWaitMs
   if (waitExplicit === undefined && waitLegacy !== undefined) {
-    console.warn("[advisor] timeoutMs is deprecated — rename it to advisorResponseWaitMs")
+    warnOnce("timeoutMs", "[advisor] timeoutMs is deprecated — rename it to advisorResponseWaitMs")
   }
   maxConsultMs = readSize(opts, "maxConsultMs", 1_000, 604_800_000) ?? maxConsultMs
   if (maxConsultMs < advisorResponseWaitMs) {
-    console.warn(
-      `[advisor] maxConsultMs (${maxConsultMs}) raised to advisorResponseWaitMs (${advisorResponseWaitMs}) — the ceiling must cover the wait window`,
+    warnOnce(
+      `ceiling<wait:${maxConsultMs}/${advisorResponseWaitMs}`,
+        `[advisor] maxConsultMs (${maxConsultMs}) raised to advisorResponseWaitMs (${advisorResponseWaitMs}) — the ceiling must cover the wait window`,
     )
     maxConsultMs = advisorResponseWaitMs
   }
@@ -234,7 +246,8 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   const toolTokLegacy = readSize(opts, "maxToolOutputChars", 16, 16_000_000)
   if (toolTokExplicit === undefined && toolTokLegacy !== undefined) {
     maxToolOutputTokens = Math.max(4, Math.ceil(toolTokLegacy / CHARS_PER_TOKEN))
-    console.warn(
+    warnOnce(
+      "maxToolOutputChars",
       `[advisor] maxToolOutputChars is deprecated — use maxToolOutputTokens ` +
         `(${maxToolOutputTokens} tokens ≈ ${maxToolOutputTokens * CHARS_PER_TOKEN} chars)`,
     )
@@ -286,9 +299,10 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
 
   // sanity: the context budget must accommodate several tool slices
   if (transcriptBudgetTokens < maxToolOutputChars) {
-    console.warn(
-      `[advisor] transcriptBudgetTokens (${transcriptBudgetTokens}) raised to maxToolOutputChars ` +
-        `(${maxToolOutputChars}) — a smaller budget cannot hold a meaningful excerpt`,
+    warnOnce(
+      `budget<toolcap:${transcriptBudgetTokens}/${maxToolOutputChars}`,
+      `[advisor] transcriptBudgetTokens (${transcriptBudgetTokens}) raised to maxToolOutputTokens ` +
+        `(${maxToolOutputTokens} tokens ≈ ${maxToolOutputChars} chars) — a smaller budget cannot hold a meaningful excerpt`,
     )
     transcriptBudgetTokens = maxToolOutputChars
   }

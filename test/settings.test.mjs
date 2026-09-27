@@ -17,8 +17,7 @@ import {
   presetTitle,
   runSettingsFlow,
   summaryMessage,
-  tierLabel,
-} from "../dist/opencode-advisor.js"
+  tierLabel, settingsRows, settingsSummary,} from "../dist/opencode-advisor.js"
 
 function makeView(overrides = {}) {
   return {
@@ -145,18 +144,23 @@ test("display state and menu rows reflect the effective view + draft", () => {
   assert.equal(preset.name, "thorough")
   assert.equal(preset.isDefault, false)
 
-  const rows = mainMenuRows(view, {})
+  // Level 2 carries the three headline settings; the budgets are one level down.
+  const rows = settingsRows(view, {})
   assert.ok(rows.find((r) => r.value === "preset").title.includes("Thorough"))
-  assert.ok(rows.find((r) => r.value === "limits").title.includes("5 consults/task"))
+  assert.ok(rows.find((r) => r.value === "advanced").title.includes("5 consults"))
   assert.ok(
-    rows.find((r) => r.value === "limits").description.includes("64K context + 16K advice tokens"),
-    "limits row speaks tokens, and names the shared-window constraint",
+    rows.find((r) => r.value === "advanced").description.includes("64K context, 16K advice"),
+    "the Advanced row summarises the budgets in tokens",
+  )
+  assert.ok(
+    mainMenuRows(view, {})[0].description.includes("64K in"),
+    "the single top-level Settings row still answers 'what is this set to?'",
   )
 
   // Draft overrides win; null means inherit.
-  const rowsDraft = mainMenuRows(view, { preset: null, maxUsesPerTask: 2 })
+  const rowsDraft = settingsRows(view, { preset: null, maxUsesPerTask: 2 })
   assert.ok(rowsDraft.find((r) => r.value === "preset").title.includes("Inherit"))
-  assert.ok(rowsDraft.find((r) => r.value === "limits").title.includes("2 consults/task"))
+  assert.ok(rowsDraft.find((r) => r.value === "advanced").title.includes("2 consults"))
   assert.equal(hasChanges({}), false)
   assert.equal(tierLabel("project"), "project file")
   assert.equal(tierLabel(undefined), "default")
@@ -170,15 +174,23 @@ test("display state and menu rows reflect the effective view + draft", () => {
   assert.equal(
     limitRows(view, {}).length,
     10,
-    "10 rows: consults, wait, ceiling, context, advice, toolcap, pruning, retries, loglevel, back",
+    "10 rows: consults, wait, maxTime, context, advice, toolcap, pruning, retries, loglevel, back",
+  )
+  assert.ok(
+    limitRows(view, {}).some((r) => r.value === "maxTime" && r.title.includes("Max consult time")),
+    "max consult time is reachable from the menu",
   )
   assert.ok(
     limitRows(view, {}).some((r) => r.value === "pruning" && r.title.includes("Pruning — standard")),
     "the pruning policy is editable, not JSON-only",
   )
   assert.ok(limitRows(view, {}).some((r) => r.value === "wait" && r.title.includes("Response wait — 90s")))
-  assert.ok(limitRows(view, {}).some((r) => r.value === "ceiling" && r.title.includes("Consult ceiling — 1h")))
+  assert.ok(limitRows(view, {}).some((r) => r.value === "maxTime" && r.title.includes("Max consult time — 1h")))
   assert.ok(limitRows(view, {}).some((r) => r.value === "advice" && r.title.includes("16K tokens")))
+  assert.ok(
+    settingsRows(view, {}).some((r) => r.value === "mode" && r.title.startsWith("Evidence basis —")),
+    "Mode is renamed to say what it changes about the answer",
+  )
   // The row states the consequence, not just the name: "none" is a real mode.
   const noneView = makeView({ config: { ...makeView().config, pruning: "none" } })
   assert.ok(
@@ -374,5 +386,140 @@ test("flow: the pruning picker writes pruning:none and supports Inherit", async 
   assert.ok(
     picker.options.some((o) => o.value === "none" && o.description.includes("context window")),
     "the picker explains the trade, not just the label",
+  )
+})
+
+/* ═══ reachability: no row may be a dead button ═══ */
+
+/** Menu titles the flow rendered, in order. */
+function titles(calls) {
+  return calls.selects.map((s) => s.title)
+}
+
+test("the three levels are actually reachable: Settings -> Advanced -> a limit", async () => {
+  const { ports, calls } = scripted({ select: ["settings", "advanced", "maxTime", "10800000", "back", "back", "save"] })
+  await runSettingsFlow(ports)
+  const t = titles(calls)
+  assert.ok(t[0].startsWith("Advisor Settings"), `level 1 renders (${JSON.stringify(t)})`)
+  assert.ok(t[1].startsWith("Settings"), `"settings" opens level 2 (${JSON.stringify(t)})`)
+  assert.ok(t[2] === "Limits", `"advanced" opens the limits menu (${JSON.stringify(t)})`)
+  assert.ok(t[3] === "Max consult time", "the ceiling row opens its picker")
+  assert.deepEqual(calls.saved, [{ maxConsultMs: 10_800_000 }], "and the edit is saved under the real key")
+  assert.ok(!calls.toasts.some((x) => x.variant === "error"), `no unknown-row errors (${JSON.stringify(calls.toasts)})`)
+})
+
+/* ═══ "if I change anything, the preset becomes Custom" ═══ */
+
+test("every limit row opens something — none is a dead button", async () => {
+  // A row with no handler redraws the SAME list, which the user sees as a dead
+  // button. This bug shipped twice (an unhandled "Settings" row, then an
+  // unhandled "maxTime" row), so every row is now exercised explicitly. Each
+  // script ends in "save" so the flow always terminates.
+  const pick = { consults: "7", wait: "1800000", maxTime: "10800000", context: "64000", advice: "16000", toolcap: "2000", retries: "42" }
+  for (const row of limitRows(makeView(), {})) {
+    if (row.value === "back") continue
+    const value = pick[row.value] ?? "standard"
+    const { ports, calls } = scripted({
+      select: ["settings", "advanced", row.value, value, "back", "back", "save"],
+    })
+    await runSettingsFlow(ports)
+    assert.ok(
+      !calls.toasts.some((x) => x.variant === "error" && /Unknown|no config key/.test(x.message)),
+      `limits row "${row.value}" is unhandled (${JSON.stringify(calls.toasts)})`,
+    )
+    const t = calls.selects.map((x) => x.title)
+    for (let k = 2; k < t.length; k++) {
+      assert.ok(!(t[k] === "Limits" && t[k - 1] === "Limits"), `"${row.value}" redrew the list in place: ${JSON.stringify(t)}`)
+    }
+  }
+})
+
+test("each limit row writes to its OWN config key — no cross-wiring", async () => {
+  // The defect this locks: the ceiling picker wrote `maxAttempts`, because the
+  // key was derived from the row name by a ternary chain that was not updated
+  // when the row was renamed ceiling -> maxTime. Setting max consult time
+  // silently destroyed the retry ceiling. Each key is now co-located with its
+  // own picker, and this proves the mapping end to end.
+  const cases = [
+    ["consults", "maxUsesPerTask", "7"],
+    ["wait", "advisorResponseWaitMs", "1800000"],
+    ["maxTime", "maxConsultMs", "10800000"],
+    ["context", "transcriptBudgetTokens", "64000"],
+    ["advice", "adviceTokenBudget", "16000"],
+    ["toolcap", "maxToolOutputTokens", "2000"],
+    ["retries", "maxAttempts", "42"],
+  ]
+  for (const [row, key, value] of cases) {
+    const { ports, calls } = scripted({ select: ["settings", "advanced", row, value, "back", "back", "save"] })
+    await runSettingsFlow(ports)
+    assert.deepEqual(calls.saved, [{ [key]: Number(value) }], `row "${row}" must write only ${key}`)
+  }
+})
+
+test("the categorical limits save their own keys too", async () => {
+  const pruning = scripted({ select: ["settings", "advanced", "pruning", "none", "back", "back", "save"] })
+  await runSettingsFlow(pruning.ports)
+  assert.deepEqual(pruning.calls.saved, [{ pruning: "none" }], "pruning saves under `pruning`")
+
+  const log = scripted({ select: ["settings", "advanced", "loglevel", "debug", "back", "back", "save"] })
+  await runSettingsFlow(log.ports)
+  assert.deepEqual(log.calls.saved, [{ logLevel: "debug" }], "log level saves under `logLevel`")
+})
+
+test("every level-2 row is reachable from the top", async () => {
+  for (const row of settingsRows(makeView(), {})) {
+    if (row.value === "back" || row.value === "advanced") continue
+    const { ports, calls } = scripted({ select: ["settings", row.value, "__inherit__", "back", "save"] })
+    await runSettingsFlow(ports)
+    assert.ok(
+      !calls.toasts.some((x) => x.variant === "error" && x.message.includes("Unknown")),
+      `level-2 row "${row.value}" is unhandled`,
+    )
+  }
+})
+
+test("ANY edit flips the preset to Custom — including the wait and the ceiling", () => {
+  const view = makeView({ config: { preset: "balanced" } })
+  assert.equal(currentPreset(view, {}).name, "balanced", "untouched: the declared preset")
+  const edits = [
+    { transcriptBudgetTokens: 64_000 }, { adviceTokenBudget: 16_000 }, { maxUsesPerTask: 7 },
+    { advisorResponseWaitMs: 180_000 }, { maxConsultMs: 7_200_000 },
+    { maxToolOutputTokens: 2_000 }, { pruning: "none" }, { maxAttempts: 20 },
+    { logLevel: "debug" }, { advisorMode: "agent" }, { advisor: { providerID: "z", id: "q" } },
+  ]
+  for (const draft of edits) {
+    const p = currentPreset(view, draft)
+    assert.equal(p.kind, "custom", `${JSON.stringify(draft)} must report Custom (got ${p.kind})`)
+    assert.equal(p.title, "Custom")
+    assert.ok(p.blurb.includes("You have changed a setting"), "the blurb explains WHY it says Custom")
+  }
+})
+
+test("picking a preset again still names that preset when nothing else is edited", () => {
+  const view = makeView({ config: { preset: "balanced" } })
+  assert.equal(currentPreset(view, { preset: "thorough" }).name, "thorough")
+  // A non-preset edit survives re-picking a preset, so Custom is the honest label.
+  assert.equal(currentPreset(view, { maxConsultMs: 7_200_000, preset: "thorough" }).kind, "custom")
+  // Inherit still wins over everything.
+  assert.equal(currentPreset(view, { preset: null }).kind, "inherit")
+})
+
+test("the GUI reflects the change immediately: the preset row flips to Custom", async () => {
+  // No save here — we only care what the ROWS said along the way — so the
+  // discard prompt must be answered or the flow re-asks forever.
+  const { ports, calls } = scripted({
+    select: ["settings", "advanced", "context", "64000", "back", "back"],
+    confirm: [true],
+  })
+  await runSettingsFlow(ports)
+  const presetTitles = calls.selects
+    .flatMap((s) => s.options)
+    .filter((o) => o.value === "preset")
+    .map((o) => o.title)
+  assert.ok(presetTitles.some((t) => t.includes("Balanced")), `started as the preset (${JSON.stringify(presetTitles)})`)
+  assert.ok(presetTitles.some((t) => t.includes("Custom")), `the row updated to Custom (${JSON.stringify(presetTitles)})`)
+  assert.ok(
+    presetTitles.findIndex((t) => t.includes("Custom")) > presetTitles.findIndex((t) => t.includes("Balanced")),
+    "Custom appears AFTER the edit, not before",
   )
 })

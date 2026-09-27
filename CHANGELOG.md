@@ -3,6 +3,51 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.0.3] — 2026-09-27
+
+### Fixed — three dead buttons and one silent data-corruption bug in the settings UI
+
+The settings menu had been restructured into three levels, but the **flow was
+never rewired to match**: `mainMenuRows` emitted a `settings` row and
+`settingsRows` emitted an `advanced` row, and neither had a handler. Selecting
+"Settings" redrew the same list forever. Restructured the display functions
+without touching the dispatch loop is exactly the change that makes a menu look
+right in review and do nothing at runtime.
+
+- **"Settings" did nothing.** Level 2 (model, preset, evidence basis, Advanced)
+  was unreachable. It is now wired, with an unknown-row error instead of a
+  silent redraw.
+- **"Max consult time" was a dead row** inside the limits menu — its handler
+  had been removed as "dead code" in the same pass that renamed the row.
+- **Max consult time wrote the wrong config key.** The draft key was derived
+  from the row name by one ternary chain that silently defaulted to
+  `maxAttempts`. Renaming the row from `ceiling` to `maxTime` meant setting max
+  consult time **overwrote the retry ceiling**, with no error anywhere. Each
+  key is now declared beside its own picker, so a row cannot be added without
+  its key, and a missing mapping is a loud error rather than a wrong write.
+
+### Changed
+- **"Mode" is now "Evidence basis"**, with options "Review only" / "Review +
+  Agent". The old name was opaque; the new one says what actually changes about
+  the answer, and it is the phrase the advice frame already uses.
+- **Any change flips the preset to Custom** — including the response wait, the
+  consult ceiling, the tool cap, pruning, retries, log level, the mode and the
+  model. The previous rule ("a preset is only the three budget quantities") was
+  defensible on paper and unusable in practice: editing the wait or the ceiling
+  left the row frozen on "Balanced", which is indistinguishable from the edit
+  not registering. The row's blurb now says why it reads Custom, and picking a
+  preset still snaps the three budgets back.
+
+### Tests
+- 211 green. A config carrying BOTH `maxToolOutputChars` and
+  `maxToolOutputTokens` — the shape left by editing a pre-1.0 config through
+  the 1.0 menu — is pinned to the canonical key winning. New reachability guards assert that every row at every level has a
+  handler and that each limit row writes to its own config key. Both were
+  proven non-vacuous by re-introducing the defects: the wrong-key mutation fails
+  the cross-wiring test, and removing the handler fails the dead-button test.
+- A note for whoever extends this menu: a `scripted` flow test that ends without
+  a `save` MUST answer the discard prompt, or the flow re-asks forever.
+
 ## [1.0.2] — 2026-09-27
 
 ### Fixed — `/advisor-settings` could not open at all

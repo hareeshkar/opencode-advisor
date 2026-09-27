@@ -301,6 +301,14 @@ export function currentPreset(view: AdvisorSettingsView, draft: SettingsDraft): 
   if (draft.preset === null) {
     return { kind: "inherit", name: "", title: "Inherit", blurb: "No preset key in this file — falls back to other layers", isDefault: false }
   }
+  // "If I change anything, the preset becomes Custom." Anything means
+  // anything: once a draft touches a single setting, this configuration is no
+  // longer exactly the preset it started from, and saying "Balanced" would be
+  // a claim the user can see is false from the row above. The previous rule —
+  // a preset is only the three budget quantities — was defensible on paper and
+  // unusable in practice: editing the wait or the ceiling left the row frozen,
+  // which is indistinguishable from the edit not registering at all.
+  const touched = Object.keys(draft).filter((key) => key !== "preset")
   const declaredRaw = draft.preset !== undefined ? draft.preset : view.config.preset
   const declared = typeof declaredRaw === "string" && declaredRaw !== "" ? declaredRaw : ""
   const draftedPreset = typeof draft.preset === "string" && draft.preset !== "" ? draft.preset : undefined
@@ -319,14 +327,17 @@ export function currentPreset(view: AdvisorSettingsView, draft: SettingsDraft): 
     contextTokens: resolveKey("transcriptBudgetTokens", base.contextTokens),
     adviceTokens: resolveKey("adviceTokenBudget", base.adviceTokens),
   }
-  const match = Object.keys(PRESETS).find((name) => {
-    const expansion = presetExpansion(name)
-    return (
-      expansion.consults === effective.consults &&
-      expansion.contextTokens === effective.contextTokens &&
-      expansion.adviceTokens === effective.adviceTokens
-    )
-  })
+  const match =
+    touched.length > 0
+      ? undefined
+      : Object.keys(PRESETS).find((name) => {
+          const expansion = presetExpansion(name)
+          return (
+            expansion.consults === effective.consults &&
+            expansion.contextTokens === effective.contextTokens &&
+            expansion.adviceTokens === effective.adviceTokens
+          )
+        })
   if (match) {
     return {
       kind: "preset",
@@ -340,7 +351,10 @@ export function currentPreset(view: AdvisorSettingsView, draft: SettingsDraft): 
     kind: "custom",
     name: "",
     title: "Custom",
-    blurb: "Effective limits match no preset — pick one to snap back, or keep this mix",
+    blurb:
+      touched.length > 0
+        ? "You have changed a setting — pick a preset to snap all of them back, or keep this mix"
+        : "Effective limits match no preset — pick one to snap back, or keep this mix",
     isDefault: false,
   }
 }
@@ -410,59 +424,97 @@ export function currentLimits(view: AdvisorSettingsView, draft: SettingsDraft): 
 
 /* --------------------------------- rows ----------------------------------- */
 
+/** Level 1 — the whole surface is one Settings branch plus the file actions. */
 export function mainMenuRows(view: AdvisorSettingsView, draft: SettingsDraft): MenuRow[] {
   const target = view.files.project || view.files.global
-  const model = currentModel(view, draft)
-  const preset = currentPreset(view, draft)
-  const mode = currentMode(view, draft)
-  const limits = currentLimits(view, draft)
+  const settings = settingsSummary(view, draft)
   return [
-    { category: "Settings", value: "model", title: `Advisor model — ${model.label}`, description: model.description },
-    {
-      category: "Settings",
-      value: "preset",
-      title: `Preset — ${preset.title}${preset.kind === "preset" && preset.isDefault ? " · default" : ""}`,
-      description: preset.blurb,
-    },
-    { category: "Settings", value: "mode", title: `Mode — ${mode.title}`, description: mode.description },
-    {
-      category: "Settings",
-      value: "limits",
-      title: `Limits — ${limits.consults} consults/task · response wait ${formatDuration(limits.responseWaitMs)}`,
-      description: `${formatSize(limits.contextTokens)} context + ${formatSize(limits.adviceTokens)} advice tokens (both draw on one context window) · ceiling ${formatDuration(limits.ceilingMs)} · ${limits.attempts} retries`,
-    },
+    { category: "Settings", value: "settings", title: "Settings", description: settings },
     { category: "Actions", value: "save", title: "Save changes", description: hasChanges(draft) ? `Write to ${target}` : "No changes yet" },
     { category: "Actions", value: "reset", title: "Reset all settings…", description: `Remove the plugin's keys from ${target}` },
     { category: "Actions", value: "cancel", title: "Cancel", description: hasChanges(draft) ? "Discard unsaved changes" : "Close" },
   ]
 }
 
+/**
+ * One line summarising the whole configuration, so the single top-level row
+ * still answers "what is this set to?" without opening anything. This is the
+ * summary the old flat menu spread across four rows.
+ */
+export function settingsSummary(view: AdvisorSettingsView, draft: SettingsDraft): string {
+  const model = currentModel(view, draft)
+  const preset = currentPreset(view, draft)
+  const mode = currentMode(view, draft)
+  const limits = currentLimits(view, draft)
+  return [
+    model.label,
+    `${preset.title}`,
+    mode.title,
+    `${limits.consults} consults/task`,
+    `wait ${formatDuration(limits.responseWaitMs)}`,
+    `max ${formatDuration(limits.ceilingMs)}`,
+    `${formatSize(limits.contextTokens)} in`,
+    `${formatSize(limits.adviceTokens)} out`,
+    limits.pruning === "none" ? "pruning none" : `pruning ${limits.pruning}`,
+  ].join(" · ")
+}
+
+/** Level 2 — what most people change, with everything else one level down. */
+export function settingsRows(view: AdvisorSettingsView, draft: SettingsDraft): MenuRow[] {
+  const model = currentModel(view, draft)
+  const preset = currentPreset(view, draft)
+  const mode = currentMode(view, draft)
+  const limits = currentLimits(view, draft)
+  return [
+    { category: "", value: "model", title: `Advisor model — ${model.label}`, description: model.description },
+    {
+      category: "",
+      value: "preset",
+      title: `Preset — ${preset.title}${preset.kind === "preset" && preset.isDefault ? " · default" : ""}`,
+      description: preset.blurb,
+    },
+    {
+      category: "",
+      value: "mode",
+      title: `Evidence basis — ${mode.title}`,
+      description: `${mode.description} The advice frame states which basis was used.`,
+    },
+    {
+      category: "",
+      value: "advanced",
+      title: `Advanced — ${limits.consults} consults · wait ${formatDuration(limits.responseWaitMs)} · max ${formatDuration(limits.ceilingMs)}`,
+      description: `Budgets and every limit: ${formatSize(limits.contextTokens)} context, ${formatSize(limits.adviceTokens)} advice, ${formatSize(limits.toolCap)} per tool output, pruning ${limits.pruning}, ${limits.attempts} retries, log ${limits.logLevel}`,
+    },
+    { category: "Actions", value: "back", title: "← Back", description: "Return to the main menu" },
+  ]
+}
+
 export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): MenuRow[] {
   const limits = currentLimits(view, draft)
   return [
-    { category: "", value: "consults", title: `Consults per task — ${limits.consults}`, description: "Advisor calls allowed per user task (safety cap)" },
-    { category: "", value: "wait", title: `Response wait — ${formatDuration(limits.responseWaitMs)}`, description: "How long to wait for advisor advice before continuing in the background (the advisor keeps running)" },
-    { category: "Advanced", value: "ceiling", title: `Consult ceiling — ${formatDuration(limits.ceilingMs)}`, description: "Maximum advisor lifetime; expiry fails the consult without consuming the cap" },
+    { category: "Budgets", value: "consults", title: `Consults per task — ${limits.consults}`, description: "Advisor calls allowed per user task (safety cap)" },
+    { category: "Timing", value: "wait", title: `Response wait — ${formatDuration(limits.responseWaitMs)}`, description: "How long to wait for advisor advice before continuing in the background (the advisor keeps running)" },
+    { category: "Timing", value: "maxTime", title: `Max consult time — ${formatDuration(limits.ceilingMs)}`, description: "Maximum advisor lifetime; expiry fails the consult WITHOUT consuming the consult cap" },
     {
-      category: "Advanced",
+      category: "Budgets",
       value: "context",
       title: `Context budget — ${formatSize(limits.contextTokens)} tokens`,
       description: "INPUT tokens of conversation sent to the advisor (up to the model's context window)",
     },
     {
-      category: "Advanced",
+      category: "Budgets",
       value: "advice",
       title: `Advice length — ${formatSize(limits.adviceTokens)} tokens`,
       description: "OUTPUT tokens for the advisor's reply (under the model's max output limit)",
     },
     {
-      category: "Advanced",
+      category: "Budgets",
       value: "toolcap",
       title: `Per-tool output cap — ${formatSize(limits.toolCap)} tokens`,
       description: "Maximum tokens kept from a single tool output",
     },
     {
-      category: "Advanced",
+      category: "Evidence",
       value: "pruning",
       title: `Pruning — ${limits.pruning === "none" ? "none (verbatim)" : "standard"}`,
       description:
@@ -471,12 +523,12 @@ export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): Menu
           : "Window the transcript to the context budget; truncate per tool output",
     },
     {
-      category: "Advanced",
+      category: "Evidence",
       value: "retries",
       title: `Retry ceiling — ${limits.attempts}`,
       description: "Transport attempts per task — NOT extra paid consults",
     },
-    { category: "Advanced", value: "loglevel", title: `Log level — ${limits.logLevel}`, description: "Plugin diagnostics verbosity" },
+    { category: "Evidence", value: "loglevel", title: `Log level — ${limits.logLevel}`, description: "Plugin diagnostics verbosity" },
     { category: "Actions", value: "back", title: "← Back", description: "Return to the main menu" },
   ]
 }
@@ -558,13 +610,125 @@ async function pickNumber(
   return parsed
 }
 
+/**
+ * The max-consult-time picker. It lives on the MAIN menu — a top-level
+ * option — because it is the one limit a user reaches for deliberately (a slow
+ * model, a long audit) and burying it under Limits made it undiscoverable. The
+ * same function serves both surfaces so the two can never disagree.
+ */
+async function pickConsultCeiling(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<number | null | undefined> {
+  return pickNumber(ports, {
+    title: "Max consult time",
+    description: "Maximum advisor lifetime. Expiry fails the consult WITHOUT consuming the consult cap",
+    current: currentLimits(view, draft).ceilingMs,
+    choices: [300_000, 900_000, 1_800_000, 3_600_000, 10_800_000, 86_400_000],
+    format: formatDuration,
+    parse: parseHumanSize,
+    min: 30_000,
+    max: 86_400_000,
+    rangeHint: "30s–24h, e.g. 1h",
+  })
+}
+
+/* --------------------- shared pickers (used at every level) ---------------- */
+
+async function applyModel(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
+  const picked = await pickModel(ports, view, draft)
+  if (picked.kind === "inherit") draft.advisor = null
+  else if (picked.kind === "pick") draft.advisor = picked.ref
+}
+
+async function applyMode(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
+  const current = currentMode(view, draft)
+  const picked = await ports.select({
+    // "Evidence basis" is the name that says what actually changes about the
+    // ANSWER — the advice frame already uses that phrase, so the menu, the
+    // frame and the docs all speak the same language. "Mode" was opaque.
+    title: "Evidence basis — how much the advisor may check before advising",
+    current: current.mode,
+    options: [
+      { category: "Actions", title: "Inherit — remove the mode key", value: "__inherit__", description: "Falls back to other config layers" },
+      { title: "Review only", value: "review", description: MODE_DESCRIPTIONS.review },
+      { title: "Review + Agent", value: "agent", description: MODE_DESCRIPTIONS.agent },
+    ],
+  })
+  if (picked !== undefined) draft.advisorMode = picked === "__inherit__" ? null : picked
+}
+
+async function applyPreset(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
+  const current = currentPreset(view, draft)
+  const options: SettingsSelectOption[] = [
+    { category: "Actions", title: "Inherit — remove the preset key", value: "__inherit__", description: "Falls back to other config layers" },
+    ...Object.keys(PRESETS).map((name) => ({ title: presetTitle(name), value: name, description: presetBlurb(name) })),
+  ]
+  if (current.kind === "custom") {
+    options.unshift({
+      category: "Current",
+      title: "Custom — current effective mix",
+      value: "__custom_current__",
+      description: "Matches no preset; pick one below to snap back",
+      disabled: true,
+    })
+  }
+  const picked = await ports.select({
+    title: "Preset — how much resource the advisor may use",
+    current: current.kind === "preset" ? current.name : "",
+    options,
+  })
+  if (picked !== undefined) draft.preset = picked === "__inherit__" ? null : picked
+}
+
+async function applyCeiling(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
+  const next = await pickConsultCeiling(ports, view, draft)
+  if (next !== undefined) draft.maxConsultMs = next
+}
+
+/**
+ * Level 2. The model, the preset and the evidence basis live here; every limit
+ * is one level further down under Advanced.
+ */
+async function runSettingsSubmenu(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
+  for (;;) {
+    const title = hasChanges(draft) ? "Settings — unsaved changes" : "Settings"
+    const choice = await ports.select({ title, options: settingsRows(view, draft) })
+    if (choice === undefined || choice === "back") return
+    if (choice === "model") {
+      await applyModel(ports, view, draft)
+      continue
+    }
+    if (choice === "preset") {
+      await applyPreset(ports, view, draft)
+      continue
+    }
+    if (choice === "mode") {
+      await applyMode(ports, view, draft)
+      continue
+    }
+    if (choice === "advanced") {
+      await runLimitsMenu(ports, view, draft)
+      continue
+    }
+    // Unreachable rows must not silently swallow a keystroke: say so rather
+    // than redrawing an identical menu, which reads as a dead button.
+    ports.toast(`Unknown settings row: ${String(choice)}`, "error")
+  }
+}
+
 async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
   for (;;) {
     const choice = await ports.select({ title: "Limits", options: limitRows(view, draft) })
     if (choice === undefined || choice === "back") return
+    // The config key is declared HERE, beside the picker, and each case sets
+    // both. The previous design derived the key from the row name in one
+    // ternary chain that silently defaulted to `maxAttempts` — so renaming a
+    // row (ceiling -> maxTime) made the picker write the ceiling over the
+    // RETRY setting with no error anywhere. Co-locating them makes that class
+    // of bug impossible rather than merely unlikely.
     let next: number | null | undefined
+    let key: string | undefined
     switch (choice) {
       case "consults":
+        key = "maxUsesPerTask"
         next = await pickNumber(ports, {
           title: "Consults per task",
           description: "Advisor calls allowed per user task",
@@ -578,6 +742,7 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
         })
         break
       case "wait":
+        key = "advisorResponseWaitMs"
         next = await pickNumber(ports, {
           title: "Response wait",
           description: "How long to wait for advisor advice before continuing in the background",
@@ -593,20 +758,12 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
           rangeHint: "1–600 seconds",
         })
         break
-      case "ceiling":
-        next = await pickNumber(ports, {
-          title: "Consult ceiling",
-          description: "Maximum advisor lifetime; expiry fails the consult without consuming the cap",
-          current: currentLimits(view, draft).ceilingMs,
-          choices: [300_000, 900_000, 1_800_000, 3_600_000, 10_800_000, 86_400_000],
-          format: formatDuration,
-          parse: parseHumanSize,
-          min: 30_000,
-          max: 86_400_000,
-          rangeHint: "30s–24h, e.g. 1h",
-        })
+      case "maxTime":
+        key = "maxConsultMs"
+        next = await pickConsultCeiling(ports, view, draft)
         break
       case "context":
+        key = "transcriptBudgetTokens"
         next = await pickNumber(ports, {
           title: "Context budget",
           description: "INPUT tokens of pruned conversation sent to the advisor",
@@ -620,6 +777,7 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
         })
         break
       case "advice":
+        key = "adviceTokenBudget"
         next = await pickNumber(ports, {
           title: "Advice length",
           description: "OUTPUT token budget for the advisor's reply",
@@ -633,6 +791,7 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
         })
         break
       case "toolcap":
+        key = "maxToolOutputTokens"
         next = await pickNumber(ports, {
           title: "Per-tool output cap",
           description: "Maximum tokens kept from a single tool output",
@@ -646,6 +805,7 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
         })
         break
       case "retries":
+        key = "maxAttempts"
         next = await pickNumber(ports, {
           title: "Retry ceiling",
           description: "Maximum dispatch attempts per task",
@@ -658,7 +818,10 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
           rangeHint: "1–100",
         })
         break
-      case "pruning": {
+      default:
+      ports.toast(`Unknown limit: ${String(choice)}`, "error")
+      break
+    case "pruning": {
         const current = currentLimits(view, draft).pruning
         const picked = await ports.select({
           title: "Pruning",
@@ -700,21 +863,13 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
       }
     }
     if (next !== undefined) {
-      const key =
-        choice === "consults"
-          ? "maxUsesPerTask"
-          : choice === "wait"
-            ? "advisorResponseWaitMs"
-            : choice === "ceiling"
-              ? "maxConsultMs"
-              : choice === "context"
-                ? "transcriptBudgetTokens"
-                : choice === "advice"
-                  ? "adviceTokenBudget"
-                  : choice === "toolcap"
-                    ? "maxToolOutputTokens"
-                    : "maxAttempts"
-      draft[key] = next
+      if (key === undefined) {
+        // Loud, not silent: a missing mapping is a programming error and must
+        // never be papered over by writing to some other setting.
+        ports.toast(`Internal error: no config key mapped for "${String(choice)}"`, "error")
+      } else {
+        draft[key] = next
+      }
     }
   }
 }
@@ -816,49 +971,28 @@ export async function runSettingsFlow(ports: SettingsPorts): Promise<void> {
       continue
     }
 
+    if (choice === "settings") {
+      await runSettingsSubmenu(ports, view, draft)
+      continue
+    }
+
     if (choice === "model") {
-      const picked = await pickModel(ports, view, draft)
-      if (picked.kind === "inherit") draft.advisor = null
-      else if (picked.kind === "pick") draft.advisor = picked.ref
+      await applyModel(ports, view, draft)
       continue
     }
 
     if (choice === "preset") {
-      const current = currentPreset(view, draft)
-      const options: SettingsSelectOption[] = [
-        { category: "Actions", title: "Inherit — remove the preset key", value: "__inherit__", description: "Falls back to other config layers" },
-        ...Object.keys(PRESETS).map((name) => ({ title: presetTitle(name), value: name, description: presetBlurb(name) })),
-      ]
-      if (current.kind === "custom") {
-        options.unshift({
-          category: "Current",
-          title: "Custom — current effective mix",
-          value: "__custom_current__",
-          description: "Matches no preset; pick one below to snap back",
-          disabled: true,
-        })
-      }
-      const picked = await ports.select({
-        title: "Preset — how much resource the advisor may use",
-        current: current.kind === "preset" ? current.name : "",
-        options,
-      })
-      if (picked !== undefined) draft.preset = picked === "__inherit__" ? null : picked
+      await applyPreset(ports, view, draft)
       continue
     }
 
     if (choice === "mode") {
-      const current = currentMode(view, draft)
-      const picked = await ports.select({
-        title: "Mode — how the advisor investigates",
-        current: current.mode,
-        options: [
-          { category: "Actions", title: "Inherit — remove the mode key", value: "__inherit__", description: "Falls back to other config layers" },
-          { title: "Review", value: "review", description: MODE_DESCRIPTIONS.review },
-          { title: "Review + Agent", value: "agent", description: MODE_DESCRIPTIONS.agent },
-        ],
-      })
-      if (picked !== undefined) draft.advisorMode = picked === "__inherit__" ? null : picked
+      await applyMode(ports, view, draft)
+      continue
+    }
+
+    if (choice === "maxTime") {
+      await applyCeiling(ports, view, draft)
       continue
     }
 

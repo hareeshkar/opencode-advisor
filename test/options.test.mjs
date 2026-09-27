@@ -293,3 +293,17 @@ test("context + advice past a 1M window is flagged as an over-subscription", () 
     `the shared-budget over-subscription is explained (got ${JSON.stringify(seen)})`,
   )
 })
+
+test("when both tool-output keys are present, the canonical one wins", () => {
+  // A real config now has this shape: written by a pre-1.0 release and later
+  // edited through the 1.0 menu, which writes only the canonical key. Silently
+  // halving the user's chosen budget (or honouring the stale one) would be
+  // worse than either, so the precedence is pinned here.
+  const base = { advisor: { providerID: "p", id: "m" } }
+  const both = resolveOptions({ ...base, maxToolOutputChars: 3000, maxToolOutputTokens: 8000 })
+  assert.equal(both.maxToolOutputTokens, 8000, "the token key wins")
+  assert.equal(both.prune.maxToolOutputChars, 32_000, "…and the pruner follows it (8000 × 4)")
+  // Legacy only, and canonical only, both still behave.
+  assert.equal(resolveOptions({ ...base, maxToolOutputChars: 3000 }).maxToolOutputTokens, 750)
+  assert.equal(resolveOptions({ ...base, maxToolOutputTokens: 8000 }).maxToolOutputTokens, 8000)
+})

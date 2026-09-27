@@ -15,7 +15,7 @@
  */
 
 import { ADVISOR_CONFIG_KEYS } from "./config.js"
-import { PRESETS } from "./options.js"
+import { PRESETS, resolveOptions } from "./options.js"
 import { describeError } from "./sanitize.js"
 
 /* ------------------------------- RPC schemas ------------------------------ */
@@ -457,47 +457,72 @@ export function mainMenuRows(view: AdvisorSettingsView, draft: SettingsDraft): M
   ]
 }
 
+/**
+ * The host's select dialog shows at most 10 rows (a hardcoded viewport in
+ * OpenCode's TUI) and renders each row's `category` as its own visual line, so
+ * a menu of N rows occupies up to N + G lines. Anything past the viewport
+ * forces scrolling, and on a short terminal that means the row you want is
+ * invisible before you have even read the list.
+ *
+ * So the menus are BUDGETED, not just ordered: the rows people actually reach
+ * for sit above the fold, and the rare ones move behind a single "More…" row
+ * that opens a second page. This is the responsiveness knob — a host with a
+ * taller viewport can pass a bigger budget and get a flatter menu.
+ */
+export const MENU_VIEWPORT_ROWS = 10
+/** 10 viewport rows, less the dialog frame and the title it renders above. */
+export const MENU_ROW_BUDGET = 8
+
+/** Limits reachable without scrolling; the rest live behind "More…". */
+const PRIMARY_LIMITS = ["consults", "wait", "maxTime", "context", "advice", "pruning"] as const
+/** Genuinely rare knobs: per-output shaping, transport retries, diagnostics. */
+const SECONDARY_LIMITS = ["toolcap", "retries", "loglevel"] as const
+
 export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): MenuRow[] {
+  return limitPage(view, draft, "primary")
+}
+
+/**
+ * Page 1 = the limits people change. Page 2 = everything else, so the list
+ * fits the host viewport without scrolling.
+ */
+export function limitPage(view: AdvisorSettingsView, draft: SettingsDraft, page: "primary" | "more"): MenuRow[] {
   const limits = currentLimits(view, draft)
+  const back = { category: "", value: "back", title: "← Back", description: "Return to the main menu" }
+  if (page === "more") {
+    return [
+      { category: "", value: "toolcap", title: `Per-tool output cap — ${formatSize(limits.toolCap)} tokens`, description: "Tokens kept from one tool output" },
+      { category: "", value: "retries", title: `Retry ceiling — ${limits.attempts}`, description: "Transport attempts per task — NOT extra paid consults" },
+      { category: "", value: "loglevel", title: `Log level — ${limits.logLevel}`, description: "Plugin diagnostics verbosity" },
+      back,
+    ]
+  }
+  // Group headers are omitted on purpose: the host renders each category as its
+  // own line, and on a 10-row viewport four headers is the difference between
+  // every limit being visible and the list scrolling. The order still groups
+  // them and the group is named in each description, so nothing is lost.
   return [
-    { category: "Budgets", value: "consults", title: `Consults per task — ${limits.consults}`, description: "Advisor calls allowed per user task (safety cap)" },
-    { category: "Timing", value: "wait", title: `Response wait — ${formatDuration(limits.responseWaitMs)}`, description: "How long to wait for advisor advice before continuing in the background (the advisor keeps running)" },
-    { category: "Timing", value: "maxTime", title: `Max consult time — ${formatDuration(limits.ceilingMs)}`, description: "Maximum advisor lifetime; expiry fails the consult WITHOUT consuming the consult cap" },
+    { category: "", value: "consults", title: `Consults per task — ${limits.consults}`, description: "Advisor calls allowed per user task · Budgets" },
+    { category: "", value: "context", title: `Context budget — ${formatSize(limits.contextTokens)} tokens`, description: "INPUT tokens of conversation sent to the advisor · Budgets" },
+    { category: "", value: "advice", title: `Advice length — ${formatSize(limits.adviceTokens)} tokens`, description: "OUTPUT tokens for the advisor's reply · Budgets" },
+    { category: "", value: "wait", title: `Response wait — ${formatDuration(limits.responseWaitMs)}`, description: "How long to wait before continuing in the background · Timing" },
+    { category: "", value: "maxTime", title: `Max consult time — ${formatDuration(limits.ceilingMs)}`, description: "Maximum advisor lifetime; expiry fails WITHOUT consuming the cap · Timing" },
     {
-      category: "Budgets",
-      value: "context",
-      title: `Context budget — ${formatSize(limits.contextTokens)} tokens`,
-      description: "INPUT tokens of conversation sent to the advisor (up to the model's context window)",
-    },
-    {
-      category: "Budgets",
-      value: "advice",
-      title: `Advice length — ${formatSize(limits.adviceTokens)} tokens`,
-      description: "OUTPUT tokens for the advisor's reply (under the model's max output limit)",
-    },
-    {
-      category: "Budgets",
-      value: "toolcap",
-      title: `Per-tool output cap — ${formatSize(limits.toolCap)} tokens`,
-      description: "Maximum tokens kept from a single tool output",
-    },
-    {
-      category: "Evidence",
+      category: "",
       value: "pruning",
       title: `Pruning — ${limits.pruning === "none" ? "none (verbatim)" : "standard"}`,
       description:
         limits.pruning === "none"
-          ? "No windowing or truncation — the task arrives whole. Verbatim, but measured accuracy FALLS with input length."
-          : "Window the transcript to the context budget; truncate per tool output",
+          ? "No windowing or truncation — measured accuracy FALLS with input length · Evidence"
+          : "Window the transcript; truncate per tool output · Evidence",
     },
     {
-      category: "Evidence",
-      value: "retries",
-      title: `Retry ceiling — ${limits.attempts}`,
-      description: "Transport attempts per task — NOT extra paid consults",
+      category: "",
+      value: "more",
+      title: "More limits…",
+      description: `Per-tool output ${formatSize(limits.toolCap)} tokens · ${limits.attempts} retries · log ${limits.logLevel}`,
     },
-    { category: "Evidence", value: "loglevel", title: `Log level — ${limits.logLevel}`, description: "Plugin diagnostics verbosity" },
-    { category: "Actions", value: "back", title: "← Back", description: "Return to the main menu" },
+    back,
   ]
 }
 
@@ -511,6 +536,97 @@ export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): Menu
  * anything, just a partial echo of the three rows that happened to predate the
  * Advanced submenu.
  */
+/**
+ * The view the server would return if this draft were written, computed locally
+ * and WITHOUT touching the disk.
+ *
+ * The preview has to be honest, and the only honest preview is the real
+ * resolved result — a preset expands to its three quantities, explicit keys
+ * override it, and `null` means "remove this key" (Inherit), which resolves to
+ * whatever layer below provides. So the projection follows the same precedence
+ * `resolveOptions` does rather than echoing the draft back.
+ */
+export function projectView(view: AdvisorSettingsView, draft: SettingsDraft, scope: "project" | "global" = "project"): AdvisorSettingsView {
+  const config: Record<string, unknown> = { ...view.config }
+  const preset = typeof draft.preset === "string" && draft.preset !== "" ? PRESETS[draft.preset] : undefined
+  if (preset) {
+    if (preset.maxUsesPerTask !== undefined) config.maxUsesPerTask = preset.maxUsesPerTask
+    if (preset.transcriptBudgetTokens !== undefined) {
+      config.transcriptBudgetTokens =
+        typeof preset.transcriptBudgetTokens === "string"
+          ? Number.parseInt(preset.transcriptBudgetTokens.replace("k", "000"), 10)
+          : preset.transcriptBudgetTokens
+    }
+    if (preset.adviceTokenBudget !== undefined) config.adviceTokenBudget = preset.adviceTokenBudget
+  }
+  for (const [key, value] of Object.entries(draft)) {
+    if (key === "preset" || key === "advisor") continue
+    if (value === null) delete config[key]           // Inherit removes the key
+    else config[key] = value
+  }
+  if (draft.advisor === null) {
+    config.providerID = ""
+    config.id = ""
+  } else if (draft.advisor && typeof draft.advisor === "object") {
+    const ref = draft.advisor as { providerID?: unknown; id?: unknown; variant?: unknown }
+    config.providerID = typeof ref.providerID === "string" ? ref.providerID : config.providerID
+    config.id = typeof ref.id === "string" ? ref.id : config.id
+    config.variant = typeof ref.variant === "string" ? ref.variant : ""
+  }
+  // Re-resolve through the real option layer so defaults, the two-clock rules
+  // and the token/char conversions all apply exactly as they will on disk.
+  //
+  // A CLEAN options object, never a spread of the view: the view's `config`
+  // carries display-only fields (`source` is a TIER LABEL, not a provider
+  // descriptor) and the model under `providerID`/`id` rather than `advisor`.
+  // Spreading it made resolveOptions throw on every save.
+  const resolved = resolveOptions({
+    advisor: { providerID: config.providerID, id: config.id, ...(config.variant ? { variant: config.variant } : {}) },
+    ...(typeof config.advisorMode === "string" ? { advisorMode: config.advisorMode } : {}),
+    ...(typeof config.maxUsesPerTask === "number" ? { maxUsesPerTask: config.maxUsesPerTask } : {}),
+    ...(typeof config.maxAttempts === "number" ? { maxAttempts: config.maxAttempts } : {}),
+    ...(typeof config.advisorResponseWaitMs === "number" ? { advisorResponseWaitMs: config.advisorResponseWaitMs } : {}),
+    ...(typeof config.maxConsultMs === "number" ? { maxConsultMs: config.maxConsultMs } : {}),
+    ...(typeof config.adviceTokenBudget === "number" ? { adviceTokenBudget: config.adviceTokenBudget } : {}),
+    ...(typeof config.transcriptBudgetTokens === "number" || typeof config.transcriptBudgetTokens === "string"
+      ? { transcriptBudgetTokens: config.transcriptBudgetTokens }
+      : {}),
+    ...(typeof config.maxToolOutputTokens === "number" ? { maxToolOutputTokens: config.maxToolOutputTokens } : {}),
+    ...(config.pruning === "none" || config.pruning === "standard" ? { pruning: config.pruning } : {}),
+    ...(Array.isArray(config.triggers) ? { triggers: config.triggers } : {}),
+    ...(typeof config.logLevel === "string" ? { logLevel: config.logLevel } : {}),
+  })
+  return {
+    ...view,
+    config: {
+      ...view.config,
+      providerID: resolved.advisor.providerID,
+      id: resolved.advisor.id,
+      variant: resolved.advisor.variant ?? "",
+      source: scope,
+      preset: typeof draft.preset === "string" ? draft.preset : typeof view.config.preset === "string" ? view.config.preset : "",
+      advisorMode: resolved.advisorMode,
+      maxUsesPerTask: resolved.maxUsesPerTask,
+      maxAttempts: resolved.maxAttempts,
+      advisorResponseWaitMs: resolved.advisorResponseWaitMs,
+      maxConsultMs: resolved.maxConsultMs,
+      adviceTokenBudget: resolved.adviceTokenBudget,
+      transcriptBudgetTokens: resolved.transcriptBudgetTokens,
+      maxToolOutputTokens: resolved.maxToolOutputTokens,
+      pruning: resolved.pruning,
+      triggers: resolved.triggers,
+      logLevel: resolved.logLevel,
+    },
+    tiers: { ...view.tiers },
+    // The preview names the file the write will actually land in, which is
+    // what `pickConfigTarget` will choose on the server.
+    files:
+      scope === "project" && view.files.project === ""
+        ? { ...view.files, project: view.files.global }
+        : { ...view.files },
+  }
+}
+
 export function summaryMessage(view: AdvisorSettingsView): string {
   const model = currentModel(view, {})
   const preset = currentPreset(view, {})
@@ -646,6 +762,8 @@ async function pickConsultCeiling(ports: SettingsPorts, view: AdvisorSettingsVie
 
 /* --------------------- shared pickers (used at every level) ---------------- */
 
+
+
 async function applyModel(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
   const picked = await pickModel(ports, view, draft)
   if (picked.kind === "inherit") draft.advisor = null
@@ -697,10 +815,30 @@ async function applyCeiling(ports: SettingsPorts, view: AdvisorSettingsView, dra
   if (next !== undefined) draft.maxConsultMs = next
 }
 
-async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
+/**
+ * One function, two pages. The switch below is the ONLY place a limit row is
+ * mapped to a config key, so a key can never be correct on page 1 and wrong on
+ * page 2 — which is exactly how the ceiling ended up writing the retry setting.
+ */
+async function runLimitsMenu(
+  ports: SettingsPorts,
+  view: AdvisorSettingsView,
+  draft: SettingsDraft,
+  page: "primary" | "more" = "primary",
+): Promise<void> {
   for (;;) {
-    const choice = await ports.select({ title: "Limits", options: limitRows(view, draft) })
+    const choice = await ports.select({
+      title: page === "more" ? "More limits" : "Limits",
+      options: limitPage(view, draft, page),
+    })
     if (choice === undefined || choice === "back") return
+    if (choice === "more") {
+      // A second page rather than a longer list: the host viewport is fixed,
+      // so paging is what keeps every reachable row on screen. "back" on that
+      // page returns here, and this loop re-renders page 1.
+      await runLimitsMenu(ports, view, draft, "more")
+      continue
+    }
     // The config key is declared HERE, beside the picker, and each case sets
     // both. The previous design derived the key from the row name in one
     // ternary chain that silently defaulted to `maxAttempts` — so renaming a
@@ -940,19 +1078,35 @@ export async function runSettingsFlow(ports: SettingsPorts): Promise<void> {
   }
   let draft: SettingsDraft = {}
 
+  // Guards against a non-boolean from the host: a confirm that returns
+  // `undefined` (Esc, or a dismissed dialog) must not be read as "keep
+  // editing" forever, which re-asks the same unanswerable question on every
+  // iteration. One refusal returns to the menu; a second one exits.
+  let refusedDiscard = false
+  const exitOrKeepEditing = async (): Promise<boolean> => {
+    if (await discardOrKeep(ports, draft)) return true
+    if (refusedDiscard) return true
+    refusedDiscard = true
+    return false
+  }
+
   for (;;) {
     const title = hasChanges(draft) ? "Advisor Settings — unsaved changes" : "Advisor Settings"
     const choice = await ports.select({ title, options: mainMenuRows(view, draft) })
 
     if (choice === undefined) {
-      if (await discardOrKeep(ports, draft)) return
+      if (await exitOrKeepEditing()) return
       continue
     }
 
     if (choice === "cancel") {
-      if (await discardOrKeep(ports, draft)) return
+      if (await exitOrKeepEditing()) return
       continue
     }
+
+    // Any real navigation clears the refusal, so Esc-then-keep-editing still
+    // works; only an unanswerable prompt twice in a row ends the session.
+    refusedDiscard = false
 
     if (choice === "model") {
       await applyModel(ports, view, draft)
@@ -986,11 +1140,25 @@ export async function runSettingsFlow(ports: SettingsPorts): Promise<void> {
         ports.toast("No changes to save.", "info")
         continue
       }
+      // Save All shows a PREVIEW first and writes only on Confirm. The order
+      // matters: writing before the user agreed meant a declined save had
+      // already changed the file, and the "preview" was a receipt rather than
+      // a question. `cancelLabel` is what makes this a two-button dialog in the
+      // host instead of a dead-end OK.
+      const ok = await ports.confirm({
+        title: "Save these settings?",
+        message: summaryMessage(projectView(view, draft, "project")),
+        confirmLabel: "Save",
+        cancelLabel: "Keep editing",
+      })
+      if (ok !== true) continue // draft intact, menu still open, nothing written
       try {
-        const saved = await ports.save(draft)
-        view = saved
+        view = await ports.save(draft)
         draft = {}
-        await ports.alert({ title: "✓ Saved", message: summaryMessage(saved) })
+        ports.toast(`Saved to ${view.files.project || view.files.global}`, "success")
+        // Confirming means done: close the settings AND the preview rather
+        // than dropping the user back into a menu they have already answered.
+        return
       } catch (err) {
         ports.toast(`Save failed: ${errorText(err)}`, "error")
       }

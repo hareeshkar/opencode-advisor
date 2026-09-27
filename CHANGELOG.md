@@ -3,6 +3,54 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.0.6] — 2026-09-27
+
+### Changed
+- **Save All previews before it writes.** Save now opens a preview dialog whose
+  message is the full post-save summary, with a **Save** / **Keep editing**
+  choice. Nothing touches the file until Save is accepted, and accepting it
+  closes both the settings and the preview instead of dropping the user back
+  into a menu they had already answered. Previously the write happened first and
+  the summary was a receipt rather than a question, so declining could not
+  un-write anything.
+- The preview is a real projection (`projectView`): presets are expanded to
+  their quantities, explicit keys override them, `null`/Inherit resolves to the
+  layer below, and the result is passed back through `resolveOptions` so the
+  numbers shown are the numbers that will be written. It is pure — the
+  projection never touches disk.
+- **The menus are budgeted to the host's viewport.** OpenCode's select dialog
+  has a hardcoded 10-row viewport and renders each row's `category` as its own
+  line, so the limits list (10 rows + 4 group headers) scrolled. The rare knobs
+  — per-tool output cap, retry ceiling, log level — moved behind a single
+  **More limits…** row that names what it hides, and the group is stated in each
+  row's description instead of costing a header line. Settings page, limits
+  page 1 and page 2 all fit now, and one switch backs both pages so a key
+  mapping cannot be right on one and wrong on the other.
+
+### Fixed
+- **`advisor: { providerID: "", id: "" }` was rejected as malformed.** That
+  empty ref is the plugin's own unconfigured state — `resolveOptions` produces
+  exactly it for a fresh install, and "Inherit" on the model produces it too —
+  so the save preview threw on a config it had just written. An all-empty ref
+  now means *unconfigured*; a half-filled one still throws, because that is
+  genuinely a mistake.
+- **A `confirm` returning `undefined` re-asked forever.** Esc on the discard
+  prompt read as "keep editing" with no route out, so the flow looped
+  indefinitely. One refusal now returns to the menu and a second exits; any
+  real navigation clears the refusal, so Esc-then-keep-editing still works.
+
+### Tests
+- 224 green. New coverage: the viewport invariant (rows + group headers ≤ 10)
+  across all three menus; every limit reachable from *some* page, so paging
+  can never silently drop one; both pages sharing one key mapping; Save
+  previewing before writing; declining writing nothing while keeping the draft;
+  Confirm closing everything; and `projectView` agreeing with `resolveOptions`.
+- The viewport guard was proven non-vacuous by injecting an extra row and a
+  group header. A first attempt at that proof was itself vacuous — the
+  mutation did not match the file, so the tests passed without exercising
+  anything. Worth recording: a guard that has never been seen to fail is not
+  evidence.
+
 ## [1.0.5] — 2026-09-27
 
 ### Fixed — the post-save preview was missing most of what you just changed

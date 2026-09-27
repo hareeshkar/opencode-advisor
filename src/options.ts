@@ -158,6 +158,14 @@ function readModelRef(v: unknown, label: string): AdvisorModelRef {
   const rec = asRecord(v)
   const providerID = readString(rec, "providerID")
   const id = readString(rec, "id")
+  if (!providerID && !id) {
+    // An all-empty ref is the plugin's own UNCONFIGURED state — `resolveOptions`
+    // produces exactly `{ providerID: "", id: "" }` for a fresh install, and
+    // "Inherit" on the model in the settings menu produces it too. Treating that
+    // as malformed made the save preview throw, so a config could be written
+    // that the preview could not describe.
+    return { providerID: "", id: "", variant: readString(rec, "variant") }
+  }
   if (!providerID || !id) {
     throw new Error(
       `[advisor] option "${label}" must be { providerID, id, variant? } — ` +

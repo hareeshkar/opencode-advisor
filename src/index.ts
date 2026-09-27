@@ -34,7 +34,7 @@ export { ADVISOR_CONFIG_KEYS, ADVISOR_OVERRIDE_KEY, advisorConfigPaths, atomicWr
 export { CONSULT_CONCURRENCY, ConsultLedger, runningMessage } from "./consults.js"
 export type { ConsultDelivery, ConsultRecord, ConsultState } from "./consults.js"
 export type { AdvisorConfigFiles, AdvisorConfigSnapshot, AdvisorConfigTier, MigrationResult, OverrideStorage } from "./config.js"
-export { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA, MODE_DESCRIPTIONS, currentLimits, currentMode, currentModel, currentPreset, formatDuration, formatSize, hasChanges, limitRows, mainMenuRows, parseHumanSize, presetBlurb, presetTitle, runSettingsFlow, summaryMessage, tierLabel } from "./settings.js"
+export { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA, MENU_ROW_BUDGET, MENU_VIEWPORT_ROWS, MODE_DESCRIPTIONS, currentLimits, currentMode, currentModel, currentPreset, formatDuration, formatSize, hasChanges, limitPage, limitRows, mainMenuRows, parseHumanSize, presetBlurb, presetTitle, projectView, runSettingsFlow, summaryMessage, tierLabel } from "./settings.js"
 export type { AdvisorSettingsView, MenuRow, SettingsDraft, SettingsModelInfo, SettingsPorts, SettingsSelectOption } from "./settings.js"
 export { callAdvisorProvider } from "./providers.js"
 export { PLUGIN_VERSION, PLUGIN_ID } from "./types.js"

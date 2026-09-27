@@ -3,6 +3,38 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.0.4] — 2026-09-27
+
+### Changed — the settings page is one flat list again
+The three-level restructure (a "Settings" row you had to open, containing the
+model/preset/mode rows, containing "Advanced") put an extra click between the
+user and every setting, and the outer level told them nothing except "Settings".
+The intermediate level is gone:
+
+```
+Settings
+  Advisor model        — glm-5.3 · high
+  Preset               — Balanced (recommended)
+  Evidence basis       — Review + Agent
+Advanced
+  Advanced             — 3 consults/task · max consult time 1h
+Actions
+  Save changes / Reset all settings… / Cancel
+```
+
+`Advanced` is the only submenu, and it holds every limit including max consult
+time, exactly once. Each row's description carries its current value, so the
+page still answers "what is this set to?" without opening anything — which is
+what the summary line was doing, one click too far away. The now-unreachable
+`settingsRows`/`settingsSummary` functions and the exports that referenced them
+are removed, so there is one source of truth for the menu again.
+
+### Tests
+- 214 green. The dead-button guard now walks the settings page and was proven
+  non-vacuous by un-handling the `advanced` row, which fails it. Its assertion
+  was also tightened: the correct signal is that the NEXT render differs, since
+  re-rendering the page after a save is correct behaviour rather than a stall.
+
 ## [1.0.3] — 2026-09-27
 
 ### Fixed — three dead buttons and one silent data-corruption bug in the settings UI

@@ -1,6 +1,6 @@
 {
   "name": "opencode-advisor",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Model-agnostic advisor orchestration for OpenCode \u2014 any executor model escalates to any advisor model mid-task, with strict token budgets and zero transcript pollution.",
   "type": "module",
   "license": "MIT",

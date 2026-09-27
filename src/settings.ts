@@ -427,65 +427,33 @@ export function currentLimits(view: AdvisorSettingsView, draft: SettingsDraft): 
 /** Level 1 — the whole surface is one Settings branch plus the file actions. */
 export function mainMenuRows(view: AdvisorSettingsView, draft: SettingsDraft): MenuRow[] {
   const target = view.files.project || view.files.global
-  const settings = settingsSummary(view, draft)
-  return [
-    { category: "Settings", value: "settings", title: "Settings", description: settings },
-    { category: "Actions", value: "save", title: "Save changes", description: hasChanges(draft) ? `Write to ${target}` : "No changes yet" },
-    { category: "Actions", value: "reset", title: "Reset all settings…", description: `Remove the plugin's keys from ${target}` },
-    { category: "Actions", value: "cancel", title: "Cancel", description: hasChanges(draft) ? "Discard unsaved changes" : "Close" },
-  ]
-}
-
-/**
- * One line summarising the whole configuration, so the single top-level row
- * still answers "what is this set to?" without opening anything. This is the
- * summary the old flat menu spread across four rows.
- */
-export function settingsSummary(view: AdvisorSettingsView, draft: SettingsDraft): string {
   const model = currentModel(view, draft)
   const preset = currentPreset(view, draft)
   const mode = currentMode(view, draft)
   const limits = currentLimits(view, draft)
   return [
-    model.label,
-    `${preset.title}`,
-    mode.title,
-    `${limits.consults} consults/task`,
-    `wait ${formatDuration(limits.responseWaitMs)}`,
-    `max ${formatDuration(limits.ceilingMs)}`,
-    `${formatSize(limits.contextTokens)} in`,
-    `${formatSize(limits.adviceTokens)} out`,
-    limits.pruning === "none" ? "pruning none" : `pruning ${limits.pruning}`,
-  ].join(" · ")
-}
-
-/** Level 2 — what most people change, with everything else one level down. */
-export function settingsRows(view: AdvisorSettingsView, draft: SettingsDraft): MenuRow[] {
-  const model = currentModel(view, draft)
-  const preset = currentPreset(view, draft)
-  const mode = currentMode(view, draft)
-  const limits = currentLimits(view, draft)
-  return [
-    { category: "", value: "model", title: `Advisor model — ${model.label}`, description: model.description },
+    { category: "Settings", value: "model", title: `Advisor model — ${model.label}`, description: model.description },
     {
-      category: "",
+      category: "Settings",
       value: "preset",
       title: `Preset — ${preset.title}${preset.kind === "preset" && preset.isDefault ? " · default" : ""}`,
       description: preset.blurb,
     },
     {
-      category: "",
+      category: "Settings",
       value: "mode",
       title: `Evidence basis — ${mode.title}`,
       description: `${mode.description} The advice frame states which basis was used.`,
     },
     {
-      category: "",
+      category: "Advanced",
       value: "advanced",
-      title: `Advanced — ${limits.consults} consults · wait ${formatDuration(limits.responseWaitMs)} · max ${formatDuration(limits.ceilingMs)}`,
-      description: `Budgets and every limit: ${formatSize(limits.contextTokens)} context, ${formatSize(limits.adviceTokens)} advice, ${formatSize(limits.toolCap)} per tool output, pruning ${limits.pruning}, ${limits.attempts} retries, log ${limits.logLevel}`,
+      title: `Advanced — ${limits.consults} consults/task · max consult time ${formatDuration(limits.ceilingMs)}`,
+      description: `Every limit: response wait ${formatDuration(limits.responseWaitMs)}, ${formatSize(limits.contextTokens)} context, ${formatSize(limits.adviceTokens)} advice, ${formatSize(limits.toolCap)} per tool output, pruning ${limits.pruning}, ${limits.attempts} retries, log ${limits.logLevel}`,
     },
-    { category: "Actions", value: "back", title: "← Back", description: "Return to the main menu" },
+    { category: "Actions", value: "save", title: "Save changes", description: hasChanges(draft) ? `Write to ${target}` : "No changes yet" },
+    { category: "Actions", value: "reset", title: "Reset all settings…", description: `Remove the plugin's keys from ${target}` },
+    { category: "Actions", value: "cancel", title: "Cancel", description: hasChanges(draft) ? "Discard unsaved changes" : "Close" },
   ]
 }
 
@@ -681,37 +649,6 @@ async function applyPreset(ports: SettingsPorts, view: AdvisorSettingsView, draf
 async function applyCeiling(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
   const next = await pickConsultCeiling(ports, view, draft)
   if (next !== undefined) draft.maxConsultMs = next
-}
-
-/**
- * Level 2. The model, the preset and the evidence basis live here; every limit
- * is one level further down under Advanced.
- */
-async function runSettingsSubmenu(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
-  for (;;) {
-    const title = hasChanges(draft) ? "Settings — unsaved changes" : "Settings"
-    const choice = await ports.select({ title, options: settingsRows(view, draft) })
-    if (choice === undefined || choice === "back") return
-    if (choice === "model") {
-      await applyModel(ports, view, draft)
-      continue
-    }
-    if (choice === "preset") {
-      await applyPreset(ports, view, draft)
-      continue
-    }
-    if (choice === "mode") {
-      await applyMode(ports, view, draft)
-      continue
-    }
-    if (choice === "advanced") {
-      await runLimitsMenu(ports, view, draft)
-      continue
-    }
-    // Unreachable rows must not silently swallow a keystroke: say so rather
-    // than redrawing an identical menu, which reads as a dead button.
-    ports.toast(`Unknown settings row: ${String(choice)}`, "error")
-  }
 }
 
 async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, draft: SettingsDraft): Promise<void> {
@@ -971,11 +908,6 @@ export async function runSettingsFlow(ports: SettingsPorts): Promise<void> {
       continue
     }
 
-    if (choice === "settings") {
-      await runSettingsSubmenu(ports, view, draft)
-      continue
-    }
-
     if (choice === "model") {
       await applyModel(ports, view, draft)
       continue
@@ -996,7 +928,9 @@ export async function runSettingsFlow(ports: SettingsPorts): Promise<void> {
       continue
     }
 
-    if (choice === "limits") {
+    if (choice === "advanced" || choice === "limits") {
+      // `limits` is the historical value for the same row; accept both so an
+      // older caller cannot land on a dead row.
       await runLimitsMenu(ports, view, draft)
       continue
     }

@@ -17,7 +17,8 @@ import {
   presetTitle,
   runSettingsFlow,
   summaryMessage,
-  tierLabel, settingsRows, settingsSummary,} from "../dist/opencode-advisor.js"
+  tierLabel,
+} from "../dist/opencode-advisor.js"
 
 function makeView(overrides = {}) {
   return {
@@ -144,21 +145,30 @@ test("display state and menu rows reflect the effective view + draft", () => {
   assert.equal(preset.name, "thorough")
   assert.equal(preset.isDefault, false)
 
-  // Level 2 carries the three headline settings; the budgets are one level down.
-  const rows = settingsRows(view, {})
+  // ONE level: model, preset, evidence basis and Advanced are all on the
+  // settings page. An extra "Settings" row you had to open before seeing any
+  // of them was pure indirection.
+  const rows = mainMenuRows(view, {})
+  assert.deepEqual(
+    rows.map((r) => r.value),
+    ["model", "preset", "mode", "advanced", "save", "reset", "cancel"],
+    "the settings page is one flat list; Advanced is the only submenu",
+  )
+  assert.ok(!rows.some((r) => r.value === "settings"), "no intermediate Settings row")
   assert.ok(rows.find((r) => r.value === "preset").title.includes("Thorough"))
   assert.ok(rows.find((r) => r.value === "advanced").title.includes("5 consults"))
   assert.ok(
     rows.find((r) => r.value === "advanced").description.includes("64K context, 16K advice"),
     "the Advanced row summarises the budgets in tokens",
   )
-  assert.ok(
-    mainMenuRows(view, {})[0].description.includes("64K in"),
-    "the single top-level Settings row still answers 'what is this set to?'",
+  assert.equal(
+    rows.filter((r) => r.category === "Settings").length,
+    3,
+    "model, preset and evidence basis are grouped under Settings",
   )
 
   // Draft overrides win; null means inherit.
-  const rowsDraft = settingsRows(view, { preset: null, maxUsesPerTask: 2 })
+  const rowsDraft = mainMenuRows(view, { preset: null, maxUsesPerTask: 2 })
   assert.ok(rowsDraft.find((r) => r.value === "preset").title.includes("Inherit"))
   assert.ok(rowsDraft.find((r) => r.value === "advanced").title.includes("2 consults"))
   assert.equal(hasChanges({}), false)
@@ -188,7 +198,7 @@ test("display state and menu rows reflect the effective view + draft", () => {
   assert.ok(limitRows(view, {}).some((r) => r.value === "maxTime" && r.title.includes("Max consult time — 1h")))
   assert.ok(limitRows(view, {}).some((r) => r.value === "advice" && r.title.includes("16K tokens")))
   assert.ok(
-    settingsRows(view, {}).some((r) => r.value === "mode" && r.title.startsWith("Evidence basis —")),
+    mainMenuRows(view, {}).some((r) => r.value === "mode" && r.title.startsWith("Evidence basis —")),
     "Mode is renamed to say what it changes about the answer",
   )
   // The row states the consequence, not just the name: "none" is a real mode.
@@ -396,16 +406,37 @@ function titles(calls) {
   return calls.selects.map((s) => s.title)
 }
 
-test("the three levels are actually reachable: Settings -> Advanced -> a limit", async () => {
-  const { ports, calls } = scripted({ select: ["settings", "advanced", "maxTime", "10800000", "back", "back", "save"] })
+test("every settings-page row is reachable, and Advanced opens the limits", async () => {
+  const { ports, calls } = scripted({ select: ["advanced", "maxTime", "10800000", "back", "save"] })
   await runSettingsFlow(ports)
   const t = titles(calls)
-  assert.ok(t[0].startsWith("Advisor Settings"), `level 1 renders (${JSON.stringify(t)})`)
-  assert.ok(t[1].startsWith("Settings"), `"settings" opens level 2 (${JSON.stringify(t)})`)
-  assert.ok(t[2] === "Limits", `"advanced" opens the limits menu (${JSON.stringify(t)})`)
-  assert.ok(t[3] === "Max consult time", "the ceiling row opens its picker")
-  assert.deepEqual(calls.saved, [{ maxConsultMs: 10_800_000 }], "and the edit is saved under the real key")
+  assert.ok(t[0].startsWith("Advisor Settings"), `the settings page renders (${JSON.stringify(t)})`)
+  assert.ok(t[1] === "Limits", `"advanced" opens the limits menu (${JSON.stringify(t)})`)
+  assert.ok(t[2] === "Max consult time", "the ceiling row opens its picker")
+  assert.deepEqual(calls.saved, [{ maxConsultMs: 10_800_000 }], "and the edit saves under the real key")
   assert.ok(!calls.toasts.some((x) => x.variant === "error"), `no unknown-row errors (${JSON.stringify(calls.toasts)})`)
+})
+
+test("every row on the settings page opens something", async () => {
+  // The settings page has no "back" row, so a leaf row goes straight to Save;
+  // only a submenu has to be closed first.
+  for (const row of mainMenuRows(makeView(), {})) {
+    if (row.value === "cancel" || row.value === "save" || row.value === "reset") continue
+    const script = row.value === "advanced" ? ["advanced", "back", "save"] : [row.value, "__inherit__", "save"]
+    const { ports, calls } = scripted({ select: script })
+    await runSettingsFlow(ports)
+    assert.ok(
+      !calls.toasts.some((x) => x.variant === "error" && /Unknown|no config key/.test(x.message)),
+      `settings row "${row.value}" is unhandled (${JSON.stringify(calls.toasts)})`,
+    )
+    // The row must lead SOMEWHERE: the very next render has to differ. A row
+    // with no handler redraws the identical list, which is the dead button.
+    // (Comparing later pairs is wrong — re-rendering the page after a save is
+    // correct behaviour, not a stall.)
+    const t = titles(calls)
+    assert.ok(t.length > 1, `"${row.value}" produced no further interaction`)
+    assert.notEqual(t[1], t[0], `"${row.value}" is a dead button: ${JSON.stringify(t)}`)
+  }
 })
 
 /* ═══ "if I change anything, the preset becomes Custom" ═══ */
@@ -420,7 +451,7 @@ test("every limit row opens something — none is a dead button", async () => {
     if (row.value === "back") continue
     const value = pick[row.value] ?? "standard"
     const { ports, calls } = scripted({
-      select: ["settings", "advanced", row.value, value, "back", "back", "save"],
+      select: ["advanced", row.value, value, "back", "save"],
     })
     await runSettingsFlow(ports)
     assert.ok(
@@ -450,33 +481,80 @@ test("each limit row writes to its OWN config key — no cross-wiring", async ()
     ["retries", "maxAttempts", "42"],
   ]
   for (const [row, key, value] of cases) {
-    const { ports, calls } = scripted({ select: ["settings", "advanced", row, value, "back", "back", "save"] })
+    const { ports, calls } = scripted({ select: ["advanced", row, value, "back", "save"] })
     await runSettingsFlow(ports)
     assert.deepEqual(calls.saved, [{ [key]: Number(value) }], `row "${row}" must write only ${key}`)
   }
 })
 
 test("the categorical limits save their own keys too", async () => {
-  const pruning = scripted({ select: ["settings", "advanced", "pruning", "none", "back", "back", "save"] })
+  const pruning = scripted({ select: ["advanced", "pruning", "none", "back", "save"] })
   await runSettingsFlow(pruning.ports)
   assert.deepEqual(pruning.calls.saved, [{ pruning: "none" }], "pruning saves under `pruning`")
 
-  const log = scripted({ select: ["settings", "advanced", "loglevel", "debug", "back", "back", "save"] })
+  const log = scripted({ select: ["advanced", "loglevel", "debug", "back", "save"] })
   await runSettingsFlow(log.ports)
   assert.deepEqual(log.calls.saved, [{ logLevel: "debug" }], "log level saves under `logLevel`")
 })
 
-test("every level-2 row is reachable from the top", async () => {
-  for (const row of settingsRows(makeView(), {})) {
-    if (row.value === "back" || row.value === "advanced") continue
-    const { ports, calls } = scripted({ select: ["settings", row.value, "__inherit__", "back", "save"] })
+/* ═══ "if I change anything, the preset becomes Custom" ═══ */
+
+test("every limit row opens something — none is a dead button", async () => {
+  // A row with no handler redraws the SAME list, which the user sees as a dead
+  // button. This bug shipped twice (an unhandled "Settings" row, then an
+  // unhandled "maxTime" row), so every row is now exercised explicitly. Each
+  // script ends in "save" so the flow always terminates.
+  const pick = { consults: "7", wait: "1800000", maxTime: "10800000", context: "64000", advice: "16000", toolcap: "2000", retries: "42" }
+  for (const row of limitRows(makeView(), {})) {
+    if (row.value === "back") continue
+    const value = pick[row.value] ?? "standard"
+    const { ports, calls } = scripted({
+      select: ["advanced", row.value, value, "back", "save"],
+    })
     await runSettingsFlow(ports)
     assert.ok(
-      !calls.toasts.some((x) => x.variant === "error" && x.message.includes("Unknown")),
-      `level-2 row "${row.value}" is unhandled`,
+      !calls.toasts.some((x) => x.variant === "error" && /Unknown|no config key/.test(x.message)),
+      `limits row "${row.value}" is unhandled (${JSON.stringify(calls.toasts)})`,
     )
+    const t = calls.selects.map((x) => x.title)
+    for (let k = 2; k < t.length; k++) {
+      assert.ok(!(t[k] === "Limits" && t[k - 1] === "Limits"), `"${row.value}" redrew the list in place: ${JSON.stringify(t)}`)
+    }
   }
 })
+
+test("each limit row writes to its OWN config key — no cross-wiring", async () => {
+  // The defect this locks: the ceiling picker wrote `maxAttempts`, because the
+  // key was derived from the row name by a ternary chain that was not updated
+  // when the row was renamed ceiling -> maxTime. Setting max consult time
+  // silently destroyed the retry ceiling. Each key is now co-located with its
+  // own picker, and this proves the mapping end to end.
+  const cases = [
+    ["consults", "maxUsesPerTask", "7"],
+    ["wait", "advisorResponseWaitMs", "1800000"],
+    ["maxTime", "maxConsultMs", "10800000"],
+    ["context", "transcriptBudgetTokens", "64000"],
+    ["advice", "adviceTokenBudget", "16000"],
+    ["toolcap", "maxToolOutputTokens", "2000"],
+    ["retries", "maxAttempts", "42"],
+  ]
+  for (const [row, key, value] of cases) {
+    const { ports, calls } = scripted({ select: ["advanced", row, value, "back", "save"] })
+    await runSettingsFlow(ports)
+    assert.deepEqual(calls.saved, [{ [key]: Number(value) }], `row "${row}" must write only ${key}`)
+  }
+})
+
+test("the categorical limits save their own keys too", async () => {
+  const pruning = scripted({ select: ["advanced", "pruning", "none", "back", "save"] })
+  await runSettingsFlow(pruning.ports)
+  assert.deepEqual(pruning.calls.saved, [{ pruning: "none" }], "pruning saves under `pruning`")
+
+  const log = scripted({ select: ["advanced", "loglevel", "debug", "back", "save"] })
+  await runSettingsFlow(log.ports)
+  assert.deepEqual(log.calls.saved, [{ logLevel: "debug" }], "log level saves under `logLevel`")
+})
+
 
 test("ANY edit flips the preset to Custom — including the wait and the ceiling", () => {
   const view = makeView({ config: { preset: "balanced" } })
@@ -508,7 +586,7 @@ test("the GUI reflects the change immediately: the preset row flips to Custom", 
   // No save here — we only care what the ROWS said along the way — so the
   // discard prompt must be answered or the flow re-asks forever.
   const { ports, calls } = scripted({
-    select: ["settings", "advanced", "context", "64000", "back", "back"],
+    select: ["advanced", "context", "64000", "back"],
     confirm: [true],
   })
   await runSettingsFlow(ports)

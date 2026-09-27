@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs"
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { createV2Plugin } from "../dist/opencode-advisor.js"
+import { CONFIG_OUTPUT_SCHEMA, createV2Plugin } from "../dist/opencode-advisor.js"
 
 /** Minimal fake V2 plugin context — exercises setup wiring end to end. */
 function makeCtx(overrides = {}) {
@@ -1081,3 +1081,95 @@ test("DEFECT-1 (agent mode): an aborted child turn is interrupted, not left runn
   assert.equal(childSignal === null || childSignal.aborted === true, true, "the child turn's own signal is aborted")
 })
 
+
+/* ============ producer ↔ schema agreement (the missing guard) ============ */
+
+/**
+ * Minimal JSON-Schema check for the subset CONFIG_OUTPUT_SCHEMA uses:
+ * type, properties, required, additionalProperties, enum, items.
+ *
+ * This exists because the host validates the RPC payload against the schema and
+ * answers `rpc.invalid_output` when they disagree — so a producer that drifts
+ * from the schema is not a cosmetic bug, it is a feature that fails to open.
+ * Every settings test used to build its view by hand, which is exactly why a
+ * producer that emitted the pre-1.0 key shipped while the schema had already
+ * moved on. Nothing exercised the real pair together until now.
+ */
+function assertMatchesSchema(value, schema, path = "root", seen = new Set()) {
+  if (schema === undefined) return
+  if (schema.enum) {
+    assert.ok(schema.enum.includes(value), `${path}: ${JSON.stringify(value)} not in enum ${JSON.stringify(schema.enum)}`)
+    return
+  }
+  if (schema.type === "object") {
+    assert.ok(value !== null && typeof value === "object" && !Array.isArray(value), `${path}: expected an object, got ${Array.isArray(value) ? "array" : typeof value}`)
+    assert.ok(!seen.has(value), `${path}: circular structure`)
+    const next = new Set(seen).add(value)
+    for (const key of schema.required ?? []) {
+      assert.ok(
+        Object.prototype.hasOwnProperty.call(value, key),
+        `${path}: missing required key ${JSON.stringify(key)} — the host would answer rpc.invalid_output`,
+      )
+    }
+    for (const [key, v] of Object.entries(value)) {
+      const sub = schema.properties?.[key]
+      if (sub) assertMatchesSchema(v, sub, `${path}.${key}`, next)
+      else if (schema.additionalProperties === false) {
+        assert.fail(`${path}: unexpected additional property ${JSON.stringify(key)} — the host would answer rpc.invalid_output`)
+      } else if (schema.additionalProperties) {
+        assertMatchesSchema(v, schema.additionalProperties, `${path}.${key}`, next)
+      }
+    }
+    return
+  }
+  if (schema.type === "array") {
+    assert.ok(Array.isArray(value), `${path}: expected an array, got ${typeof value}`)
+    value.forEach((v, i) => assertMatchesSchema(v, schema.items, `${path}[${i}]`, seen))
+    return
+  }
+  if (schema.type === "string") assert.equal(typeof value, "string", `${path}: expected a string, got ${typeof value}`)
+  if (schema.type === "number") assert.equal(typeof value, "number", `${path}: expected a number, got ${typeof value}`)
+}
+
+test("the real RPC get output satisfies the real CONFIG_OUTPUT_SCHEMA", async () => {
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  const out = await rpc.get({})
+  assertMatchesSchema(out, CONFIG_OUTPUT_SCHEMA)
+  // The keys the schema demands must carry the resolved, canonical values.
+  assert.equal(out.config.maxToolOutputTokens, 750)
+  assert.equal(out.config.pruning, "standard")
+  assert.ok(!("maxToolOutputChars" in out.config), "the pre-1.0 key is not emitted")
+})
+
+test("a legacy maxToolOutputChars config still yields a schema-valid view", async () => {
+  // The reported failure: an existing config on the pre-1.0 key produced a
+  // payload missing `maxToolOutputTokens`, so /advisor-settings refused to open.
+  const { ctx, captured } = makeCtx()
+  await createV2Plugin().setup(ctx)
+  const dir = join(ctx.location.directory, ".opencode")
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, "opencode-advisor.json"), JSON.stringify({ maxToolOutputChars: 3000 }))
+  const rpc = captured.rpcHandlers.get("opencode-advisor")
+  const out = await rpc.get({})
+  assertMatchesSchema(out, CONFIG_OUTPUT_SCHEMA)
+  assert.equal(out.config.maxToolOutputTokens, 750, "3000 chars is reported as the 750 tokens actually in effect")
+  assert.equal(out.tiers.maxToolOutputTokens, "project", "the legacy key still attributes the canonical one, so the menu is honest")
+})
+
+test("every schema that ships is internally consistent with its own producer", async () => {
+  // Guards the two halves from drifting apart again: the schema must not
+  // demand a key the settings UI has no way to write, and vice versa.
+  const writable = new Set([
+    "providerID", "id", "variant", "source", "preset", "advisorMode", "maxUsesPerTask", "maxAttempts",
+    "advisorResponseWaitMs", "maxConsultMs", "adviceTokenBudget", "transcriptBudgetTokens",
+    "maxToolOutputTokens", "pruning", "triggers", "logLevel",
+  ])
+  for (const key of CONFIG_OUTPUT_SCHEMA.properties.config.required) {
+    assert.ok(writable.has(key), `schema requires ${key}, but the menu cannot write it`)
+  }
+  for (const key of Object.keys(CONFIG_OUTPUT_SCHEMA.properties.config.properties)) {
+    assert.ok(CONFIG_OUTPUT_SCHEMA.properties.config.required.includes(key), `${key} is emitted but not required — drift risk`)
+  }
+})

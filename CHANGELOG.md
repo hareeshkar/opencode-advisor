@@ -3,6 +3,41 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.0.2] — 2026-09-27
+
+### Fixed — `/advisor-settings` could not open at all
+The settings RPC validates its payload against `CONFIG_OUTPUT_SCHEMA`, and the
+host answers `rpc.invalid_output` when they disagree. In 1.0.0 the schema was
+migrated to the canonical vocabulary (`maxToolOutputTokens`, `pruning`) but the
+**producer was not** — `configOutput` still emitted `maxToolOutputChars` and
+omitted the new keys entirely. Because the `config` sub-schema is
+`additionalProperties: false` with an explicit `required` list, that failed
+validation in both directions:
+
+```
+Missing key at ["config"]["maxToolOutputTokens"]  rpc.invalid_output
+```
+
+So the settings menu was broken for **every** configuration, not only ones on
+the pre-1.0 key — the legacy key was never the cause. A TypeScript interface
+declared every field of `config` as present, which is why the type system stayed
+silent about a payload that did not honour it.
+
+- `configOutput` now emits the canonical `maxToolOutputTokens` and `pruning`
+  (and no longer emits the retired key).
+- Tier attribution follows the alias: a config still using
+  `maxToolOutputChars` now attributes the canonical `maxToolOutputTokens`, so
+  the menu reports the value that is actually in effect instead of offering
+  "Inherit" for a setting that is set.
+
+### Tests — the guard that should have caught it
+Every settings test built its view by hand, so the real producer and the real
+schema were never exercised together; that is precisely how the two drifted.
+Two tests now run the actual `get` handler and validate the result against the
+actual schema, plus a consistency test asserting the schema requires only keys
+the menu can write and that every emitted property is required. All three fail
+against the shipped 1.0.0/1.0.1 code and pass after the fix. 202 green.
+
 ## [1.0.1] — 2026-09-27
 
 ### Fixed

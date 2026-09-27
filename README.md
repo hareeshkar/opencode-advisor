@@ -290,7 +290,7 @@ npm test            # node --test — the full suite
 npm run build       # esbuild → dist/opencode-advisor.js + dist/tui.js
 ```
 
-Zero runtime dependencies; the bundles are the installable artifacts. Current version: **1.0.1**. Design notes and prior art live in [`research/`](research/).
+Zero runtime dependencies; the bundles are the installable artifacts. Current version: **1.0.2**. Design notes and prior art live in [`research/`](research/).
 
 ## License
 

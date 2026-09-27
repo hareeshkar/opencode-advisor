@@ -112,6 +112,13 @@ export async function loadAdvisorConfig(args: { directory?: string; options?: un
 
   const tiers: Record<string, AdvisorConfigTier> = {}
   for (const { tier, doc } of layers) for (const key of Object.keys(doc)) tiers[key] = tier
+  // A config still on the pre-1.0 `maxToolOutputChars` key has its value in
+  // effect (options.ts divides it by 4), so the CANONICAL key must carry that
+  // tier too — otherwise the menu reports the setting as unattributed and
+  // offers "Inherit" for a value that is actually set.
+  if (tiers.maxToolOutputTokens === undefined && tiers.maxToolOutputChars !== undefined) {
+    tiers.maxToolOutputTokens = tiers.maxToolOutputChars
+  }
 
   return {
     merged: mergeAdvisorConfigLayers(layers.map((l) => l.doc)),

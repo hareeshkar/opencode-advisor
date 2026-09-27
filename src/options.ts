@@ -11,6 +11,18 @@ import type { AdvisorModelRef, AdvisorOptions, AdvisorSource, LogLevel } from ".
 
 const ENV = process.env as Record<string, string | undefined>
 
+/**
+ * Where the measurements say a second opinion is still worth having.
+ *
+ * Not a hard limit — the validators accept far more — but the point past which
+ * the plugin says "you are asking for less accuracy", because that is what
+ * the code-review long-context benchmarks actually measure. Context peaks
+ * 32K-64K for bug fixing and 64K-128K for comprehension; output stops paying
+ * for itself well before the provider's 64K-128K ceiling.
+ */
+export const EVIDENCE_CEILING_TOKENS = 128_000
+export const EVIDENCE_CEILING_ADVICE_TOKENS = 32_000
+
 /** The one chars↔tokens conversion constant in the plugin. 4 is the
  *  industry-standard approximation for English + code (GPT/Claude/Gemini all
  *  land within ±10%). Every token budget is multiplied by this to reach the
@@ -50,24 +62,56 @@ export function mergeAdvisorConfigLayers(layers: Array<unknown>): Record<string,
  *  the response budget instructed in the prompt and hard-capped at ~4
  *  chars/token. Numbers are deliberately generous — advice output is the
  *  cheapest part of a consult. */
+/**
+ * The curve is NOT monotonic in context size, and the evidence is unusually
+ * consistent for this plugin's exact job (reviewing code and bugs):
+ *
+ * - LongCodeBench, bug fixing: Claude 3.5 Sonnet solves 29% of issues at 32K
+ *   and 3% at 256K. Gemini 2 Flash and GPT-4o also peak at 32K.
+ * - LongCodeBench, comprehension: accuracy peaks at 64K-128K for nearly every
+ *   model, then falls; one model peaks at 512K and drops to 40% at 1M.
+ * - "The Limits of Long-Context Reasoning in Automated Bug Fixing": successful
+ *   agentic trajectories stay UNDER 20-30K tokens, and longer contexts
+ *   correlate with LOWER resolve rates. Single-shot at 64K with perfect file
+ *   inclusion, GPT-5-nano solved zero.
+ * - "Context Length Alone Hurts LLM Performance Despite Perfect Retrieval"
+ *   (EMNLP 2025): accuracy falls 13.9%-85% as input grows, even with all
+ *   distractors MASKED and the evidence immediately before the question. The
+ *   authors' own mitigation is to turn a long-context task into a short one.
+ * - "Same Task, More Tokens": degradation already appears at 3,000 tokens of
+ *   pure padding (0.92 -> 0.68).
+ *
+ * So the generous setting is a MODERATE one. Every preset below sits inside
+ * the measured region where models still reason well; the ceilings exist for
+ * users who knowingly want to trade accuracy for reach, not as a "more is
+ * better" ladder.
+ */
 export const PRESETS: Record<string, Partial<Record<string, unknown>>> = {
-  economy: { maxUsesPerTask: 1, transcriptBudgetTokens: "16k", adviceTokenBudget: 8_000 },
-  balanced: { maxUsesPerTask: 3, transcriptBudgetTokens: "32k", adviceTokenBudget: 16_000 },
-  thorough: { maxUsesPerTask: 5, transcriptBudgetTokens: "64k", adviceTokenBudget: 32_000 },
-  exhaustive: { maxUsesPerTask: 8, transcriptBudgetTokens: "128k", adviceTokenBudget: 64_000 },
+  economy: { maxUsesPerTask: 1, transcriptBudgetTokens: "16k", adviceTokenBudget: 4_000 },
+  balanced: { maxUsesPerTask: 3, transcriptBudgetTokens: "32k", adviceTokenBudget: 8_000 },
+  thorough: { maxUsesPerTask: 5, transcriptBudgetTokens: "64k", adviceTokenBudget: 16_000 },
+  exhaustive: { maxUsesPerTask: 8, transcriptBudgetTokens: "128k", adviceTokenBudget: 32_000 },
 }
 
 export const DEFAULTS = {
   advisor: { providerID: "", id: "" } as AdvisorModelRef,
   maxUsesPerTask: 3,
-  adviceTokenBudget: 16_000,
+  // Output length has a NON-MONOTONIC effect on accuracy: "Demystify
+  // Reasoning Length" finds correct answers turn incorrect at the longest
+  // ranks (~5-10% of them), i.e. overthinking past the point of diminishing
+  // returns. A large budget does not make the advisor think harder, it lets it
+  // keep going. 8K is past the useful range for a review and well short of
+  // where compounding errors start.
+  adviceTokenBudget: 8_000,
   advisorResponseWaitMs: 90_000,
   maxConsultMs: 3_600_000,
   // 750 tokens ≈ 3,000 chars: a whole file section or a full stack trace.
   maxToolOutputTokens: 750,
-  // 32k tokens ≈ 128k chars: balanced default — the recency-weighted excerpt
-  // plus original-task pinning preserves signal at roughly ⅔ the cost of a
-  // larger window (efficiency review F-ledger; tune per workload).
+  // 32K tokens ≈ 128K chars — the measured peak for bug-fixing review
+  // (LongCodeBench) and a clean room above the sub-20-30K span that
+  // successful agentic trajectories actually occupy. It also fits inside a
+  // 200K-window model, so the default is portable across the whole 200K-to-1M
+  // class rather than assuming the largest window available.
   transcriptBudgetTokens: 32_000,
   pruning: "standard" as const,
   advisorMode: "review" as const,
@@ -217,21 +261,25 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     }
     if (preset.maxUsesPerTask !== undefined) maxUsesPerTask = preset.maxUsesPerTask as number
     if (preset.transcriptBudgetTokens !== undefined) {
-      transcriptBudgetTokens = readSize({ v: preset.transcriptBudgetTokens as string }, "v", 1_000, 2_000_000) ?? transcriptBudgetTokens
+      transcriptBudgetTokens = readSize({ v: preset.transcriptBudgetTokens as string }, "v", 1_000, 1_000_000) ?? transcriptBudgetTokens
     }
     if (preset.adviceTokenBudget !== undefined) adviceTokenBudget = preset.adviceTokenBudget as number
   }
 
-  maxUsesPerTask = readInt(opts, "maxUsesPerTask", 1, 1_000) ?? maxUsesPerTask
-  let maxAttempts = readInt(opts, "maxAttempts", 1, 10_000) ?? 0 // 0 = derive from cap
-  adviceTokenBudget = readInt(opts, "adviceTokenBudget", 16, 1_000_000) ?? adviceTokenBudget
+  maxUsesPerTask = readInt(opts, "maxUsesPerTask", 1, 200) ?? maxUsesPerTask
+  let maxAttempts = readInt(opts, "maxAttempts", 1, 2_000) ?? 0 // 0 = derive from cap
+  // 200K output is comfortably above every real max-output limit in the
+  // 1M-window class (Gemini 3.1 Pro / Claude Sonnet 64K, GPT-5.x / Claude
+  // Opus 128K). Asking for more is not "generous", it is a value no provider
+  // in this class will honour.
+  adviceTokenBudget = readInt(opts, "adviceTokenBudget", 256, 200_000) ?? adviceTokenBudget
   const waitExplicit = readInt(opts, "advisorResponseWaitMs", 1, 3_600_000)
   const waitLegacy = readInt(opts, "timeoutMs", 1, 3_600_000)
   advisorResponseWaitMs = waitExplicit ?? waitLegacy ?? advisorResponseWaitMs
   if (waitExplicit === undefined && waitLegacy !== undefined) {
     warnOnce("timeoutMs", "[advisor] timeoutMs is deprecated — rename it to advisorResponseWaitMs")
   }
-  maxConsultMs = readSize(opts, "maxConsultMs", 1_000, 604_800_000) ?? maxConsultMs
+  maxConsultMs = readSize(opts, "maxConsultMs", 1_000, 86_400_000) ?? maxConsultMs
   if (maxConsultMs < advisorResponseWaitMs) {
     warnOnce(
       `ceiling<wait:${maxConsultMs}/${advisorResponseWaitMs}`,
@@ -242,8 +290,11 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
   // Tool-output ceiling: `maxToolOutputTokens` is canonical (tokens are the
   // unit providers bill in). `maxToolOutputChars` is still accepted and
   // divided by 4, so a pre-1.0 config keeps working and reads honestly.
-  const toolTokExplicit = readSize(opts, "maxToolOutputTokens", 4, 4_000_000)
-  const toolTokLegacy = readSize(opts, "maxToolOutputChars", 16, 16_000_000)
+  // One tool output. 500K tokens ≈ a 2M-character file, which already exceeds
+  // any single source file worth sending; above that the value is a mistake,
+  // not a preference.
+  const toolTokExplicit = readSize(opts, "maxToolOutputTokens", 16, 500_000)
+  const toolTokLegacy = readSize(opts, "maxToolOutputChars", 64, 2_000_000)
   if (toolTokExplicit === undefined && toolTokLegacy !== undefined) {
     maxToolOutputTokens = Math.max(4, Math.ceil(toolTokLegacy / CHARS_PER_TOKEN))
     warnOnce(
@@ -255,7 +306,13 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     maxToolOutputTokens = toolTokExplicit ?? maxToolOutputTokens
   }
   maxToolOutputChars = maxToolOutputTokens * CHARS_PER_TOKEN
-  transcriptBudgetTokens = readSize(opts, "transcriptBudgetTokens", 64, 32_000_000) ?? transcriptBudgetTokens
+  // 1,000,000 is the hosted-frontier standard and the ceiling this plugin is
+  // sized for (Gemini 3.1 Pro, GPT-5.x, Claude Opus/Sonnet 5 all report
+  // 1,000,000–1,048,576). The 2M/10M classes are deliberately out of scope:
+  // rare, and sizing to them would only invite configs that fail on the models
+  // people actually run. A 200K-window model is the common floor, and the
+  // Economy/Balanced presets fit inside it.
+  transcriptBudgetTokens = readSize(opts, "transcriptBudgetTokens", 1_000, 1_000_000) ?? transcriptBudgetTokens
 
   // Pruning policy: "standard" (window + truncate) or "none" (verbatim).
   let pruning: "standard" | "none" = DEFAULTS.pruning
@@ -295,6 +352,46 @@ export function resolveOptions(raw: unknown): AdvisorOptions {
     // This keeps a fresh install safe (zero advisor spend) and friendly
     // (the tool itself teaches the setup steps at the moment of need).
     advisor = { providerID: "", id: "" }
+  }
+
+  // Above the measured region, a bigger context budget is not more generous —
+  // it is measurably worse advice. LongCodeBench puts bug-fixing accuracy at
+  // 29% at 32K falling to 3% at 256K, comprehension peaking at 64K-128K, and
+  // "Context Length Alone Hurts" shows accuracy falling 13.9-85% purely from
+  // input length even with perfect retrieval. Say so, once, with the number
+  // the user chose — silently honouring it would be the dishonest option.
+  if (transcriptBudgetTokens > EVIDENCE_CEILING_TOKENS) {
+    warnOnce(
+      `context>evidence:${transcriptBudgetTokens}`,
+      `[advisor] transcriptBudgetTokens is ${transcriptBudgetTokens} — past the ~${EVIDENCE_CEILING_TOKENS}-token ` +
+        `ceiling where code-review accuracy peaks (measured: 29% bug-fix resolution at 32K, falling to 3% at 256K). ` +
+        `A larger budget sends more evidence and measurably WEAKER advice. Use pruning:"none" if you need the rest, ` +
+        `or a 1M-window model with a review that genuinely needs the reach.`,
+    )
+  }
+  if (adviceTokenBudget > EVIDENCE_CEILING_ADVICE_TOKENS) {
+    warnOnce(
+      `advice>evidence:${adviceTokenBudget}`,
+      `[advisor] adviceTokenBudget is ${adviceTokenBudget} — past the ~${EVIDENCE_CEILING_ADVICE_TOKENS}-token ` +
+        `point where extra output stops adding correctness and starts compounding errors. ` +
+        `Output length has a non-monotonic effect on accuracy; a bigger cap permits overthinking, not insight.`,
+    )
+  }
+
+  // The advisor's context window is a SHARED budget: input (the pruned
+  // transcript + system + tools) and output (the reply, plus reasoning tokens
+  // on thinking models) all draw on it. Sizing them independently is how a
+  // config ends up asking for 1.13M from a 1M window and failing with
+  // prompt_too_long. The reference window is the hosted-frontier standard.
+  const REFERENCE_WINDOW_TOKENS = 1_000_000
+  if (transcriptBudgetTokens + adviceTokenBudget > REFERENCE_WINDOW_TOKENS) {
+    warnOnce(
+      `window:over:${transcriptBudgetTokens}+${adviceTokenBudget}`,
+      `[advisor] context (${transcriptBudgetTokens}) + advice (${adviceTokenBudget}) = ` +
+        `${transcriptBudgetTokens + adviceTokenBudget} tokens, past the ${REFERENCE_WINDOW_TOKENS}-token ` +
+        `reference window — context and output share one budget, so the advisor will likely fail with ` +
+        `prompt_too_long. Lower one of them, or pick a model with a larger window.`,
+    )
   }
 
   // sanity: the context budget must accommodate several tool slices

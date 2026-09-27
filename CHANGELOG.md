@@ -3,6 +3,62 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.0.1] — 2026-09-27
+
+### Fixed
+- **A config error could render as `[object Object]`.** The catch sites used
+  `err instanceof Error ? err.message : String(err)`. A host that rejects with a
+  structured value — an RPC error is `{ code, message }` — stringifies to the
+  literal text `[object Object]`, so `/advisor-settings` reported
+  "Could not read the advisor configuration: [object Object]" and hid the cause
+  entirely. All catch sites now route through `describeError`, which unwraps
+  `Error`, `{message}`, `{error}`, `{cause}`, `{data}`, `{errors[]}`, keeps a
+  `code`/`status` (usually the most actionable part), and falls back to
+  `JSON.stringify` before ever degrading to a bracketed type name. This also
+  closes the finding previously logged as a low-severity harness artifact —
+  it was reachable in production after all.
+
+### Changed — the preset ladder was inverted, now re-derived from measurements
+Context budget and advice budget were being scaled **up** on the theory that a
+bigger budget is a more generous default. The long-context literature says the
+opposite, and specifically for this plugin's job:
+
+- **LongCodeBench**: bug-fixing resolution 29% at 32K → **3% at 256K**
+  (Claude 3.5 Sonnet); Gemini 2 Flash and GPT-4o also peak at 32K. Comprehension
+  peaks at 64K–128K. The curve is not monotonic — it peaks, then collapses.
+- **The Limits of Long-Context Reasoning in Automated Bug Fixing**: successful
+  agentic trajectories stay under 20–30K tokens and longer contexts correlate
+  with *lower* success; single-shot at 64K with perfect file inclusion,
+  GPT-5-nano resolved zero.
+- **Context Length Alone Hurts LLM Performance Despite Perfect Retrieval**
+  (EMNLP 2025): accuracy falls 13.9%–85% with input length even when every
+  distractor is masked and the evidence sits immediately before the question.
+- **Same Task, More Tokens**: degradation starts at 3,000 tokens of padding
+  (0.92 → 0.68).
+- Reasoning length is likewise **non-monotonic** for correctness: answers that
+  were right turn wrong at the longest ranks. A bigger output cap permits
+  overthinking, not insight.
+
+Presets are now `1/16K/4K`, `3/32K/8K`, `5/64K/16K`, `8/128K/32K` — Economy
+and Balanced fit inside a 200K-window model, and the default (32K/8K) sits at
+the measured bug-fixing peak. The plugin now **warns once** when a context
+budget exceeds 128K or an advice budget exceeds 32K, citing the measurement.
+The value is still applied exactly: the plugin never silently trims a number the
+user chose. It also warns when context + advice together exceed a 1M window,
+since input and output share one budget.
+
+Ranges were narrowed to the real envelope of the 200K-to-1M class: context
+1K–1M, advice 256–200K, tool output 16–500K, consults 1–200, ceiling 24h. The
+previous 32M context and 1M advice were 32× and 2.6× anything a real provider
+offers — generous in name, unusable in practice. The rare 2M/10M window classes
+are deliberately out of scope.
+
+### Tests
+- 199 green. New coverage: the evidence-ceiling advisories, an invariant that
+  no preset may drift past the measured ceiling, the shared-window
+  over-subscription warning, and `describeError` across every thrown shape
+  (including circular objects and an `Error` carrying a `code`).
+
 ## [1.0.0] — 2026-09-27
 
 The production release. Every budget is token-denominated, the value-change

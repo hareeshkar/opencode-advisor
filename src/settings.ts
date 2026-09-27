@@ -16,6 +16,7 @@
 
 import { ADVISOR_CONFIG_KEYS } from "./config.js"
 import { PRESETS } from "./options.js"
+import { describeError } from "./sanitize.js"
 
 /* ------------------------------- RPC schemas ------------------------------ */
 
@@ -398,7 +399,7 @@ export function currentLimits(view: AdvisorSettingsView, draft: SettingsDraft): 
     responseWaitMs: pick("advisorResponseWaitMs", 90_000) as number,
     ceilingMs: pick("maxConsultMs", 3_600_000) as number,
     contextTokens: pick("transcriptBudgetTokens", 32_000) as number,
-    adviceTokens: pick("adviceTokenBudget", 16_000) as number,
+    adviceTokens: pick("adviceTokenBudget", 8_000) as number,
     toolCap: pick("maxToolOutputTokens", 750) as number,
     pruning: (pick("pruning", "standard") === "none" ? "none" : "standard") as "standard" | "none",
     attempts: pick("maxAttempts", 11) as number,
@@ -428,7 +429,7 @@ export function mainMenuRows(view: AdvisorSettingsView, draft: SettingsDraft): M
       category: "Settings",
       value: "limits",
       title: `Limits — ${limits.consults} consults/task · response wait ${formatDuration(limits.responseWaitMs)}`,
-      description: `${formatSize(limits.contextTokens)} context tokens · ${formatSize(limits.adviceTokens)} advice tokens · ceiling ${formatDuration(limits.ceilingMs)} · ${limits.attempts} retries`,
+      description: `${formatSize(limits.contextTokens)} context + ${formatSize(limits.adviceTokens)} advice tokens (both draw on one context window) · ceiling ${formatDuration(limits.ceilingMs)} · ${limits.attempts} retries`,
     },
     { category: "Actions", value: "save", title: "Save changes", description: hasChanges(draft) ? `Write to ${target}` : "No changes yet" },
     { category: "Actions", value: "reset", title: "Reset all settings…", description: `Remove the plugin's keys from ${target}` },
@@ -466,7 +467,7 @@ export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): Menu
       title: `Pruning — ${limits.pruning === "none" ? "none (verbatim)" : "standard"}`,
       description:
         limits.pruning === "none"
-          ? "No windowing, no truncation — the advisor sees the task whole"
+          ? "No windowing or truncation — the task arrives whole. Verbatim, but measured accuracy FALLS with input length."
           : "Window the transcript to the context budget; truncate per tool output",
     },
     {
@@ -499,8 +500,10 @@ export function summaryMessage(view: AdvisorSettingsView): string {
 
 /* --------------------------------- flow ----------------------------------- */
 
+/** Every catch site routes through describeError, so a structured host
+ *  rejection (RPC `{code,message}`) can never surface as "[object Object]". */
 function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err)
+  return describeError(err)
 }
 
 async function discardOrKeep(ports: SettingsPorts, draft: SettingsDraft): Promise<boolean> {
@@ -608,12 +611,12 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
           title: "Context budget",
           description: "INPUT tokens of pruned conversation sent to the advisor",
           current: currentLimits(view, draft).contextTokens,
-          choices: [16_000, 32_000, 64_000, 128_000, 256_000, 1_000_000, 4_000_000],
+          choices: [16_000, 32_000, 64_000, 128_000, 256_000, 1_000_000],
           format: formatSize,
           parse: parseHumanSize,
-          min: 64,
-          max: 32_000_000,
-          rangeHint: "64–32M tokens, e.g. 128k",
+          min: 1_000,
+          max: 1_000_000,
+          rangeHint: "1K–1M tokens. 32K-128K is the measured peak; above it accuracy falls.",
         })
         break
       case "advice":
@@ -621,12 +624,12 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
           title: "Advice length",
           description: "OUTPUT token budget for the advisor's reply",
           current: currentLimits(view, draft).adviceTokens,
-          choices: [8_000, 16_000, 32_000, 64_000, 128_000, 256_000],
+          choices: [4_000, 8_000, 16_000, 32_000, 64_000],
           format: formatSize,
           parse: parseHumanSize,
-          min: 16,
-          max: 1_000_000,
-          rangeHint: "16–1M tokens (the model's own output limit is the real ceiling)",
+          min: 256,
+          max: 200_000,
+          rangeHint: "256–200K tokens. Past ~32K, extra output compounds errors rather than adding insight.",
         })
         break
       case "toolcap":
@@ -634,12 +637,12 @@ async function runLimitsMenu(ports: SettingsPorts, view: AdvisorSettingsView, dr
           title: "Per-tool output cap",
           description: "Maximum tokens kept from a single tool output",
           current: currentLimits(view, draft).toolCap,
-          choices: [250, 750, 2_000, 8_000, 32_000, 128_000],
+          choices: [750, 2_000, 8_000, 32_000, 128_000],
           format: formatSize,
           parse: parseHumanSize,
-          min: 4,
-          max: 4_000_000,
-          rangeHint: "4–4,000,000 tokens",
+          min: 16,
+          max: 500_000,
+          rangeHint: "16–500K tokens (one tool output)",
         })
         break
       case "retries":

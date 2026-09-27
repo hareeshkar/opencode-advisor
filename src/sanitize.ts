@@ -19,6 +19,63 @@ const TOKENISH = /\b(sk-[A-Za-z0-9_-]{8,}|xox[baprs]-[A-Za-z0-9-]+|AIza[0-9A-Za-
  * echoed in an error must never travel to advisor provider B via the tool
  * result → transcript → next advisor prompt chain).
  */
+/**
+ * Turn ANY thrown value into a readable, redacted, length-bounded string.
+ *
+ * The naive `err instanceof Error ? err.message : String(err)` is the bug this
+ * replaces: a host that rejects with a structured value — an RPC error is
+ * `{ code, message }`, a fetch failure may be a plain object — stringifies to
+ * the literal text "[object Object]", which tells the reader nothing at all and
+ * hides the actual cause. Every catch site in this plugin funnels through here
+ * so a thrown value can never degrade into a useless message.
+ */
+export function describeError(err: unknown): string {
+  const seen = new Set<unknown>()
+  let current: unknown = err
+  // Unwrap nested shapes: {error}, {cause}, {data}, arrays of the above.
+  for (let hop = 0; hop < 4; hop++) {
+    if (current === null || current === undefined) break
+    if (typeof current === "string") return current
+    if (typeof current === "number" || typeof current === "boolean" || typeof current === "bigint") {
+      return String(current)
+    }
+    if (current instanceof Error) {
+      // Node throws AggregateError/Error with a `code`, and fetch errors carry
+      // the status in `code` — that is usually the most actionable part.
+      const code = (current as { code?: unknown }).code
+      const base = current.message === "" ? current.name : current.message
+      return typeof code === "string" || typeof code === "number" ? `${base} (${code})` : base
+    }
+    if (typeof current !== "object" || seen.has(current)) break
+    seen.add(current)
+    const rec = current as Record<string, unknown>
+    const next = rec.error ?? rec.cause ?? rec.data ?? (Array.isArray(rec.errors) ? rec.errors[0] : undefined)
+    if (next !== undefined && next !== null && typeof next !== "string") {
+      current = next
+      continue
+    }
+    if (typeof next === "string") return next
+    // No nested cause: assemble from the object's own fields rather than
+    // degrading to "[object Object]".
+    const parts: string[] = []
+    for (const key of ["message", "code", "status", "statusText", "reason", "type", "name"] as const) {
+      const v = rec[key]
+      if (typeof v === "string" && v !== "" && !parts.includes(v)) parts.push(v)
+      else if (typeof v === "number" && !parts.includes(String(v))) parts.push(String(v))
+    }
+    if (parts.length > 0) return parts.join(" ")
+    try {
+      const json = JSON.stringify(rec)
+      if (json !== undefined && json !== "{}") return json
+    } catch {
+      /* circular or unserialisable — fall through */
+    }
+    return Object.prototype.toString.call(rec)
+  }
+  return "unknown error"
+}
+
+/** Redact a pre-stringified message (kept for callers that already have text). */
 export function redactError(message: string): string {
   return clean(
     message

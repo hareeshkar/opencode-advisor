@@ -24,7 +24,7 @@ import { extractToolNames, replaceSystemInBody } from "./inject.js"
 import { resolveOptions } from "./options.js"
 import { CONFIG_OUTPUT_SCHEMA, CONFIG_SET_INPUT_SCHEMA } from "./settings.js"
 import { ADVISOR_TOOL_DESCRIPTION, AGENT_MODE_PREFIX, TUI_CLAIM_KEY, advisorLabel, findTrigger, hasDirective, isAdvisorConfigured, isSettingsInvocation, shortlistAdvisorModels, triggerDirective } from "./prompts.js"
-import { frameAdvice, isAdvisorOutputFrame, redactError } from "./sanitize.js"
+import { describeError, frameAdvice, isAdvisorOutputFrame, redactError } from "./sanitize.js"
 import { PLUGIN_ID, PLUGIN_VERSION } from "./types.js"
 import type { AdvisorOptions, ConsultResult, Host, LogLevel, Slice, UsageEntry } from "./types.js"
 
@@ -899,7 +899,7 @@ export function createV2Plugin(): { id: string; setup: (ctx: unknown) => Promise
                   }
                 })
                 .catch((err: unknown) => {
-                  const reason = `advisor_not_running — ${redactError(err instanceof Error ? err.message : String(err))}`
+                  const reason = `advisor_not_running — ${redactError(describeError(err))}`
                   ledger.fail(consultId, reason)
                   // Same gate as above: an unexpected throw that settles
                   // inside the wait window is already in the tool result.

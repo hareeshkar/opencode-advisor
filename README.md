@@ -81,14 +81,23 @@ Boundary rules: only the pruned evidence leaves your session — the full transc
 
 One word expands to consults/task, context tokens, and advice tokens:
 
-| Preset | Consults/task | Context tokens (input) | Advice tokens (output) |
-|---|---|---|---|
-| Economy | 1 | 16K | 8K |
-| Balanced *(recommended, default)* | 3 | 32K | 16K |
-| Thorough | 5 | 64K | 32K |
-| Exhaustive | 8 | 128K | 64K |
+| Preset | Consults/task | Context tokens (input) | Advice tokens (output) | Fits a 200K-window model? |
+|---|---|---|---|---|
+| Economy | 1 | 16K | 4K | yes |
+| Balanced *(recommended, default)* | 3 | 32K | 8K | yes |
+| Thorough | 5 | 64K | 16K | needs the 1M class |
+| Exhaustive | 8 | 128K | 32K | needs the 1M class |
 
-Advice is the cheapest part of a consult, so the defaults are deliberately generous: these are real-workload numbers, not safety minima.
+**A bigger context budget makes the advice measurably worse, so the ladder stops where the evidence stops.** This is the opposite of what a "generous default" normally means, and it is deliberate:
+
+- On **LongCodeBench**, bug-fixing resolution goes from **29% at 32K down to 3% at 256K** for Claude 3.5 Sonnet; Gemini 2 Flash and GPT-4o also peak at 32K. Code *comprehension* peaks at **64K–128K**. Performance is not monotonic — it peaks, then falls off.
+- In *The Limits of Long-Context Reasoning in Automated Bug Fixing*, successful agentic trajectories stay **under 20–30K tokens**, and longer contexts correlate with *lower* success. Single-shot at 64K with perfect file inclusion, GPT-5-nano resolved **zero** issues.
+- *Context Length Alone Hurts LLM Performance Despite Perfect Retrieval* (EMNLP 2025) finds accuracy falling **13.9%–85%** as input grows — even with every distractor **masked** and the evidence placed immediately before the question. Their proposed fix is to convert a long-context task into a short one, which is exactly what the pruner does.
+- *Same Task, More Tokens* finds degradation beginning at **3,000 tokens** of pure padding (0.92 → 0.68).
+
+Advice length has a **non-monotonic** effect on accuracy too: reasoning longer past a certain point turns correct answers wrong (~5–10% of them at the longest ranks). A larger output cap permits overthinking; it does not buy insight.
+
+So the generous setting here is a **moderate** one, and every preset sits inside the measured region. The settings menu still lets you go to 1M, but the plugin says plainly when you have left the range where models still reason well.
 
 Patience is *uniform across presets*: every preset waits 90 seconds for a synchronous answer and allows a 1-hour consult ceiling — presets scale *budget*, never *patience*.
 
@@ -107,7 +116,8 @@ The advice frame states its evidence basis, so you always know what was verified
 - **Consult ceiling** (`maxConsultMs`, default 1h) — maximum advisor lifetime; expiry fails the consult without consuming the consult cap.
 - **Consults/task** (`maxUsesPerTask`, default 3) — successful consults per user task.
 - **Retry ceiling** (`maxAttempts`, default 3× consults + 2) — *transport attempts, never extra paid consults*.
-- **Context tokens** (`transcriptBudgetTokens`, default 32K) and **advice tokens** (`adviceTokenBudget`, default 16K) — overridden by presets; configurable directly.
+- **Context tokens** (`transcriptBudgetTokens`, default 32K) and **advice tokens** (`adviceTokenBudget`, default 8K) — overridden by presets; configurable directly.
+- **Evidence ceilings** — above **128K context** or **32K advice** the plugin warns once, citing the measurement. Your number is still applied exactly; the plugin never silently trims a value you chose.
 - **Per-tool output cap** (`maxToolOutputTokens`, default 750) — the ceiling on one tool output, in tokens.
 - **Pruning** (`pruning`, default `standard`) — see below.
 - **Log level**.
@@ -148,13 +158,13 @@ The `/advisor-settings` menu reads the file when it opens and writes it atomical
 | `advisor` | model ref | none | `{ providerID, id, variant? }` | The model that advises. Unset ⇒ unconfigured, zero spend |
 | `preset` | enum | balanced *(implied)* | economy / balanced / thorough / exhaustive | How much the advisor may use |
 | `advisorMode` | enum | review | review, agent (`review-agent` accepted) | Review = advice from the pruned conversation; agent = Review + Agent, read-only file verification |
-| `maxUsesPerTask` | number | preset (3) | 1–1,000 | Successful consults per user task; a safety cap |
-| `maxAttempts` | number | 3 × consults + 2 (11) | 1–10,000 | Transport attempts per task — never extra paid consults |
-| `advisorResponseWaitMs` | ms (number) | `90000` | 1–3,600,000 | How long the tool call waits for advice before continuing in the background (the advisor keeps running). `timeoutMs` accepted as a deprecated alias |
-| `maxConsultMs` | ms (number or size) | `3600000` | 1,000–604,800,000 | Maximum advisor lifetime; expiry fails the consult without consuming the cap |
-| `adviceTokenBudget` | tokens (number) | preset (16,000) | 16–1,000,000 | Advisor **output** tokens — the reply length cap |
-| `transcriptBudgetTokens` | tokens (number or size) | preset (32,000) | 64–32,000,000 | **Input** context tokens sent to the advisor (×4 chars for the pruner) |
-| `maxToolOutputTokens` | tokens (number or size) | `750` | 4–4,000,000 | Tokens kept from a single tool output. `maxToolOutputChars` still accepted and divided by 4, with a deprecation warning |
+| `maxUsesPerTask` | number | preset (3) | 1–200 | Successful consults per user task; a safety cap |
+| `maxAttempts` | number | 3 × consults + 2 (11) | 1–2,000 | Transport attempts per task — never extra paid consults |
+| `advisorResponseWaitMs` | ms (number) | `90000` | 1–600,000 | How long the tool call waits for advice before continuing in the background (the advisor keeps running). `timeoutMs` accepted as a deprecated alias |
+| `maxConsultMs` | ms (number or size) | `3600000` | 1,000–86,400,000 | Maximum advisor lifetime; expiry fails the consult without consuming the cap |
+| `adviceTokenBudget` | tokens (number) | preset (8,000) | 256–200,000 | Advisor **output** tokens. Non-monotonic effect on accuracy; past ~32K the plugin warns |
+| `transcriptBudgetTokens` | tokens (number or size) | preset (32,000) | 1,000–1,000,000 | **Input** context tokens (×4 chars for the pruner). Accuracy peaks 32K–128K; past that the plugin warns |
+| `maxToolOutputTokens` | tokens (number or size) | `750` | 16–500,000 | Tokens kept from a single tool output. `maxToolOutputChars` still accepted and divided by 4, with a deprecation warning |
 | `pruning` | enum | `standard` | standard / none | `none` disables windowing and truncation — see [Pruning](#pruning--standard-or-none) |
 | `triggers` | string list | advice, advisor, get consultation | non-empty strings; `[]` disables | Words that route a consult request; a mere mention never spends |
 | `logLevel` | enum | info | debug / info / warn / error | Plugin diagnostics verbosity |
@@ -162,7 +172,9 @@ The `/advisor-settings` menu reads the file when it opens and writes it atomical
 
 Notes: the files are **strict JSON** — no comments, no trailing commas (`opencode.json` is JSONC and allows both). The token budgets accept a number or a 1000-based size string (`"32k"`, `"1.5m"`). If the context budget is smaller than the per-tool cap, it is raised to match, with a warning. The consult ceiling is raised to cover the response wait.
 
-**On the ranges:** they are typo-detectors, not budgets. Each one spans every plausible real workload and fails only on a value that is certainly a mistake — a chars-for-tokens slip, a stray zero, a paste of the wrong field. The model's own context window is the real ceiling on context, and its own output limit is the real ceiling on advice. Nothing here silently trims a number you chose.
+**On the ranges:** they are typo-detectors, not budgets — but they are also not unbounded. Each one spans the real capability envelope of the 200K-to-1M-window model class (the frontier standard is a 1,000,000-token window; real max output is 64K on Gemini/Claude Sonnet and 128K on GPT-5.x/Claude Opus) and fails only on a value that is certainly a mistake. Sizing to the rare 2M/10M classes would only invite configs that fail on the models people actually run. Nothing here silently trims a number you chose — going past the measured-quality region produces a warning, not a clamp.
+
+**Context and output share one window.** A model with a 1M window reserves part of it for the reply and, on reasoning models, for thinking tokens. Asking for 1M of context *and* 128K of output requests more than the window holds, and the call fails as `prompt_too_long`. The plugin warns when your two numbers together exceed 1M.
 
 Env vars: `ADVISOR_PROVIDER`, `ADVISOR_MODEL`, `ADVISOR_VARIANT`, `ADVISOR_MAX_USES`, `ADVISOR_LOG`, `ADVISOR_MODE`, `ADVISOR_SOURCE_KIND/URL/KEY_ENV/MODEL`.
 
@@ -204,8 +216,9 @@ Economy is one consult per task with an 8K input budget and 4K advice tokens; Re
 
 - **"No advisor model is configured."** Fresh installs are intentionally unconfigured and spend nothing. Run `/advisor-settings` and pick a model — the only required choice. It applies immediately.
 - **A loud load error names a config file.** The plugin never falls back silently on invalid config. The message includes the file path and the problem. Fix the JSON at that path — strict JSON, no comments or trailing commas.
-- **Advice is too long, too short, or cut off.** Tune the output budget: `adviceTokenBudget` (16–1,000,000; presets 8K–64K). The model's own max-output limit is the real ceiling.
-- **The advisor seems to be missing context.** Raise `transcriptBudgetTokens`; lower `maxToolOutputTokens` if a single tool output crowds the budget.
+- **Advice is too long, too short, or cut off.** Tune the output budget: `adviceTokenBudget` (256–200,000; presets 4K–32K). Be aware that going *larger* often makes it worse, not longer-better: output length has a non-monotonic effect on accuracy, and answers that were correct can turn wrong at the longest ranks.
+- **The advisor seems to be missing context.** Raise `transcriptBudgetTokens`, or set `pruning: "none"`. But note the direction of the evidence: code-review accuracy *falls* past 32K–128K, so a bigger budget is a deliberate trade, not a fix. If a single tool output is crowding the budget, lower `maxToolOutputTokens`.
+- **A warning says my context is past the measured ceiling.** That is the plugin telling you a larger budget produces weaker advice, with the measurement cited. Your value is applied exactly as set. To reach further, use `pruning: "none"` or a 1M-window model — but expect the accuracy trade.
 - **Spend is higher than expected.** Advice re-enters the executor's context and is re-paid on later turns until compaction — Exhaustive can add ~64K tokens of advice per task. Prefer Economy/Balanced, or lower `adviceTokenBudget`.
 - **`pruning: "none"` and the context window.** With pruning off there is no plugin-side budget, so the advisor's *own* context window is the only limit. Exceed it and the call fails loudly as `prompt_too_long` — the plugin never silently trims your transcript, because a quietly shortened transcript would read to the advisor as complete evidence. That is the trade: fidelity or a guaranteed fit, never a partial answer presented as a whole.
 - **The tool said `ADVISOR CONSULT RUNNING`.** The advisor needed longer than the response wait; the consult continues in the background and the framed advice is delivered automatically on the executor's next turn. `advisor_status` lists progress and replays delivered advice — never start another consultation for the same question.
@@ -277,7 +290,7 @@ npm test            # node --test — the full suite
 npm run build       # esbuild → dist/opencode-advisor.js + dist/tui.js
 ```
 
-Zero runtime dependencies; the bundles are the installable artifacts. Current version: **1.0.0**. Design notes and prior art live in [`research/`](research/).
+Zero runtime dependencies; the bundles are the installable artifacts. Current version: **1.0.1**. Design notes and prior art live in [`research/`](research/).
 
 ## License
 

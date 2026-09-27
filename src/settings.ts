@@ -503,19 +503,65 @@ export function limitRows(view: AdvisorSettingsView, draft: SettingsDraft): Menu
 
 /* -------------------------------- summary --------------------------------- */
 
+/**
+ * The post-save preview. It mirrors the settings page exactly — same sections,
+ * same order, same labels — because it is the user's confirmation that the menu
+ * did what they asked. When it drifted (five advanced limits missing, and
+ * "Mode" after the row became "Evidence basis") it was no longer a preview of
+ * anything, just a partial echo of the three rows that happened to predate the
+ * Advanced submenu.
+ */
 export function summaryMessage(view: AdvisorSettingsView): string {
   const model = currentModel(view, {})
   const preset = currentPreset(view, {})
   const mode = currentMode(view, {})
   const limits = currentLimits(view, {})
-  return [
-    `Model     ${model.label}`,
-    `Preset    ${preset.title}${preset.kind === "preset" && preset.isDefault ? " (default)" : ""} — ${preset.blurb}`,
-    `Mode      ${mode.title} — ${MODE_DESCRIPTIONS[mode.mode]}`,
-    `Limits    ${limits.consults} consults/task · response wait ${formatDuration(limits.responseWaitMs)} · ${formatSize(limits.contextTokens)} context tokens · ${formatSize(limits.adviceTokens)} advice tokens`,
-    `File      ${view.files.project || view.files.global}`,
-    `Applies immediately — no restart.`,
-  ].join("\n")
+
+  // One padding pass so the columns line up whatever the labels are.
+  const rows: Array<[string, string]> = []
+  const section = (title: string) => rows.push(["", ""], [title, ""])
+  const line = (label: string, value: string) => rows.push([label, value])
+
+  section("SETTINGS")
+  line("Advisor model", model.label)
+  line("Preset", `${preset.title}${preset.kind === "preset" && preset.isDefault ? " · default" : ""}`)
+  line("", preset.blurb)
+  // The description already opens with the mode's own name ("Review + Agent —
+  // the conversation is the map…"), so prefixing the title reads it twice.
+  const modeDetail = MODE_DESCRIPTIONS[mode.mode].startsWith(`${mode.title} — `)
+    ? MODE_DESCRIPTIONS[mode.mode].slice(mode.title.length + 3)
+    : MODE_DESCRIPTIONS[mode.mode]
+  line("Evidence basis", modeDetail === "" ? mode.title : `${mode.title} — ${modeDetail}`)
+
+  section("ADVANCED · BUDGETS")
+  line("Consults per task", String(limits.consults))
+  line("Context budget", `${formatSize(limits.contextTokens)} tokens`)
+  line("Advice length", `${formatSize(limits.adviceTokens)} tokens`)
+  line("Per-tool output", `${formatSize(limits.toolCap)} tokens`)
+
+  section("ADVANCED · TIMING")
+  line("Response wait", formatDuration(limits.responseWaitMs))
+  line("Max consult time", formatDuration(limits.ceilingMs))
+
+  section("ADVANCED · EVIDENCE")
+  line("Pruning", limits.pruning === "none" ? "none (verbatim)" : "standard")
+  line("Retry ceiling", String(limits.attempts))
+  line("Log level", limits.logLevel)
+
+  const width = Math.max(...rows.filter(([l]) => l !== "").map(([l]) => l.length))
+  // Headers are not padded — trailing whitespace is invisible in a TUI but
+  // shows up in a copied log, and it makes the block look ragged.
+  const body = rows
+    .map(([label, value]) => {
+      if (label === "") return value === "" ? "" : `  ${value}`
+      if (value === "") return label
+      return `  ${label.padEnd(width)}  ${value}`
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+
+  return `${body}\n\nSaved to  ${view.files.project || view.files.global}\nApplies immediately — no restart.`
 }
 
 /* --------------------------------- flow ----------------------------------- */

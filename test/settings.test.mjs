@@ -601,3 +601,76 @@ test("the GUI reflects the change immediately: the preset row flips to Custom", 
     "Custom appears AFTER the edit, not before",
   )
 })
+
+/* ═══ the post-save preview must mirror the settings page ═══ */
+
+test("the preview covers EVERY setting the menu can change", () => {
+  // The audit that was missing: five advanced limits were absent from the
+  // preview, so the confirmation the user reads after saving described less
+  // than the menu they just used. Coverage is now asserted, not eyeballed.
+  const out = summaryMessage(makeView())
+  const must = [
+    ["advisor model", "m"],                     // the fixture's model label
+    ["consults per task", "3"],
+    ["context budget", "32K tokens"],
+    ["advice length", "8K tokens"],
+    ["per-tool output", "750 tokens"],
+    ["response wait", "90s"],
+    ["max consult time", "1h"],
+    ["pruning", "standard"],
+    ["retry ceiling", "11"],
+    ["log level", "info"],
+    ["saved to", "/home/u/.config/opencode/opencode-advisor.json"],
+    ["applies immediately", "no restart"],
+  ]
+  for (const [label, value] of must) {
+    const line = out.split("\n").find((l) => l.trim().toLowerCase().startsWith(label))
+    assert.ok(line, `the preview is missing a "${label}" row:\n${out}`)
+    assert.ok(line.includes(value), `"${label}" should show ${value}, got: ${line}`)
+  }
+  // The evidence basis must appear under its CURRENT name, not the old one.
+  assert.ok(out.includes("Evidence basis"), "uses the current row name")
+  assert.ok(!/^\s*Mode\s/m.test(out), "the stale 'Mode' label is gone")
+})
+
+test("the preview is grouped like the menu: Settings, then Advanced by section", () => {
+  const out = summaryMessage(makeView())
+  const order = ["SETTINGS", "ADVANCED · BUDGETS", "ADVANCED · TIMING", "ADVANCED · EVIDENCE"]
+  const at = order.map((h) => out.indexOf(h))
+  assert.ok(at.every((i) => i >= 0), `every section is present:\n${out}`)
+  assert.deepEqual([...at].sort((a, b) => a - b), at, `sections appear in menu order:\n${out}`)
+  // Advanced's sub-groups match the limits submenu's categories exactly.
+  for (const cat of ["Budgets", "Timing", "Evidence"]) {
+    assert.ok(
+      limitRows(makeView(), {}).some((r) => r.category === cat),
+      `the limits menu still declares a "${cat}" category`,
+    )
+  }
+  assert.ok(out.includes("none (verbatim)") === false, "standard pruning is not labelled verbatim")
+  const verbatim = summaryMessage(makeView({ config: { pruning: "none" } }))
+  assert.ok(verbatim.includes("none (verbatim)"), "verbatim pruning says so")
+})
+
+test("the preview has no padded headers or doubled mode names", () => {
+  for (const view of [makeView(), makeView({ config: { advisorMode: "agent", pruning: "none" } })]) {
+    for (const line of summaryMessage(view).split("\n")) {
+      assert.equal(line, line.trimEnd(), `trailing whitespace: ${JSON.stringify(line)}`)
+    }
+    assert.ok(
+      !/Review \+ Agent — Review \+ Agent/.test(summaryMessage(view)),
+      "the evidence-basis description must not repeat the title",
+    )
+  }
+})
+
+test("columns align across the whole preview", () => {
+  const lines = summaryMessage(makeView()).split("\n")
+  // A data row is "  <label><2+ spaces><value>"; the value column must be the
+  // same offset on every one of them, or the block reads as ragged.
+  const valueColumn = lines
+    .map((l) => /^ {2}(.+?) {2,}(\S.*)$/.exec(l))
+    .filter(Boolean)
+    .map((m) => m[0].length - m[2].length)
+  assert.ok(valueColumn.length >= 8, `there are enough data rows to align (${valueColumn.length})`)
+  assert.equal(new Set(valueColumn).size, 1, `all values start at one column: ${JSON.stringify(valueColumn)}`)
+})

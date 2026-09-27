@@ -3,6 +3,38 @@
 All notable changes to this project are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [SemVer](https://semver.org/).
 
+## [1.0.5] — 2026-09-27
+
+### Fixed — the post-save preview was missing most of what you just changed
+The confirmation shown after Save described less than the menu the user had
+just used. It was still the pre-Advanced layout: five of the ten limits were
+absent, and one label was stale.
+
+| Setting | Was in the preview |
+|---|---|
+| model, preset, evidence basis, file | yes (evidence basis was labelled "Mode") |
+| consults, context, advice, response wait | yes |
+| **max consult time** | **no** |
+| **per-tool output cap** | **no** |
+| **pruning** | **no** |
+| **retry ceiling** | **no** |
+| **log level** | **no** |
+
+The preview is now grouped to mirror the settings page exactly — `SETTINGS`,
+then `ADVANCED · BUDGETS / TIMING / EVIDENCE` (the limits submenu's own
+categories), with aligned value columns, the target file, and the
+applies-immediately footer. Two cosmetic defects are gone as well: section
+headers are no longer padded with invisible trailing whitespace, and the
+evidence-basis line no longer reads "Review + Agent — Review + Agent — …" now
+that the description is de-duplicated against the title.
+
+### Tests
+- 218 green. The audit is now permanent rather than a one-off review: the
+  preview must name every setting the menu can change, use the current labels,
+  group into the same sections as the menu, carry no trailing whitespace, and
+  align its value column. All four were proven non-vacuous by restoring the old
+  preview, which fails every one of them.
+
 ## [1.0.4] — 2026-09-27
 
 ### Changed — the settings page is one flat list again
